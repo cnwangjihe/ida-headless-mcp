@@ -1,5 +1,12 @@
+"""idalib backend — single-IDB headless MCP server.
+
+This process is spawned by the pool manager.  It opens at most one IDB
+at a time and exposes IDA MCP tools over HTTP (TCP or Unix socket).
+Multi-session orchestration lives in the pool layer; this backend is
+intentionally simple.
+"""
+
 import argparse
-import json
 import logging
 import os
 import signal
@@ -7,323 +14,114 @@ import sys
 from pathlib import Path
 from typing import Annotated, Optional
 
-# idapro must go first to initialize idalib
 import idapro
+import ida_auto
 import ida_loader
+import ida_nalt
 
 from ida_pro_mcp.ida_mcp import MCP_SERVER
 from ida_pro_mcp.ida_mcp.api_core import server_health, server_warmup
-from ida_pro_mcp.ida_mcp.rpc import get_current_transport_session_id, tool
-from ida_pro_mcp.idalib_session_manager import get_session_manager
+from ida_pro_mcp.ida_mcp.rpc import tool
 
 logger = logging.getLogger(__name__)
 
-STDIO_DEFAULT_CONTEXT_ID = "stdio:default"
-SHARED_FALLBACK_CONTEXT_ID = "shared:fallback"
-IDALIB_MANAGEMENT_TOOLS = {
-    "idalib_open",
-    "idalib_close",
-    "idalib_switch",
-    "idalib_unbind",
-    "idalib_list",
-    "idalib_current",
-    "idalib_save",
-    "idalib_health",
-    "idalib_warmup",
-}
-
-_ISOLATED_CONTEXTS_ENABLED = False
+_current_session_id: str | None = None
+_current_input_path: str = ""
+_current_idb_path: str = ""
 
 
-def _resolve_effective_context_id() -> str:
-    """Resolve the context key used for this request.
+def _open_database(input_path: str, run_auto_analysis: bool = True) -> None:
+    """Open a database, replacing the currently open one if any."""
+    global _current_input_path, _current_idb_path, _current_session_id
 
-    - Default mode: always use the shared fallback context.
-    - Isolated mode: require per-transport context.
-    """
-    transport_context_id = get_current_transport_session_id()
-    if _ISOLATED_CONTEXTS_ENABLED:
-        if transport_context_id is None:
-            raise RuntimeError(
-                "No MCP transport context is active for this request. "
-                "Use MCP initialize and send Mcp-Session-Id on /mcp requests."
-            )
-        return transport_context_id
-    return SHARED_FALLBACK_CONTEXT_ID
+    if _current_session_id is not None:
+        idapro.close_database()
+        _current_session_id = None
+        _current_input_path = ""
+        _current_idb_path = ""
+
+    if idapro.open_database(input_path, run_auto_analysis=run_auto_analysis):
+        raise RuntimeError(f"Failed to open database: {input_path}")
+
+    if run_auto_analysis:
+        ida_auto.auto_wait()
+
+    _current_input_path = ida_nalt.get_input_file_path() or input_path
+    _current_idb_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB) or ""
 
 
-def _context_response_fields(context_id: str) -> dict:
+def _session_dict() -> dict:
     return {
-        "context_id": context_id,
-        "transport_context_id": get_current_transport_session_id(),
-        "isolated_contexts": _ISOLATED_CONTEXTS_ENABLED,
+        "session_id": _current_session_id or "",
+        "input_path": _current_input_path,
+        "idb_path": _current_idb_path,
+        "filename": os.path.basename(_current_input_path),
     }
 
 
-def _install_context_activation_hooks() -> None:
-    if getattr(MCP_SERVER, "_idalib_context_hooks_installed", False):
-        return
-
-    original_tools_call = MCP_SERVER.registry.methods["tools/call"]
-
-    def tools_call_with_context(
-        name: str, arguments: Optional[dict] = None, _meta: Optional[dict] = None
-    ) -> dict:
-        if name not in IDALIB_MANAGEMENT_TOOLS:
-            try:
-                manager = get_session_manager()
-                context_id = _resolve_effective_context_id()
-                manager.activate_context(context_id)
-            except Exception as e:
-                return {
-                    "content": [{"type": "text", "text": str(e)}],
-                    "isError": True,
-                }
-        return original_tools_call(name, arguments, _meta)
-
-    MCP_SERVER.registry.methods["tools/call"] = tools_call_with_context
-
-    original_resources_read = MCP_SERVER.registry.methods["resources/read"]
-
-    def resources_read_with_context(uri: str, _meta: Optional[dict] = None) -> dict:
-        try:
-            manager = get_session_manager()
-            context_id = _resolve_effective_context_id()
-            manager.activate_context(context_id)
-        except Exception as e:
-            return {
-                "contents": [
-                    {
-                        "uri": uri,
-                        "mimeType": "application/json",
-                        "text": json.dumps({"error": str(e)}, indent=2),
-                    }
-                ],
-                "isError": True,
-            }
-        return original_resources_read(uri, _meta)
-
-    MCP_SERVER.registry.methods["resources/read"] = resources_read_with_context
-    setattr(MCP_SERVER, "_idalib_context_hooks_installed", True)
-
+# ---------------------------------------------------------------------------
+# Management tools (called by pool proxy via JSON-RPC forwarding)
+# ---------------------------------------------------------------------------
 
 @tool
 def idalib_open(
-    input_path: Annotated[str, "Path to the binary file to analyze"],
-    run_auto_analysis: Annotated[bool, "Run automatic analysis on the binary"] = True,
-    session_id: Annotated[
-        Optional[str], "Custom session ID (auto-generated if not provided)"
-    ] = None,
+    input_path: Annotated[str, "Path to the binary or IDB to analyze"],
+    run_auto_analysis: Annotated[bool, "Run automatic analysis"] = True,
+    session_id: Annotated[Optional[str], "Session ID assigned by pool"] = None,
 ) -> dict:
-    """Open a binary and bind it to the active idalib context policy."""
-
+    """Open a binary in this idalib instance."""
+    global _current_session_id
     try:
-        manager = get_session_manager()
-        context_id = _resolve_effective_context_id()
-        opened_session_id = manager.open_binary(
-            Path(input_path), run_auto_analysis=run_auto_analysis, session_id=session_id
-        )
-        session = manager.bind_context(context_id, opened_session_id, activate=True)
-        return {
-            "success": True,
-            **_context_response_fields(context_id),
-            "session": session.to_dict(),
-            "message": (
-                f"Binary opened and bound to context: {session.input_path.name} "
-                f"({opened_session_id})"
-            ),
-        }
-    except (FileNotFoundError, RuntimeError, ValueError) as e:
-        return {"error": str(e)}
+        _open_database(input_path, run_auto_analysis)
+        _current_session_id = session_id
+        return {"success": True, "session": _session_dict()}
     except Exception as e:
-        return {"error": f"Unexpected error: {e}"}
+        return {"error": str(e)}
 
 
 @tool
-def idalib_close(session_id: Annotated[str, "Session ID to close"]) -> dict:
-    """Close an IDA session and remove all context bindings targeting it."""
-
+def idalib_close(
+    session_id: Annotated[str, "Session ID to close"],
+) -> dict:
+    """Close the current database."""
+    global _current_session_id, _current_input_path, _current_idb_path
     try:
-        manager = get_session_manager()
-        if manager.close_session(session_id):
-            return {"success": True, "message": f"Session closed: {session_id}"}
-        return {"success": False, "error": f"Session not found: {session_id}"}
+        if _current_session_id is not None:
+            idapro.close_database()
+        _current_session_id = None
+        _current_input_path = ""
+        _current_idb_path = ""
+        return {"success": True, "message": f"Session closed: {session_id}"}
     except Exception as e:
         return {"error": f"Failed to close session: {e}"}
 
 
 @tool
-def idalib_switch(
-    session_id: Annotated[str, "Session ID to bind to active context"],
-) -> dict:
-    """Bind the active idalib context to a session and activate it."""
-
-    try:
-        manager = get_session_manager()
-        context_id = _resolve_effective_context_id()
-        session = manager.bind_context(context_id, session_id, activate=True)
-        return {
-            "success": True,
-            **_context_response_fields(context_id),
-            "session": session.to_dict(),
-            "message": (
-                f"Bound context to session: {session_id} ({session.input_path.name})"
-            ),
-        }
-    except ValueError as e:
-        return {"error": str(e)}
-    except RuntimeError as e:
-        return {"error": f"Failed to switch session: {e}"}
-    except Exception as e:
-        return {"error": f"Unexpected error: {e}"}
-
-
-@tool
-def idalib_unbind() -> dict:
-    """Unbind the active idalib context from any session."""
-
-    try:
-        manager = get_session_manager()
-        context_id = _resolve_effective_context_id()
-        if manager.unbind_context(context_id):
-            return {
-                "success": True,
-                **_context_response_fields(context_id),
-                "message": "Context unbound successfully.",
-            }
-        return {
-            "success": False,
-            **_context_response_fields(context_id),
-            "error": "No bound session for this context.",
-        }
-    except Exception as e:
-        return {"error": f"Failed to unbind context: {e}"}
-
-
-@tool
-def idalib_list() -> dict:
-    """List sessions with context-binding and active-database metadata."""
-
-    try:
-        manager = get_session_manager()
-        context_id = _resolve_effective_context_id()
-        sessions = manager.list_sessions(context_id=context_id)
-        current_context_session_id = manager.get_context_session_id(context_id)
-        return {
-            "sessions": sessions,
-            "count": len(sessions),
-            **_context_response_fields(context_id),
-            "current_context_session_id": current_context_session_id,
-        }
-    except Exception as e:
-        return {"error": f"Failed to list sessions: {e}"}
-
-
-@tool
-def idalib_current() -> dict:
-    """Return the session bound to the active idalib context policy."""
-
-    try:
-        manager = get_session_manager()
-        context_id = _resolve_effective_context_id()
-        session = manager.get_context_session(context_id)
-        if session is None:
-            return {
-                "error": (
-                    "No session bound for this context. "
-                    "Use idalib_open(...) or idalib_switch(session_id) first."
-                ),
-                **_context_response_fields(context_id),
-            }
-
-        manager.activate_context(context_id)
-        session = manager.get_context_session(context_id)
-        if session is None:
-            return {
-                "error": "Context binding became invalid. Bind to a valid session again.",
-                **_context_response_fields(context_id),
-            }
-
-        return {**session.to_dict(), **_context_response_fields(context_id)}
-    except Exception as e:
-        return {"error": f"Failed to get current session: {e}"}
-
-
-@tool
 def idalib_save(
-    path: Annotated[str, "Optional destination path (default: current IDB path)"] = "",
-    session_id: Annotated[
-        Optional[str], "Optional session to activate before saving"
-    ] = None,
+    path: Annotated[str, "Destination path (default: current IDB path)"] = "",
 ) -> dict:
-    """Save the active (or requested) IDA session database to disk."""
-
+    """Save the current database to disk."""
     try:
-        manager = get_session_manager()
-        context_id = _resolve_effective_context_id()
-
-        if session_id:
-            manager.bind_context(context_id, session_id, activate=True)
-        else:
-            manager.activate_context(context_id)
-
         save_path = path.strip() if path else ""
         if not save_path:
             save_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
         if not save_path:
-            return {
-                "ok": False,
-                **_context_response_fields(context_id),
-                "error": "Could not resolve IDB path",
-            }
-
+            return {"ok": False, "error": "Could not resolve IDB path"}
         ok = bool(ida_loader.save_database(save_path, 0))
-        return {
-            "ok": ok,
-            "path": save_path,
-            **_context_response_fields(context_id),
-            "error": None if ok else "save_database returned false",
-        }
+        return {"ok": ok, "path": save_path, "error": None if ok else "save failed"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 
 @tool
-def idalib_health(
-    session_id: Annotated[
-        Optional[str], "Optional session to bind/activate before probing health"
-    ] = None,
-) -> dict:
-    """Health/ready probe for idalib context + core server status."""
+def idalib_health() -> dict:
+    """Health/ready probe."""
     try:
-        manager = get_session_manager()
-        context_id = _resolve_effective_context_id()
-
-        if session_id:
-            session = manager.bind_context(context_id, session_id, activate=True)
-        else:
-            session = manager.get_context_session(context_id)
-            if session is None:
-                return {
-                    "ready": False,
-                    **_context_response_fields(context_id),
-                    "session": None,
-                    "health": None,
-                    "error": (
-                        "No session bound for this context. "
-                        "Use idalib_open(...) or idalib_switch(session_id) first."
-                    ),
-                }
-            manager.activate_context(context_id)
-            session = manager.get_context_session(context_id)
-
         health = server_health()
         return {
             "ready": bool(health.get("status") == "ok"),
-            **_context_response_fields(context_id),
-            "session": session.to_dict() if session is not None else None,
+            "session": _session_dict() if _current_session_id else None,
             "health": health,
-            "error": None,
         }
     except Exception as e:
         return {"ready": False, "error": str(e)}
@@ -331,36 +129,12 @@ def idalib_health(
 
 @tool
 def idalib_warmup(
-    session_id: Annotated[
-        Optional[str], "Optional session to bind/activate before warmup"
-    ] = None,
     wait_auto_analysis: Annotated[bool, "Wait for auto analysis queue"] = True,
     build_caches: Annotated[bool, "Build core caches"] = True,
     init_hexrays: Annotated[bool, "Initialize Hex-Rays plugin"] = True,
 ) -> dict:
-    """Warm up idalib context and core subsystems."""
+    """Warm up subsystems (Hex-Rays, caches)."""
     try:
-        manager = get_session_manager()
-        context_id = _resolve_effective_context_id()
-
-        if session_id:
-            session = manager.bind_context(context_id, session_id, activate=True)
-        else:
-            session = manager.get_context_session(context_id)
-            if session is None:
-                return {
-                    "ready": False,
-                    **_context_response_fields(context_id),
-                    "session": None,
-                    "warmup": None,
-                    "error": (
-                        "No session bound for this context. "
-                        "Use idalib_open(...) or idalib_switch(session_id) first."
-                    ),
-                }
-            manager.activate_context(context_id)
-            session = manager.get_context_session(context_id)
-
         warmup = server_warmup(
             wait_auto_analysis=wait_auto_analysis,
             build_caches=build_caches,
@@ -368,57 +142,79 @@ def idalib_warmup(
         )
         return {
             "ready": bool(warmup.get("ok")),
-            **_context_response_fields(context_id),
-            "session": session.to_dict() if session is not None else None,
+            "session": _session_dict() if _current_session_id else None,
             "warmup": warmup,
-            "error": None,
         }
     except Exception as e:
         return {"ready": False, "error": str(e)}
 
 
+# These tools exist so the pool can discover them via tools/list,
+# but the pool proxy intercepts them and never forwards them.
+
+@tool
+def idalib_switch(
+    session_id: Annotated[str, "Session ID"],
+) -> dict:
+    """Switch session (handled by pool proxy)."""
+    return {"error": "idalib_switch is handled by the pool proxy, not the backend."}
+
+
+@tool
+def idalib_unbind() -> dict:
+    """Unbind context (handled by pool proxy)."""
+    return {"error": "idalib_unbind is handled by the pool proxy, not the backend."}
+
+
+@tool
+def idalib_list() -> dict:
+    """List sessions (handled by pool proxy)."""
+    return {"sessions": [_session_dict()] if _current_session_id else [], "count": 1 if _current_session_id else 0}
+
+
+@tool
+def idalib_current() -> dict:
+    """Return current session info."""
+    if _current_session_id is None:
+        return {"error": "No session open."}
+    return _session_dict()
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
 def main():
-    parser = argparse.ArgumentParser(description="MCP server for IDA Pro via idalib")
+    parser = argparse.ArgumentParser(
+        description="idalib backend — single-IDB headless MCP server"
+    )
     parser.add_argument(
         "--verbose", "-v", action="store_true", help="Show debug messages"
     )
     parser.add_argument(
-        "--host",
-        type=str,
-        default="127.0.0.1",
-        help="Host to listen on, default: 127.0.0.1",
+        "--host", type=str, default="127.0.0.1",
+        help="Host to listen on (default: 127.0.0.1)",
     )
     parser.add_argument(
-        "--port", type=int, default=8745, help="Port to listen on, default: 8745"
+        "--port", type=int, default=8745,
+        help="Port to listen on (default: 8745)",
     )
     parser.add_argument(
-        "--isolated-contexts",
-        action="store_true",
-        help=(
-            "Enable strict many-to-many context isolation. "
-            "Default mode uses shared fallback context."
-        ),
+        "--unsafe", action="store_true",
+        help="Enable unsafe functions (DANGEROUS)",
     )
     parser.add_argument(
-        "--unsafe", action="store_true", help="Enable unsafe functions (DANGEROUS)"
+        "--unix-socket", type=str, default=None,
+        help="Listen on a Unix domain socket (overrides --host/--port)",
     )
     parser.add_argument(
-        "--unix-socket",
-        type=str,
-        default=None,
-        help="Listen on a Unix domain socket instead of TCP (overrides --host/--port)",
-    )
-    parser.add_argument(
-        "--auth-token",
-        type=str,
+        "--auth-token", type=str,
         default=os.environ.get("IDA_MCP_AUTH_TOKEN"),
         help="Bearer token for HTTP authentication (or set IDA_MCP_AUTH_TOKEN)",
     )
     parser.add_argument(
-        "input_path",
-        type=Path,
-        nargs="?",
-        help="Path to the input file to analyze (optional).",
+        "input_path", type=Path, nargs="?",
+        help="Binary to open on startup (optional).",
     )
     args = parser.parse_args()
 
@@ -430,62 +226,34 @@ def main():
         idapro.enable_console_messages(False)
 
     logging.basicConfig(level=log_level)
-    logging.getLogger().setLevel(log_level)
-
-    global _ISOLATED_CONTEXTS_ENABLED
-    _ISOLATED_CONTEXTS_ENABLED = args.isolated_contexts
-
-    mode = "isolated-contexts" if _ISOLATED_CONTEXTS_ENABLED else "shared-fallback"
-    logger.info("idalib session mode: %s", mode)
-
-    session_manager = get_session_manager()
 
     if args.input_path is not None:
         if not args.input_path.exists():
             raise FileNotFoundError(f"Input file not found: {args.input_path}")
-
-        logger.info("opening initial database: %s", args.input_path)
-        session_id = session_manager.open_binary(
-            args.input_path, run_auto_analysis=True
-        )
-        logger.info("Initial session created: %s", session_id)
-
-        startup_context_id = (
-            STDIO_DEFAULT_CONTEXT_ID
-            if _ISOLATED_CONTEXTS_ENABLED
-            else SHARED_FALLBACK_CONTEXT_ID
-        )
-        session_manager.bind_context(startup_context_id, session_id, activate=True)
-        logger.info(
-            "Bound startup session %s to context %s",
-            session_id,
-            startup_context_id,
-        )
-    else:
-        logger.info(
-            "No initial binary specified. Use idalib_open() to load binaries dynamically."
-        )
+        logger.info("Opening initial database: %s", args.input_path)
+        _open_database(str(args.input_path), run_auto_analysis=True)
+        global _current_session_id
+        _current_session_id = "initial"
+        logger.info("Initial database opened")
 
     def cleanup_and_exit(signum, frame):
         logger.info("Shutting down...")
-        logger.info("Closing all IDA sessions...")
-        session_manager.close_all_sessions()
-        logger.info("All sessions closed.")
+        if _current_session_id is not None:
+            try:
+                idb_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+                if idb_path:
+                    ida_loader.save_database(idb_path, 0)
+            except Exception as e:
+                logger.warning("Failed to save on shutdown: %s", e)
+            idapro.close_database()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, cleanup_and_exit)
     signal.signal(signal.SIGTERM, cleanup_and_exit)
 
-    # In isolated mode we require Streamable HTTP session semantics.
-    MCP_SERVER.require_streamable_http_session = _ISOLATED_CONTEXTS_ENABLED
-    _install_context_activation_hooks()
-
     if args.auth_token:
         MCP_SERVER.auth_token = args.auth_token
 
-    # NOTE: npx -y @modelcontextprotocol/inspector for debugging
-    # TODO: with background=True the main thread does not fake any
-    # work from @idasync, so we deadlock.
     if args.unix_socket:
         MCP_SERVER.serve(unix_socket=args.unix_socket, background=False)
     else:
