@@ -26,6 +26,7 @@ class IDASession:
 
     session_id: str
     input_path: Path
+    idb_path: str = ""
     created_at: datetime = field(default_factory=datetime.now)
     last_accessed: datetime = field(default_factory=datetime.now)
     is_analyzing: bool = False
@@ -36,6 +37,7 @@ class IDASession:
         return {
             "session_id": self.session_id,
             "input_path": str(self.input_path),
+            "idb_path": self.idb_path,
             "filename": self.input_path.name,
             "created_at": self.created_at.isoformat(),
             "last_accessed": self.last_accessed.isoformat(),
@@ -103,10 +105,16 @@ class IDASessionManager:
             logger.info(f"Opening database: {input_path} (session: {session_id})")
             self._activate_database_path(str(input_path), run_auto_analysis)
 
-            # Create session object
+            # Get canonical paths from IDA after opening
+            import ida_nalt
+            canonical_input = ida_nalt.get_input_file_path()
+            idb_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB) or ""
+
+            # Create session object with canonical paths
             session = IDASession(
                 session_id=session_id,
-                input_path=input_path,
+                input_path=Path(canonical_input) if canonical_input else input_path,
+                idb_path=idb_path,
                 is_analyzing=run_auto_analysis,
             )
 

@@ -44,16 +44,21 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SessionInfo:
     session_id: str
-    binary_path: str
+    input_path: str
+    idb_path: str
     instance_index: int
+    is_external: bool = False
     last_accessed: float = field(default_factory=time.monotonic)
+    created_at: float = field(default_factory=time.monotonic)
 
     def to_dict(self, *, refcount: int = 0) -> dict:
         return {
             "session_id": self.session_id,
-            "input_path": self.binary_path,
-            "filename": os.path.basename(self.binary_path),
+            "input_path": self.input_path,
+            "idb_path": self.idb_path,
+            "filename": os.path.basename(self.input_path),
             "refcount": refcount,
+            "is_external": self.is_external,
             "last_accessed": self.last_accessed,
             "instance_index": self.instance_index,
         }
@@ -212,24 +217,41 @@ class InstanceManager:
 # ---------------------------------------------------------------------------
 
 class SessionRegistry:
-    """Tracks session metadata, path uniqueness, context bindings, and refcounts."""
+    """Tracks session metadata, path uniqueness, context bindings, and refcounts.
+
+    Two path indices provide dedup:
+    - ``_input_path_index``: canonical binary path → list of session IDs
+      (one-to-many when ``allow_duplicate_input`` is used)
+    - ``_idb_path_index``: IDB file path → session ID (always one-to-one)
+    """
 
     def __init__(self):
         self.sessions: dict[str, SessionInfo] = {}
-        self._open_paths: dict[str, str] = {}
+        self._input_path_index: dict[str, list[str]] = {}
+        self._idb_path_index: dict[str, str] = {}
         self._context_bindings: dict[str, str] = {}
         self._refcounts: dict[str, int] = {}
 
     def create(
-        self, session_id: str, binary_path: str, instance_index: int
+        self,
+        session_id: str,
+        input_path: str,
+        idb_path: str,
+        instance_index: int,
+        *,
+        is_external: bool = False,
     ) -> SessionInfo:
         sess = SessionInfo(
             session_id=session_id,
-            binary_path=binary_path,
+            input_path=input_path,
+            idb_path=idb_path,
             instance_index=instance_index,
+            is_external=is_external,
         )
         self.sessions[session_id] = sess
-        self._open_paths[binary_path] = session_id
+        self._input_path_index.setdefault(input_path, []).append(session_id)
+        if idb_path:
+            self._idb_path_index[idb_path] = session_id
         self._refcounts[session_id] = 0
         return sess
 
@@ -237,7 +259,13 @@ class SessionRegistry:
         """Permanently remove a session."""
         sess = self.sessions.pop(session_id, None)
         if sess:
-            self._open_paths.pop(sess.binary_path, None)
+            sids = self._input_path_index.get(sess.input_path, [])
+            if session_id in sids:
+                sids.remove(session_id)
+            if not sids:
+                self._input_path_index.pop(sess.input_path, None)
+            if sess.idb_path:
+                self._idb_path_index.pop(sess.idb_path, None)
         self._refcounts.pop(session_id, None)
         self._unbind_session_everywhere(session_id)
         return sess
@@ -250,9 +278,28 @@ class SessionRegistry:
         if sess:
             sess.last_accessed = time.monotonic()
 
-    def find_by_path(self, resolved_path: str) -> str | None:
-        """Return session_id if this path is already tracked."""
-        return self._open_paths.get(resolved_path)
+    def find_by_input_path(self, input_path: str) -> list[str]:
+        """Return all session_ids with this input_path."""
+        return list(self._input_path_index.get(input_path, []))
+
+    def find_by_idb_path(self, idb_path: str) -> str | None:
+        """Return the session_id for an exact IDB path match."""
+        return self._idb_path_index.get(idb_path)
+
+    def disambiguate(self, session_ids: list[str], input_path: str) -> str:
+        """Pick the best session when multiple share the same input_path.
+
+        Priority: IDB in the same directory as input_path > earliest created.
+        """
+        input_dir = os.path.dirname(input_path)
+        same_dir = [
+            sid for sid in session_ids
+            if os.path.dirname(self.sessions[sid].idb_path) == input_dir
+        ]
+        if same_dir:
+            return same_dir[0]
+        # Fall back to earliest by created_at
+        return min(session_ids, key=lambda sid: self.sessions[sid].created_at)
 
     def generate_id(self) -> str:
         return str(uuid.uuid4())[:8]
@@ -355,7 +402,8 @@ class PoolManager:
         with self._lock:
             self.im.kill_all()
             self.sr.sessions.clear()
-            self.sr._open_paths.clear()
+            self.sr._input_path_index.clear()
+            self.sr._idb_path_index.clear()
             self.sr._context_bindings.clear()
             self.sr._refcounts.clear()
 
@@ -364,25 +412,46 @@ class PoolManager:
         binary_path: str,
         session_id: str | None = None,
         run_auto_analysis: bool = True,
+        allow_duplicate_input: bool = False,
     ) -> dict:
         resolved = os.path.abspath(binary_path)
+        is_idb = resolved.endswith((".idb", ".i64"))
 
         with self._lock:
-            existing_sid = self.sr.find_by_path(resolved)
-            if existing_sid is not None:
-                self.sr.touch(existing_sid)
-                sess = self.sr.get(existing_sid)
-                return {
-                    "success": True,
-                    "existing": True,
-                    "session": sess.to_dict(refcount=self.sr.get_refcount(existing_sid)),
-                    "message": f"Binary already open as session '{existing_sid}'.",
-                }
+            # IDB path: check exact IDB match first
+            if is_idb:
+                existing_sid = self.sr.find_by_idb_path(resolved)
+                if existing_sid is not None:
+                    self.sr.touch(existing_sid)
+                    sess = self.sr.get(existing_sid)
+                    return {
+                        "success": True,
+                        "existing": True,
+                        "session": sess.to_dict(refcount=self.sr.get_refcount(existing_sid)),
+                        "message": f"IDB already open as session '{existing_sid}'.",
+                    }
+            else:
+                # Non-IDB path: check input_path index
+                matching_sids = self.sr.find_by_input_path(resolved)
+                if matching_sids:
+                    if len(matching_sids) == 1:
+                        existing_sid = matching_sids[0]
+                    else:
+                        existing_sid = self.sr.disambiguate(matching_sids, resolved)
+                    self.sr.touch(existing_sid)
+                    sess = self.sr.get(existing_sid)
+                    return {
+                        "success": True,
+                        "existing": True,
+                        "session": sess.to_dict(refcount=self.sr.get_refcount(existing_sid)),
+                        "message": f"Binary already open as session '{existing_sid}'.",
+                    }
 
             inst = self._allocate_instance_locked()
             if session_id is None:
                 session_id = self.sr.generate_id()
 
+        # Forward to backend
         resp = self.im.forward_tool_call(inst, "idalib_open", {
             "input_path": resolved,
             "run_auto_analysis": run_auto_analysis,
@@ -392,8 +461,39 @@ class PoolManager:
         if isinstance(resp, dict) and resp.get("error"):
             return resp
 
+        # Extract canonical paths from backend response
+        backend_session = resp.get("session", {}) if isinstance(resp, dict) else {}
+        canonical_input = backend_session.get("input_path", resolved)
+        idb_path = backend_session.get("idb_path", "")
+
         with self._lock:
-            sess = self.sr.create(session_id, resolved, inst.index)
+            # Post-open conflict check: input_path may differ from what we passed
+            canonical_input = os.path.abspath(canonical_input) if canonical_input else resolved
+            if idb_path:
+                idb_path = os.path.abspath(idb_path)
+
+            existing_for_input = self.sr.find_by_input_path(canonical_input)
+            if existing_for_input and not allow_duplicate_input:
+                # Conflict: same input binary already open under different IDB
+                conflict_sid = existing_for_input[0]
+                # Roll back: close the just-opened instance
+                try:
+                    self.im.forward_tool_call(inst, "idalib_close", {"session_id": session_id})
+                except Exception:
+                    pass
+                self.im.kill(inst)
+                return {
+                    "success": False,
+                    "error": (
+                        f"Binary already open as session '{conflict_sid}'. "
+                        f"Use allow_duplicate_input=true to open another IDB "
+                        f"for the same binary."
+                    ),
+                }
+
+            sess = self.sr.create(
+                session_id, canonical_input, idb_path, inst.index
+            )
             inst.session_id = session_id
 
         return {

@@ -90,8 +90,8 @@ _MGMT_TOOL_OVERRIDES: dict[str, dict] = {
     "idalib_open": {
         "name": "idalib_open",
         "description": (
-            "Open a binary for analysis. If the binary is already open by "
-            "another agent, shares the existing session. The returned "
+            "Open a binary or IDB for analysis. If the same binary/IDB is "
+            "already open, shares the existing session. The returned "
             "session_id may differ from the one you requested — always use "
             "the returned session_id for subsequent calls. Each idalib_open "
             "must be balanced by an idalib_close when you are done."
@@ -101,7 +101,9 @@ _MGMT_TOOL_OVERRIDES: dict[str, dict] = {
             "properties": {
                 "input_path": {
                     "type": "string",
-                    "description": "Path to the binary file to analyze",
+                    "description": (
+                        "Path to the binary file or IDB (.idb/.i64) to analyze"
+                    ),
                 },
                 "run_auto_analysis": {
                     "type": "boolean",
@@ -113,6 +115,13 @@ _MGMT_TOOL_OVERRIDES: dict[str, dict] = {
                         "Suggested session ID. This is advisory only — if the "
                         "binary is already open, the existing session_id is "
                         "returned instead."
+                    ),
+                },
+                "allow_duplicate_input": {
+                    "type": "boolean",
+                    "description": (
+                        "Allow opening a different IDB for a binary that is "
+                        "already open in another session (default: false)"
                     ),
                 },
             },
@@ -334,8 +343,12 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
         input_path = arguments.get("input_path", "")
         session_id = arguments.get("session_id")
         run_auto = arguments.get("run_auto_analysis", True)
+        allow_dup = arguments.get("allow_duplicate_input", False)
 
-        result = pool.open_session(input_path, session_id=session_id, run_auto_analysis=run_auto)
+        result = pool.open_session(
+            input_path, session_id=session_id,
+            run_auto_analysis=run_auto, allow_duplicate_input=allow_dup,
+        )
         if not result.get("success"):
             return result
 
