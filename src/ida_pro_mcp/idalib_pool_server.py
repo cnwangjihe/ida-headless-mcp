@@ -49,9 +49,11 @@ _mcp_mod = _import_zeromcp_module(
     "ida_pro_mcp.ida_mcp.zeromcp.mcp", "mcp.py"
 )
 McpServer = _mcp_mod.McpServer
+McpHttpRequestHandler = _mcp_mod.McpHttpRequestHandler
 JsonRpcResponse = _jsonrpc_mod.JsonRpcResponse
 
 from ida_pro_mcp.idalib_pool_manager import PoolManager  # noqa: E402
+from ida_pro_mcp.pool_websocket import ExternalInstanceBridge  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -371,6 +373,30 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
         if not sid:
             return {"success": False, "error": "No session bound. Use idalib_open first."}
 
+        # Guard: external sessions cannot be force-closed by agents
+        with pool._lock:
+            sess = pool.sr.get(sid)
+        if sess and sess.is_external:
+            if force:
+                return {
+                    "success": False,
+                    "error": (
+                        "Cannot force-close an externally registered session. "
+                        "The session owner must disconnect from the pool."
+                    ),
+                }
+            if ctx:
+                bound_sid = pool.get_context_session_id(ctx)
+                if bound_sid == sid:
+                    pool.unbind_context(ctx)
+            new_rc = pool.decrement_refcount(sid)
+            return {
+                "success": True,
+                "closed": False,
+                "refcount": new_rc,
+                "message": "Reference released. Session is externally managed.",
+            }
+
         if ctx:
             bound_sid = pool.get_context_session_id(ctx)
             if bound_sid == sid:
@@ -576,6 +602,88 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
 
 
 # --------------------------------------------------------------------------
+# WebSocket handler for external plugin registration
+# --------------------------------------------------------------------------
+
+def build_pool_handler_class(pool: PoolManager):
+    """Create a request handler class with WebSocket support for /pool/ws."""
+
+    class PoolHttpRequestHandler(McpHttpRequestHandler):
+
+        def do_GET(self):
+            from urllib.parse import urlparse
+            path = urlparse(self.path).path
+            if path == "/pool/ws":
+                if not self._check_auth():
+                    return
+                self._handle_pool_ws()
+            else:
+                super().do_GET()
+
+        def _handle_pool_ws(self):
+            try:
+                from websockets.sync.server import ServerConnection
+                from websockets.http11 import Request
+            except ImportError:
+                self.send_error(500, "websockets library not available")
+                return
+
+            ws = ServerConnection(self.request)
+            try:
+                ws.handshake()
+            except Exception as e:
+                logger.warning("WebSocket handshake failed: %s", e)
+                return
+
+            bridge = ExternalInstanceBridge(ws)
+            session_id = None
+
+            try:
+                raw = ws.recv()
+                reg = json.loads(raw)
+                if reg.get("type") != "register":
+                    ws.send(json.dumps({"success": False, "error": "Expected register message"}))
+                    return
+
+                result = pool.register_external(
+                    ws_bridge=bridge,
+                    input_path=reg.get("input_path", ""),
+                    idb_path=reg.get("idb_path", ""),
+                    session_id=reg.get("session_id"),
+                    allow_duplicate_input=reg.get("allow_duplicate_input", False),
+                )
+                ws.send(json.dumps(result))
+
+                if not result.get("success"):
+                    return
+
+                session_id = result["session"]["session_id"]
+                logger.info(
+                    "External plugin registered: session=%s input=%s",
+                    session_id, reg.get("input_path"),
+                )
+
+                def on_check_agents():
+                    return pool.get_external_agent_count(session_id)
+
+                bridge.run_loop(on_check_agents=on_check_agents)
+
+            except Exception as e:
+                logger.info("External plugin connection ended: %s", e)
+            finally:
+                bridge.alive = False
+                if session_id:
+                    pool.unregister_external(session_id)
+                    logger.info("External plugin unregistered: session=%s", session_id)
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+
+    return PoolHttpRequestHandler
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -668,7 +776,9 @@ def main():
         if not url.hostname or not url.port:
             print(f"Error: invalid transport URL: {transport}", file=sys.stderr)
             sys.exit(1)
-        mcp.serve(host=url.hostname, port=url.port, background=False)
+        handler_cls = build_pool_handler_class(pool)
+        mcp.serve(host=url.hostname, port=url.port, background=False,
+                  request_handler=handler_cls)
 
 
 if __name__ == "__main__":

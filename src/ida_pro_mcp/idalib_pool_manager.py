@@ -68,8 +68,18 @@ class SessionInfo:
 class InstanceInfo:
     index: int
     socket_path: str
-    process: subprocess.Popen
+    process: subprocess.Popen | None
     session_id: str | None = None  # None = idle
+    ws_bridge: Any | None = None  # ExternalInstanceBridge for external instances
+
+    @property
+    def is_external(self) -> bool:
+        return self.ws_bridge is not None
+
+    def is_alive(self) -> bool:
+        if self.is_external:
+            return self.ws_bridge is not None and self.ws_bridge.alive
+        return self.process is not None and self.process.poll() is None
 
 
 # ---------------------------------------------------------------------------
@@ -117,17 +127,36 @@ class InstanceManager:
         self._wait_for_ready(inst)
         return inst
 
+    def register_external(self, ws_bridge) -> InstanceInfo:
+        """Register an external instance connected via WebSocket."""
+        idx = self._next_index
+        inst = InstanceInfo(
+            index=idx,
+            socket_path="",
+            process=None,
+            ws_bridge=ws_bridge,
+        )
+        self._next_index += 1
+        self.instances.append(inst)
+        logger.info("Registered external instance %d", idx)
+        return inst
+
     def kill(self, inst: InstanceInfo) -> None:
-        logger.info("Killing instance %d (pid %d)", inst.index, inst.process.pid)
-        try:
-            inst.process.send_signal(signal.SIGTERM)
-            inst.process.wait(timeout=10)
-        except Exception:
-            inst.process.kill()
-            inst.process.wait(timeout=5)
-        log_file = getattr(inst, "_log_file", None)
-        if log_file:
-            log_file.close()
+        if inst.is_external:
+            logger.info("Removing external instance %d", inst.index)
+            if inst.ws_bridge:
+                inst.ws_bridge.alive = False
+        else:
+            logger.info("Killing instance %d (pid %d)", inst.index, inst.process.pid)
+            try:
+                inst.process.send_signal(signal.SIGTERM)
+                inst.process.wait(timeout=10)
+            except Exception:
+                inst.process.kill()
+                inst.process.wait(timeout=5)
+            log_file = getattr(inst, "_log_file", None)
+            if log_file:
+                log_file.close()
         if inst in self.instances:
             self.instances.remove(inst)
 
@@ -188,6 +217,8 @@ class InstanceManager:
         return sc if sc is not None else result
 
     def forward_raw(self, inst: InstanceInfo, request: dict) -> dict:
+        if inst.is_external:
+            return inst.ws_bridge.forward_request(request)
         conn = http.client.HTTPConnection("localhost", timeout=300)
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.connect(inst.socket_path)
@@ -204,7 +235,7 @@ class InstanceManager:
             conn.close()
 
     def forward_tools_list(self) -> list[dict]:
-        candidates = [i for i in self.instances if i.process.poll() is None]
+        candidates = [i for i in self.instances if i.is_alive()]
         if not candidates:
             return []
         request = {"jsonrpc": "2.0", "method": "tools/list", "id": 1}
@@ -513,11 +544,15 @@ class PoolManager:
                 self.sr.remove(session_id)
                 return {"success": True, "closed": True, "message": f"Session cleaned up: {session_id}"}
 
-        try:
-            self.im.forward_tool_call(inst, "idalib_save", {})
-        except Exception:
-            logger.warning("Failed to save before closing session %s", session_id)
-        self.im.forward_tool_call(inst, "idalib_close", {"session_id": session_id})
+        if not sess.is_external:
+            try:
+                self.im.forward_tool_call(inst, "idalib_save", {})
+            except Exception:
+                logger.warning("Failed to save before closing session %s", session_id)
+            try:
+                self.im.forward_tool_call(inst, "idalib_close", {"session_id": session_id})
+            except Exception:
+                logger.warning("Failed to forward close for session %s", session_id)
 
         with self._lock:
             self.sr.remove(session_id)
@@ -525,6 +560,81 @@ class PoolManager:
             self.im.kill(inst)
 
         return {"success": True, "closed": True, "message": f"Session closed: {session_id}"}
+
+    # ------------------------------------------------------------------
+    # External instance registration
+    # ------------------------------------------------------------------
+
+    def register_external(
+        self,
+        ws_bridge,
+        input_path: str,
+        idb_path: str,
+        session_id: str | None = None,
+        allow_duplicate_input: bool = False,
+    ) -> dict:
+        """Register an external IDA plugin instance via WebSocket."""
+        input_path = os.path.abspath(input_path)
+        if idb_path:
+            idb_path = os.path.abspath(idb_path)
+
+        with self._lock:
+            # Check idb_path conflict (same IDB already open)
+            if idb_path and self.sr.find_by_idb_path(idb_path):
+                existing_sid = self.sr.find_by_idb_path(idb_path)
+                return {
+                    "success": False,
+                    "error": f"IDB already open as session '{existing_sid}'.",
+                }
+
+            # Check input_path conflict
+            existing_for_input = self.sr.find_by_input_path(input_path)
+            if existing_for_input and not allow_duplicate_input:
+                return {
+                    "success": False,
+                    "needs_confirm": True,
+                    "conflict_session": existing_for_input[0],
+                    "message": (
+                        f"Binary already open as session "
+                        f"'{existing_for_input[0]}'. Confirm to register "
+                        f"a second session for the same binary."
+                    ),
+                }
+
+            inst = self.im.register_external(ws_bridge)
+            if not session_id:
+                session_id = self.sr.generate_id()
+
+            sess = self.sr.create(
+                session_id, input_path, idb_path, inst.index,
+                is_external=True,
+            )
+            inst.session_id = session_id
+            # User's baseline refcount
+            self.sr.increment_refcount(session_id)
+
+        return {
+            "success": True,
+            "session": sess.to_dict(refcount=self.sr.get_refcount(session_id)),
+        }
+
+    def unregister_external(self, session_id: str) -> dict:
+        """Remove an external session from the pool."""
+        with self._lock:
+            sess = self.sr.get(session_id)
+            if not sess or not sess.is_external:
+                return {"success": False, "error": "External session not found"}
+            agents = max(0, self.sr.get_refcount(session_id) - 1)
+            self.sr.remove(session_id)
+            inst = self.im.find(sess.instance_index)
+            if inst:
+                inst.session_id = None
+                self.im.kill(inst)
+        return {"success": True, "active_agents": agents}
+
+    def get_external_agent_count(self, session_id: str) -> int:
+        with self._lock:
+            return max(0, self.sr.get_refcount(session_id) - 1)
 
     def resolve_session_instance(
         self, session_id: str

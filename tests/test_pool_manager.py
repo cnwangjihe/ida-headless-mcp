@@ -1272,5 +1272,181 @@ class TestMultiAgentScenario(unittest.TestCase):
         pool.close_session.assert_called_once_with("s1")
 
 
+# ---------------------------------------------------------------------------
+# External instance registration tests
+# ---------------------------------------------------------------------------
+
+class TestExternalRegistration(unittest.TestCase):
+    """Tests for external IDA plugin registration via WebSocket bridge."""
+
+    def test_register_external_creates_session(self):
+        pool = PoolManager.__new__(PoolManager)
+        pool._lock = threading.Lock()
+        pool.im = InstanceManager.__new__(InstanceManager)
+        pool.im.instances = []
+        pool.im._next_index = 0
+        pool.sr = SessionRegistry()
+
+        bridge = MagicMock()
+        bridge.alive = True
+
+        result = pool.register_external(
+            bridge, "/tmp/a.elf", "/tmp/a.elf.i64", session_id="ext1",
+        )
+        self.assertTrue(result["success"])
+        self.assertEqual(result["session"]["session_id"], "ext1")
+        self.assertTrue(result["session"]["is_external"])
+        self.assertEqual(result["session"]["refcount"], 1)
+
+    def test_register_external_idb_conflict_rejected(self):
+        pool = PoolManager.__new__(PoolManager)
+        pool._lock = threading.Lock()
+        pool.im = InstanceManager.__new__(InstanceManager)
+        pool.im.instances = []
+        pool.im._next_index = 0
+        pool.sr = SessionRegistry()
+        pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=99)
+
+        bridge = MagicMock()
+        result = pool.register_external(
+            bridge, "/tmp/a.elf", "/tmp/a.elf.i64", session_id="ext1",
+        )
+        self.assertFalse(result["success"])
+        self.assertIn("already open", result["error"])
+
+    def test_register_external_input_conflict_needs_confirm(self):
+        pool = PoolManager.__new__(PoolManager)
+        pool._lock = threading.Lock()
+        pool.im = InstanceManager.__new__(InstanceManager)
+        pool.im.instances = []
+        pool.im._next_index = 0
+        pool.sr = SessionRegistry()
+        pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=99)
+
+        bridge = MagicMock()
+        result = pool.register_external(
+            bridge, "/tmp/a.elf", "/tmp/other.i64", session_id="ext1",
+        )
+        self.assertFalse(result["success"])
+        self.assertTrue(result.get("needs_confirm"))
+
+    def test_register_external_input_conflict_with_allow(self):
+        pool = PoolManager.__new__(PoolManager)
+        pool._lock = threading.Lock()
+        pool.im = InstanceManager.__new__(InstanceManager)
+        pool.im.instances = []
+        pool.im._next_index = 0
+        pool.sr = SessionRegistry()
+        pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=99)
+
+        bridge = MagicMock()
+        bridge.alive = True
+        result = pool.register_external(
+            bridge, "/tmp/a.elf", "/tmp/other.i64", session_id="ext1",
+            allow_duplicate_input=True,
+        )
+        self.assertTrue(result["success"])
+
+    def test_unregister_external(self):
+        pool = PoolManager.__new__(PoolManager)
+        pool._lock = threading.Lock()
+        pool.im = InstanceManager.__new__(InstanceManager)
+        pool.im.instances = []
+        pool.im._next_index = 0
+        pool.sr = SessionRegistry()
+
+        bridge = MagicMock()
+        bridge.alive = True
+        pool.register_external(bridge, "/tmp/a.elf", "/tmp/a.elf.i64", session_id="ext1")
+
+        # Simulate agent refcount
+        pool.sr.increment_refcount("ext1")  # agent opens
+        self.assertEqual(pool.sr.get_refcount("ext1"), 2)  # user + agent
+
+        result = pool.unregister_external("ext1")
+        self.assertTrue(result["success"])
+        self.assertEqual(result["active_agents"], 1)
+        self.assertIsNone(pool.sr.get("ext1"))
+
+    def test_get_external_agent_count(self):
+        pool = PoolManager.__new__(PoolManager)
+        pool._lock = threading.Lock()
+        pool.im = InstanceManager.__new__(InstanceManager)
+        pool.im.instances = []
+        pool.im._next_index = 0
+        pool.sr = SessionRegistry()
+
+        bridge = MagicMock()
+        bridge.alive = True
+        pool.register_external(bridge, "/tmp/a.elf", "/tmp/a.elf.i64", session_id="ext1")
+        self.assertEqual(pool.get_external_agent_count("ext1"), 0)
+
+        pool.sr.increment_refcount("ext1")
+        self.assertEqual(pool.get_external_agent_count("ext1"), 1)
+
+
+class TestExternalCloseGuard(TestPoolServerDispatch):
+    """Tests for the close guard on external sessions."""
+
+    def _tool_call(self, mcp, name, arguments, ctx):
+        req = {
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+            "id": 1,
+        }
+        resp = self._dispatch(mcp, req, ctx)
+        return resp["result"]["structuredContent"]
+
+    def test_force_close_external_rejected(self):
+        mcp, pool = self._make_mcp_and_pool()
+        pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0, is_external=True)
+        pool.sr.increment_refcount("s1")
+        pool.sr.increment_refcount("s1")  # agent ref
+        pool.sr.bind_context("sse:agent-a", "s1")
+
+        self.build_dispatch(mcp, pool)
+        r = self._tool_call(mcp, "idalib_close", {"force": True}, "sse:agent-a")
+        self.assertFalse(r["success"])
+        self.assertIn("externally registered", r["error"])
+
+    def test_normal_close_external_keeps_session(self):
+        mcp, pool = self._make_mcp_and_pool()
+        pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0, is_external=True)
+        pool.sr.increment_refcount("s1")  # user ref
+        pool.sr.increment_refcount("s1")  # agent ref
+        pool.sr.bind_context("sse:agent-a", "s1")
+
+        self.build_dispatch(mcp, pool)
+        r = self._tool_call(mcp, "idalib_close", {}, "sse:agent-a")
+        self.assertTrue(r["success"])
+        self.assertFalse(r["closed"])
+        self.assertEqual(r["refcount"], 1)
+        self.assertIsNotNone(pool.sr.get("s1"))
+
+
+class TestInstanceInfoExternal(unittest.TestCase):
+
+    def test_is_external_with_ws_bridge(self):
+        bridge = MagicMock()
+        bridge.alive = True
+        inst = InstanceInfo(index=0, socket_path="", process=None, ws_bridge=bridge)
+        self.assertTrue(inst.is_external)
+        self.assertTrue(inst.is_alive())
+
+    def test_is_not_external_without_bridge(self):
+        proc = MagicMock()
+        proc.poll.return_value = None
+        inst = InstanceInfo(index=0, socket_path="/tmp/0.sock", process=proc)
+        self.assertFalse(inst.is_external)
+        self.assertTrue(inst.is_alive())
+
+    def test_external_dead_when_bridge_dead(self):
+        bridge = MagicMock()
+        bridge.alive = False
+        inst = InstanceInfo(index=0, socket_path="", process=None, ws_bridge=bridge)
+        self.assertFalse(inst.is_alive())
+
+
 if __name__ == "__main__":
     unittest.main()
