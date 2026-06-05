@@ -365,7 +365,7 @@ class PoolManager:
         session_id: str | None = None,
         run_auto_analysis: bool = True,
     ) -> dict:
-        resolved = str(Path(binary_path).resolve())
+        resolved = os.path.abspath(binary_path)
 
         with self._lock:
             existing_sid = self.sr.find_by_path(resolved)

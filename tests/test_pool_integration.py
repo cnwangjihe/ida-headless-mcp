@@ -18,8 +18,8 @@ from http.client import HTTPConnection
 from pathlib import Path
 
 TESTS_DIR = Path(__file__).parent
-CRACKME = str((TESTS_DIR / "crackme03.elf").resolve())
-TYPED_FIXTURE = str((TESTS_DIR / "typed_fixture.elf").resolve())
+CRACKME = os.path.abspath(TESTS_DIR / "crackme03.elf")
+TYPED_FIXTURE = os.path.abspath(TESTS_DIR / "typed_fixture.elf")
 
 IDADIR = os.environ.get("IDADIR", "")
 SKIP_REASON = "IDADIR not set" if not IDADIR else ""

@@ -4,6 +4,7 @@ This module provides session management for multiple IDA databases in idalib mod
 Each session represents an opened binary with its own IDA database instance.
 """
 
+import os
 import uuid
 import threading
 import logging
@@ -87,7 +88,7 @@ class IDASessionManager:
         with self._lock:
             # Check if this file is already tracked
             for sid, session in self._sessions.items():
-                if session.input_path.resolve() == input_path.resolve():
+                if os.path.abspath(session.input_path) == os.path.abspath(input_path):
                     logger.info(f"Binary already open in session: {sid}")
                     session.last_accessed = datetime.now()
                     return sid
