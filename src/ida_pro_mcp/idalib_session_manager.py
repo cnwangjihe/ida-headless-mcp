@@ -14,6 +14,7 @@ from datetime import datetime
 
 import idapro
 import ida_auto
+import ida_loader
 
 logger = logging.getLogger(__name__)
 
@@ -253,11 +254,18 @@ class IDASessionManager:
             return self._sessions.get(session_id)
 
     def close_all_sessions(self):
-        """Close all sessions and databases"""
+        """Save and close all sessions and databases"""
         with self._lock:
             logger.info(f"Closing all {len(self._sessions)} sessions")
 
             if self._active_session_id is not None:
+                try:
+                    idb_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+                    if idb_path:
+                        ida_loader.save_database(idb_path, 0)
+                        logger.info("Saved database: %s", idb_path)
+                except Exception as e:
+                    logger.warning("Failed to save database on shutdown: %s", e)
                 idapro.close_database()
                 self._active_session_id = None
 

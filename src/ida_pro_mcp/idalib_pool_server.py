@@ -4,11 +4,15 @@ This process does NOT import ``idapro``.  It speaks MCP over HTTP to clients
 and forwards IDA tool calls to backend idalib_server sub-processes connected
 via Unix domain sockets.
 
+Each MCP transport session (SSE connection or Streamable HTTP session) gets
+its own context binding, so multiple agents sharing one endpoint can work on
+different IDBs without interfering.  Sessions are reference-counted: when the
+last agent closes its reference, the IDB is saved and the instance is killed.
+
 Usage::
 
     uv run idalib-pool --port 8750 /path/to/binary          # single binary
-    uv run idalib-pool --max-instances 3 --port 8750         # limited pool
-    uv run idalib-pool --max-instances 0 --port 8750         # unlimited
+    uv run idalib-pool --max-instances 3 --port 8750         # pre-warm 3 instances
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ import logging
 import os
 import signal
 import sys
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -58,13 +63,15 @@ IDALIB_MANAGEMENT_TOOLS = {
     "idalib_open",
     "idalib_close",
     "idalib_switch",
-    "idalib_unbind",
     "idalib_list",
     "idalib_current",
     "idalib_save",
     "idalib_health",
     "idalib_warmup",
 }
+
+# Backend tools that are not exposed in pool mode
+_HIDDEN_BACKEND_TOOLS = {"idalib_unbind"}
 
 # --------------------------------------------------------------------------
 # Tool schema injection
@@ -74,22 +81,203 @@ _SESSION_ID_SCHEMA: dict = {
     "type": "string",
     "description": (
         "Session ID to route this call to. "
-        "If omitted, uses the default session."
+        "If omitted, routes to the session bound to the caller's context."
     ),
+}
+
+# Management tool schemas — override backend descriptions for pool semantics.
+_MGMT_TOOL_OVERRIDES: dict[str, dict] = {
+    "idalib_open": {
+        "name": "idalib_open",
+        "description": (
+            "Open a binary for analysis. If the binary is already open by "
+            "another agent, shares the existing session. The returned "
+            "session_id may differ from the one you requested — always use "
+            "the returned session_id for subsequent calls. Each idalib_open "
+            "must be balanced by an idalib_close when you are done."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "input_path": {
+                    "type": "string",
+                    "description": "Path to the binary file to analyze",
+                },
+                "run_auto_analysis": {
+                    "type": "boolean",
+                    "description": "Run automatic analysis on the binary (default: true)",
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": (
+                        "Suggested session ID. This is advisory only — if the "
+                        "binary is already open, the existing session_id is "
+                        "returned instead."
+                    ),
+                },
+            },
+            "required": ["input_path"],
+        },
+    },
+    "idalib_close": {
+        "name": "idalib_close",
+        "description": (
+            "Release your reference to a session. The IDB is only closed "
+            "when all agents have released their references (refcount "
+            "reaches zero). Defaults to your currently bound session."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": (
+                        "Session ID to close. If omitted, closes the session "
+                        "bound to your context."
+                    ),
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": (
+                        "Force-close the session regardless of refcount. "
+                        "DANGEROUS: disconnects all other agents using this "
+                        "session. Only use when you need to immediately save "
+                        "and release the IDB."
+                    ),
+                },
+            },
+        },
+    },
+    "idalib_switch": {
+        "name": "idalib_switch",
+        "description": (
+            "Switch your default session routing to a different existing "
+            "session. This does not affect reference counts — you still need "
+            "to idalib_close sessions you opened. Use this to access a "
+            "session opened by another agent without changing ownership."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "Session ID to route your requests to",
+                },
+            },
+            "required": ["session_id"],
+        },
+    },
+    "idalib_list": {
+        "name": "idalib_list",
+        "description": (
+            "List all open sessions with refcounts. Shows which session is "
+            "bound to your context."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    "idalib_current": {
+        "name": "idalib_current",
+        "description": (
+            "Return the session currently bound to your context, or an error "
+            "if no session is bound."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    "idalib_save": {
+        "name": "idalib_save",
+        "description": (
+            "Save the IDB to disk without closing the session. Defaults to "
+            "your currently bound session."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Destination path (default: current IDB path)",
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": (
+                        "Session to save. If omitted, saves the session "
+                        "bound to your context."
+                    ),
+                },
+            },
+        },
+    },
+    "idalib_health": {
+        "name": "idalib_health",
+        "description": (
+            "Health/ready probe. Defaults to your currently bound session."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": (
+                        "Session to probe. If omitted, probes the session "
+                        "bound to your context."
+                    ),
+                },
+            },
+        },
+    },
+    "idalib_warmup": {
+        "name": "idalib_warmup",
+        "description": (
+            "Warm up subsystems (Hex-Rays, caches). Defaults to your "
+            "currently bound session."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": (
+                        "Session to warm up. If omitted, warms the session "
+                        "bound to your context."
+                    ),
+                },
+                "wait_auto_analysis": {
+                    "type": "boolean",
+                    "description": "Wait for auto analysis queue (default: true)",
+                },
+                "build_caches": {
+                    "type": "boolean",
+                    "description": "Build core caches (default: true)",
+                },
+                "init_hexrays": {
+                    "type": "boolean",
+                    "description": "Initialize Hex-Rays plugin (default: true)",
+                },
+            },
+        },
+    },
 }
 
 
 def _prepare_tools(tools: list[dict]) -> list[dict]:
     """Prepare tool schemas for the proxy.
 
-    Management tools (idalib_*) are kept as-is — they already have their own
-    session_id parameter where needed.  All other IDA tools get an optional
-    ``session_id`` parameter injected so clients can route per-tool.
+    Management tools are replaced with pool-specific schemas that describe
+    the refcount/routing semantics.  Backend-only tools (idalib_unbind) are
+    hidden.  All other IDA tools get an optional ``session_id`` parameter
+    injected so clients can route per-tool.
     """
+    seen_mgmt: set[str] = set()
     result = []
     for tool in tools:
-        tool = copy.deepcopy(tool)
         name = tool.get("name", "")
+        if name in _HIDDEN_BACKEND_TOOLS:
+            continue
+        if name in _MGMT_TOOL_OVERRIDES:
+            if name not in seen_mgmt:
+                result.append(copy.deepcopy(_MGMT_TOOL_OVERRIDES[name]))
+                seen_mgmt.add(name)
+            continue
+        tool = copy.deepcopy(tool)
         if name not in IDALIB_MANAGEMENT_TOOLS:
             schema = tool.setdefault("inputSchema", {})
             props = schema.setdefault("properties", {})
@@ -116,6 +304,21 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
             _tools_cache = _prepare_tools(raw)
         return _tools_cache
 
+    def _get_transport_ctx() -> str | None:
+        return mcp.get_current_transport_session_id()
+
+    def _resolve_session_id(arguments: dict) -> str:
+        """2-tier session resolution: explicit arg > context binding."""
+        sid = arguments.pop("session_id", None)
+        if sid:
+            return sid
+        ctx = _get_transport_ctx()
+        if ctx:
+            sid = pool.get_context_session_id(ctx)
+        if sid:
+            return sid
+        raise KeyError("No session bound. Use idalib_open to create a session first.")
+
     def _error_response(request_id: Any, code: int, message: str) -> JsonRpcResponse:
         if request_id is None:
             return None  # type: ignore[return-value]
@@ -131,41 +334,128 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
         input_path = arguments.get("input_path", "")
         session_id = arguments.get("session_id")
         run_auto = arguments.get("run_auto_analysis", True)
-        return pool.open_session(input_path, session_id=session_id, run_auto_analysis=run_auto)
+
+        result = pool.open_session(input_path, session_id=session_id, run_auto_analysis=run_auto)
+        if not result.get("success"):
+            return result
+
+        actual_sid = result["session"]["session_id"]
+        ctx = _get_transport_ctx()
+        if ctx:
+            pool.bind_context(ctx, actual_sid)
+            pool.increment_refcount(actual_sid)
+
+        result["session"]["refcount"] = pool.get_refcount(actual_sid)
+        return result
 
     def _handle_idalib_close(arguments: dict) -> dict:
-        sid = arguments.get("session_id", "")
-        return pool.close_session(sid)
+        force = arguments.get("force", False)
+
+        sid = arguments.get("session_id")
+        ctx = _get_transport_ctx()
+        if not sid and ctx:
+            sid = pool.get_context_session_id(ctx)
+        if not sid:
+            return {"success": False, "error": "No session bound. Use idalib_open first."}
+
+        if ctx:
+            bound_sid = pool.get_context_session_id(ctx)
+            if bound_sid == sid:
+                pool.unbind_context(ctx)
+
+        if force:
+            with pool._lock:
+                pool.sr._unbind_session_everywhere(sid)
+            result = pool.close_session(sid)
+            result["closed"] = True
+            return result
+
+        new_rc = pool.decrement_refcount(sid)
+        if new_rc <= 0:
+            result = pool.close_session(sid)
+            result["closed"] = True
+            return result
+
+        return {
+            "success": True,
+            "closed": False,
+            "refcount": new_rc,
+            "message": f"Reference released. Session '{sid}' still has {new_rc} reference(s).",
+        }
 
     def _handle_idalib_switch(arguments: dict) -> dict:
         sid = arguments.get("session_id", "")
+        ctx = _get_transport_ctx()
+        if not ctx:
+            return {"success": False, "error": "No transport context available."}
+
         with pool._lock:
-            if sid not in pool.sessions:
+            sess = pool.sr.get(sid)
+            if sess is None:
                 return {"success": False, "error": f"Session not found: {sid}"}
-            pool.default_session_id = sid
-            sess = pool.sessions[sid]
-            sess.last_accessed = __import__("time").monotonic()
+            pool.sr.bind_context(ctx, sid)
+            sess.last_accessed = time.monotonic()
             return {
                 "success": True,
-                "session": sess.to_dict(),
-                "message": f"Default session set to: {sid}",
+                "session": sess.to_dict(refcount=pool.sr.get_refcount(sid)),
+                "message": f"Context now routes to session: {sid}",
             }
 
     def _handle_idalib_list(_arguments: dict) -> dict:
-        return pool.list_sessions()
+        ctx = _get_transport_ctx()
+        return pool.list_sessions(context_id=ctx)
 
     def _handle_idalib_current(_arguments: dict) -> dict:
-        return pool.get_current_session()
+        ctx = _get_transport_ctx()
+        if not ctx:
+            return {"error": "No transport context available."}
+        sid = pool.get_context_session_id(ctx)
+        if not sid:
+            return {"error": "No session bound. Use idalib_open first."}
+        with pool._lock:
+            sess = pool.sr.get(sid)
+            if sess is None:
+                return {"error": f"Bound session '{sid}' no longer exists."}
+            return sess.to_dict(refcount=pool.sr.get_refcount(sid))
 
     def _handle_idalib_save(arguments: dict) -> dict:
-        sid = arguments.pop("session_id", None) or pool.default_session_id
-        if sid is None:
+        sid = arguments.pop("session_id", None)
+        ctx = _get_transport_ctx()
+        if not sid and ctx:
+            sid = pool.get_context_session_id(ctx)
+        if not sid:
             return {"error": "No session to save. Use idalib_open first."}
         try:
             _sess, inst = pool.resolve_session_instance(sid)
         except (KeyError, RuntimeError) as e:
             return {"error": str(e)}
         return pool.forward_tool_call(inst, "idalib_save", arguments)
+
+    def _handle_idalib_health(arguments: dict) -> dict:
+        sid = arguments.pop("session_id", None)
+        ctx = _get_transport_ctx()
+        if not sid and ctx:
+            sid = pool.get_context_session_id(ctx)
+        if not sid:
+            return {"ready": False, "error": "No session bound. Use idalib_open first."}
+        try:
+            _sess, inst = pool.resolve_session_instance(sid)
+        except (KeyError, RuntimeError) as e:
+            return {"ready": False, "error": str(e)}
+        return pool.forward_tool_call(inst, "idalib_health", arguments)
+
+    def _handle_idalib_warmup(arguments: dict) -> dict:
+        sid = arguments.pop("session_id", None)
+        ctx = _get_transport_ctx()
+        if not sid and ctx:
+            sid = pool.get_context_session_id(ctx)
+        if not sid:
+            return {"ready": False, "error": "No session bound. Use idalib_open first."}
+        try:
+            _sess, inst = pool.resolve_session_instance(sid)
+        except (KeyError, RuntimeError) as e:
+            return {"ready": False, "error": str(e)}
+        return pool.forward_tool_call(inst, "idalib_warmup", arguments)
 
     _mgmt_handlers: dict[str, Any] = {
         "idalib_open": _handle_idalib_open,
@@ -174,6 +464,8 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
         "idalib_list": _handle_idalib_list,
         "idalib_current": _handle_idalib_current,
         "idalib_save": _handle_idalib_save,
+        "idalib_health": _handle_idalib_health,
+        "idalib_warmup": _handle_idalib_warmup,
     }
 
     # --- tools/call handler ---
@@ -201,34 +493,17 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
                 "id": request_id,
             }
 
-        # 2. Other management tools — forward to default session's instance
-        if tool_name in IDALIB_MANAGEMENT_TOOLS:
-            sid = pool.default_session_id
-            if sid is None:
-                return _error_response(
-                    request_id, -32001,
-                    f"No active session for tool '{tool_name}'. Use idalib_open first.",
-                )
-            try:
-                _sess, inst = pool.resolve_session_instance(sid)
-            except (KeyError, RuntimeError) as e:
-                return _error_response(request_id, -32001, str(e))
-            return pool.forward_raw(inst, request_obj)
-
-        # 3. IDA tools — route by session_id
-        session_id = arguments.pop("session_id", None) or pool.default_session_id
-        if session_id is None:
-            return _error_response(
-                request_id, -32001,
-                "No active session. Use idalib_open to create one, or pass session_id.",
-            )
+        # 2. IDA tools — route via 2-tier resolution
+        try:
+            session_id = _resolve_session_id(dict(arguments))
+        except KeyError as e:
+            return _error_response(request_id, -32001, str(e))
 
         try:
             _sess, inst = pool.resolve_session_instance(session_id)
         except (KeyError, RuntimeError) as e:
             return _error_response(request_id, -32001, str(e))
 
-        # Rebuild request without session_id in arguments
         forwarded = copy.deepcopy(request_obj)
         fwd_args = forwarded.get("params", {}).get("arguments", {})
         fwd_args.pop("session_id", None)
@@ -255,17 +530,14 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
         method = request_obj.get("method", "")
         request_id = request_obj.get("id")
 
-        # Protocol methods handled locally
         if method == "initialize":
             return dispatch_original(request)
         if method.startswith("notifications/"):
             return dispatch_original(request)
 
-        # tools/list — merge local + cached IDA tools
         if method == "tools/list":
             return _handle_tools_list(request_obj)
 
-        # tools/call — route
         if method == "tools/call":
             try:
                 return _handle_tools_call(request_obj)
@@ -273,12 +545,13 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
                 tb = traceback.format_exc()
                 return _error_response(request_id, -32000, f"{e}\n{tb}")
 
-        # Everything else — forward to default session's instance
-        sid = pool.default_session_id
+        # Everything else (resources, etc.) — route via context binding
+        ctx = _get_transport_ctx()
+        sid = pool.get_context_session_id(ctx) if ctx else None
         if sid is None:
             return _error_response(
                 request_id, -32001,
-                f"No active session for method '{method}'. Use idalib_open first.",
+                f"No session bound for method '{method}'. Use idalib_open first.",
             )
         try:
             _sess, inst = pool.resolve_session_instance(sid)
@@ -306,7 +579,8 @@ def main():
     )
     parser.add_argument(
         "--max-instances", type=int, default=1,
-        help="Max idalib instances (0 = unlimited, default: 1)",
+        help="Number of idalib instances to pre-warm (default: 1). "
+             "Additional instances are spawned on demand as needed.",
     )
     parser.add_argument(
         "--socket-dir", type=str, default=None,
@@ -343,16 +617,15 @@ def main():
     )
 
     mcp = McpServer("ida-pro-mcp")
+    mcp.require_streamable_http_session = True
     if args.auth_token:
         mcp.auth_token = args.auth_token
 
-    # We need at least one instance running to get the tool schemas
     logger.info("Spawning initial instance for tool discovery...")
     pool.spawn_instance()
 
     build_dispatch(mcp, pool)
 
-    # Open initial binary if provided
     if args.input_path is not None:
         if not args.input_path.exists():
             print(f"Error: Input file not found: {args.input_path}", file=sys.stderr)
@@ -362,7 +635,8 @@ def main():
         if isinstance(result, dict) and result.get("error"):
             print(f"Error opening binary: {result['error']}", file=sys.stderr)
             sys.exit(1)
-        logger.info("Initial session: %s", result.get("session", {}).get("session_id"))
+        sid = result.get("session", {}).get("session_id")
+        logger.info("Initial session: %s (no context binding — use idalib_open from a client)", sid)
 
     def cleanup(signum, frame):
         logger.info("Shutting down pool...")

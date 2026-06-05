@@ -2,16 +2,19 @@
 
 Each instance is an independent idalib_server process communicating over a
 Unix domain socket.  The pool enforces a 1-instance-per-session model: every
-instance holds at most one active IDB at a time.  When the pool is full a new
-``open`` evicts the least-recently-used session (which becomes "cold" and can
-be transparently reactivated later).
+instance holds at most one active IDB at a time.
 
 Key invariants
 --------------
 * ``SessionRegistry._open_paths`` prevents the same binary from being opened
   by two instances concurrently (IDA creates working files alongside the IDB).
-* ``max_instances == 0`` means *unlimited*: a fresh instance is spawned for
-  every ``open`` and destroyed on ``close``.
+* Sessions are always "hot" (backed by a running instance).  Closing a session
+  kills its instance.
+* Each session has a reference count tracking how many agents have it open.
+  When the refcount reaches zero the session is closed automatically.
+* ``_context_bindings`` maps MCP transport session IDs to IDA session IDs,
+  providing per-agent routing so multiple agents sharing one MCP endpoint
+  can work on different IDBs without interfering.
 """
 
 from __future__ import annotations
@@ -42,19 +45,15 @@ logger = logging.getLogger(__name__)
 class SessionInfo:
     session_id: str
     binary_path: str
-    instance_index: int | None = None  # None = cold (evicted, no instance)
+    instance_index: int
     last_accessed: float = field(default_factory=time.monotonic)
 
-    @property
-    def is_hot(self) -> bool:
-        return self.instance_index is not None
-
-    def to_dict(self) -> dict:
+    def to_dict(self, *, refcount: int = 0) -> dict:
         return {
             "session_id": self.session_id,
             "input_path": self.binary_path,
             "filename": os.path.basename(self.binary_path),
-            "is_active": self.is_hot,
+            "refcount": refcount,
             "last_accessed": self.last_accessed,
             "instance_index": self.instance_index,
         }
@@ -209,17 +208,17 @@ class InstanceManager:
 
 
 # ---------------------------------------------------------------------------
-# Session Registry — session state, path dedup, default tracking
+# Session Registry — session state, path dedup, context bindings, refcounts
 # ---------------------------------------------------------------------------
 
 class SessionRegistry:
-    """Tracks session metadata, path uniqueness, and the default session."""
+    """Tracks session metadata, path uniqueness, context bindings, and refcounts."""
 
     def __init__(self):
         self.sessions: dict[str, SessionInfo] = {}
-        self.default_session_id: str | None = None
-        # resolved-path → session_id  (prevents concurrent access to same IDB)
         self._open_paths: dict[str, str] = {}
+        self._context_bindings: dict[str, str] = {}
+        self._refcounts: dict[str, int] = {}
 
     def create(
         self, session_id: str, binary_path: str, instance_index: int
@@ -231,16 +230,16 @@ class SessionRegistry:
         )
         self.sessions[session_id] = sess
         self._open_paths[binary_path] = session_id
-        self.default_session_id = session_id
+        self._refcounts[session_id] = 0
         return sess
 
     def remove(self, session_id: str) -> SessionInfo | None:
-        """Permanently remove a session (explicit close only)."""
+        """Permanently remove a session."""
         sess = self.sessions.pop(session_id, None)
         if sess:
             self._open_paths.pop(sess.binary_path, None)
-        if self.default_session_id == session_id:
-            self.default_session_id = next(iter(self.sessions), None)
+        self._refcounts.pop(session_id, None)
+        self._unbind_session_everywhere(session_id)
         return sess
 
     def get(self, session_id: str) -> SessionInfo | None:
@@ -251,46 +250,65 @@ class SessionRegistry:
         if sess:
             sess.last_accessed = time.monotonic()
 
-    def make_cold(self, session_id: str) -> None:
-        """Mark a session as cold (evicted). Keeps path reservation."""
-        sess = self.sessions.get(session_id)
-        if sess:
-            sess.instance_index = None
-
-    def make_hot(self, session_id: str, instance_index: int) -> None:
-        """Bind a (cold) session to an instance."""
-        sess = self.sessions.get(session_id)
-        if sess:
-            sess.instance_index = instance_index
-
     def find_by_path(self, resolved_path: str) -> str | None:
         """Return session_id if this path is already tracked."""
         return self._open_paths.get(resolved_path)
 
-    def lru_hot_session(self) -> SessionInfo | None:
-        """Return the least-recently-used hot session, or None."""
-        hot = [s for s in self.sessions.values() if s.is_hot]
-        if not hot:
-            return None
-        return min(hot, key=lambda s: s.last_accessed)
-
     def generate_id(self) -> str:
         return str(uuid.uuid4())[:8]
 
-    def list_all(self) -> dict:
-        return {
-            "sessions": [s.to_dict() for s in self.sessions.values()],
-            "count": len(self.sessions),
-            "default_session_id": self.default_session_id,
-        }
+    # --- Context bindings (no refcount effect) ---
 
-    def get_default(self) -> dict:
-        if self.default_session_id is None:
-            return {"error": "No default session. Use idalib_open to create one."}
-        sess = self.sessions.get(self.default_session_id)
-        if sess is None:
-            return {"error": f"Default session '{self.default_session_id}' not found."}
-        return sess.to_dict()
+    def bind_context(self, context_id: str, session_id: str) -> None:
+        """Set the routing for a transport context. No refcount change."""
+        if session_id not in self.sessions:
+            raise ValueError(f"Session not found: {session_id}")
+        self._context_bindings[context_id] = session_id
+
+    def unbind_context(self, context_id: str) -> str | None:
+        """Remove a context binding. Returns the old session_id or None."""
+        return self._context_bindings.pop(context_id, None)
+
+    def get_context_session_id(self, context_id: str) -> str | None:
+        """Return the session_id bound to a context, or None."""
+        return self._context_bindings.get(context_id)
+
+    def _unbind_session_everywhere(self, session_id: str) -> None:
+        """Remove all context bindings pointing to a session."""
+        stale = [ctx for ctx, sid in self._context_bindings.items() if sid == session_id]
+        for ctx in stale:
+            del self._context_bindings[ctx]
+
+    # --- Refcounts ---
+
+    def increment_refcount(self, session_id: str) -> int:
+        rc = self._refcounts.get(session_id, 0) + 1
+        self._refcounts[session_id] = rc
+        return rc
+
+    def decrement_refcount(self, session_id: str) -> int:
+        rc = max(0, self._refcounts.get(session_id, 0) - 1)
+        self._refcounts[session_id] = rc
+        return rc
+
+    def get_refcount(self, session_id: str) -> int:
+        return self._refcounts.get(session_id, 0)
+
+    # --- Listing ---
+
+    def list_all(self, context_id: str | None = None) -> dict:
+        context_session_id = self._context_bindings.get(context_id) if context_id else None
+        return {
+            "sessions": [
+                {
+                    **s.to_dict(refcount=self.get_refcount(s.session_id)),
+                    "is_current_context": s.session_id == context_session_id,
+                }
+                for s in self.sessions.values()
+            ],
+            "count": len(self.sessions),
+            "current_context_session_id": context_session_id,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -304,26 +322,13 @@ class PoolManager:
         socket_dir: str | None = None,
         idalib_args: list[str] | None = None,
     ):
-        self.max_instances = max_instances  # 0 = unlimited
+        self.max_instances = max_instances
         socket_dir = socket_dir or tempfile.mkdtemp(prefix="idalib-pool-")
         os.makedirs(socket_dir, exist_ok=True)
 
         self.im = InstanceManager(socket_dir, idalib_args)
         self.sr = SessionRegistry()
         self._lock = threading.Lock()
-
-    # -- convenience accessors for pool_server --
-    @property
-    def sessions(self) -> dict[str, SessionInfo]:
-        return self.sr.sessions
-
-    @property
-    def default_session_id(self) -> str | None:
-        return self.sr.default_session_id
-
-    @default_session_id.setter
-    def default_session_id(self, value: str | None) -> None:
-        self.sr.default_session_id = value
 
     # ------------------------------------------------------------------
     # High-level operations
@@ -334,15 +339,25 @@ class PoolManager:
 
     def shutdown_all(self) -> None:
         with self._lock:
-            for inst in list(self.im.instances):
-                if inst.session_id:
-                    try:
-                        self.im.forward_tool_call(inst, "idalib_save", {})
-                    except Exception:
-                        pass
+            instances_to_save = [
+                inst for inst in self.im.instances if inst.session_id
+            ]
+
+        for inst in instances_to_save:
+            try:
+                self.im.forward_tool_call(inst, "idalib_save", {})
+            except Exception:
+                logger.warning(
+                    "Failed to save instance %d (session %s), continuing shutdown",
+                    inst.index, inst.session_id,
+                )
+
+        with self._lock:
             self.im.kill_all()
             self.sr.sessions.clear()
             self.sr._open_paths.clear()
+            self.sr._context_bindings.clear()
+            self.sr._refcounts.clear()
 
     def open_session(
         self,
@@ -353,31 +368,21 @@ class PoolManager:
         resolved = str(Path(binary_path).resolve())
 
         with self._lock:
-            # --- path dedup / conflict ---
             existing_sid = self.sr.find_by_path(resolved)
             if existing_sid is not None:
-                if session_id is not None and session_id != existing_sid:
-                    return {
-                        "error": (
-                            f"Binary already open as session '{existing_sid}'. "
-                            f"Cannot open with different session_id '{session_id}'."
-                        )
-                    }
                 self.sr.touch(existing_sid)
-                self.sr.default_session_id = existing_sid
                 sess = self.sr.get(existing_sid)
                 return {
                     "success": True,
-                    "session": sess.to_dict(),
-                    "message": f"Returning existing session: {existing_sid}",
+                    "existing": True,
+                    "session": sess.to_dict(refcount=self.sr.get_refcount(existing_sid)),
+                    "message": f"Binary already open as session '{existing_sid}'.",
                 }
 
-            # --- allocate instance ---
             inst = self._allocate_instance_locked()
             if session_id is None:
                 session_id = self.sr.generate_id()
 
-        # --- forward open (outside lock) ---
         resp = self.im.forward_tool_call(inst, "idalib_open", {
             "input_path": resolved,
             "run_auto_analysis": run_auto_analysis,
@@ -393,7 +398,8 @@ class PoolManager:
 
         return {
             "success": True,
-            "session": sess.to_dict(),
+            "existing": False,
+            "session": sess.to_dict(refcount=self.sr.get_refcount(session_id)),
             "message": f"Session created: {session_id}",
         }
 
@@ -402,31 +408,28 @@ class PoolManager:
             sess = self.sr.get(session_id)
             if sess is None:
                 return {"success": False, "error": f"Session not found: {session_id}"}
-
-            if sess.is_hot:
-                inst = self.im.find(sess.instance_index)
-            else:
-                inst = None
-
+            inst = self.im.find(sess.instance_index)
             if inst is None:
                 self.sr.remove(session_id)
-                return {"success": True, "message": f"Session cleaned up: {session_id}"}
+                return {"success": True, "closed": True, "message": f"Session cleaned up: {session_id}"}
 
-        # Forward close (outside lock)
+        try:
+            self.im.forward_tool_call(inst, "idalib_save", {})
+        except Exception:
+            logger.warning("Failed to save before closing session %s", session_id)
         self.im.forward_tool_call(inst, "idalib_close", {"session_id": session_id})
 
         with self._lock:
             self.sr.remove(session_id)
             inst.session_id = None
-            if self.max_instances == 0:
-                self.im.kill(inst)
+            self.im.kill(inst)
 
-        return {"success": True, "message": f"Session closed: {session_id}"}
+        return {"success": True, "closed": True, "message": f"Session closed: {session_id}"}
 
     def resolve_session_instance(
         self, session_id: str
     ) -> tuple[SessionInfo, InstanceInfo]:
-        """Return (session, instance). Reactivates cold sessions automatically."""
+        """Return (session, instance) for a hot session."""
         with self._lock:
             sess = self.sr.get(session_id)
             if sess is None:
@@ -435,47 +438,49 @@ class PoolManager:
                     f"Use idalib_open to create a session first."
                 )
             self.sr.touch(session_id)
+            inst = self.im.find(sess.instance_index)
+            if inst is None:
+                raise RuntimeError(
+                    f"Instance for session '{session_id}' is gone. "
+                    f"The session may need to be re-opened."
+                )
+            return sess, inst
 
-            # Hot path
-            if sess.is_hot:
-                inst = self.im.find(sess.instance_index)
-                if inst is not None:
-                    return sess, inst
-                sess.instance_index = None  # instance gone, fall through
+    # ------------------------------------------------------------------
+    # Context binding pass-throughs
+    # ------------------------------------------------------------------
 
-            # Cold path — reactivate
-            logger.info("Reactivating cold session %s (%s)", session_id, sess.binary_path)
-            inst = self._allocate_instance_locked()
-
-        # Forward open (outside lock)
-        resp = self.im.forward_tool_call(inst, "idalib_open", {
-            "input_path": sess.binary_path,
-            "run_auto_analysis": False,
-            "session_id": session_id,
-        })
-
-        if isinstance(resp, dict) and resp.get("error"):
-            raise RuntimeError(
-                f"Failed to reactivate session '{session_id}': {resp['error']}"
-            )
-
+    def bind_context(self, context_id: str, session_id: str) -> None:
         with self._lock:
-            self.sr.make_hot(session_id, inst.index)
-            inst.session_id = session_id
+            self.sr.bind_context(context_id, session_id)
 
-        return sess, inst
+    def unbind_context(self, context_id: str) -> str | None:
+        with self._lock:
+            return self.sr.unbind_context(context_id)
+
+    def get_context_session_id(self, context_id: str) -> str | None:
+        with self._lock:
+            return self.sr.get_context_session_id(context_id)
+
+    def increment_refcount(self, session_id: str) -> int:
+        with self._lock:
+            return self.sr.increment_refcount(session_id)
+
+    def decrement_refcount(self, session_id: str) -> int:
+        with self._lock:
+            return self.sr.decrement_refcount(session_id)
+
+    def get_refcount(self, session_id: str) -> int:
+        with self._lock:
+            return self.sr.get_refcount(session_id)
 
     # ------------------------------------------------------------------
     # Listing
     # ------------------------------------------------------------------
 
-    def list_sessions(self) -> dict:
+    def list_sessions(self, context_id: str | None = None) -> dict:
         with self._lock:
-            return self.sr.list_all()
-
-    def get_current_session(self) -> dict:
-        with self._lock:
-            return self.sr.get_default()
+            return self.sr.list_all(context_id=context_id)
 
     # ------------------------------------------------------------------
     # Forwarding shortcuts
@@ -492,47 +497,15 @@ class PoolManager:
             return self.im.forward_tools_list()
 
     # ------------------------------------------------------------------
-    # Instance allocation & LRU (internal, caller holds _lock)
+    # Instance allocation (internal, caller holds _lock)
     # ------------------------------------------------------------------
 
     def _allocate_instance_locked(self) -> InstanceInfo:
-        # 1. Idle instance
         inst = self.im.find_idle()
         if inst is not None:
             return inst
-
-        # 2. Spawn new
-        if self.max_instances == 0 or len(self.im.instances) < self.max_instances:
-            self._lock.release()
-            try:
-                return self.im.spawn()
-            finally:
-                self._lock.acquire()
-
-        # 3. Evict LRU
-        return self._evict_lru_locked()
-
-    def _evict_lru_locked(self) -> InstanceInfo:
-        lru_sess = self.sr.lru_hot_session()
-        if lru_sess is None:
-            raise RuntimeError("Pool is full but has no hot sessions to evict")
-
-        inst = self.im.find(lru_sess.instance_index)
-        if inst is None:
-            raise RuntimeError(f"Instance for LRU session {lru_sess.session_id} not found")
-
-        logger.info("Evicting LRU session %s from instance %d", lru_sess.session_id, inst.index)
-
         self._lock.release()
         try:
-            try:
-                self.im.forward_tool_call(inst, "idalib_save", {})
-            except Exception:
-                pass
-            self.im.forward_tool_call(inst, "idalib_close", {"session_id": lru_sess.session_id})
+            return self.im.spawn()
         finally:
             self._lock.acquire()
-
-        self.sr.make_cold(lru_sess.session_id)
-        inst.session_id = None
-        return inst
