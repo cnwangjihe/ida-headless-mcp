@@ -29,6 +29,10 @@ SUPPORTED_HTTP_PROTOCOL_VERSIONS = {
 }
 
 
+def _log(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
 class McpToolError(Exception):
     def __init__(self, message: str):
         super().__init__(message)
@@ -644,7 +648,7 @@ class McpServer:
 
     def serve(self, host: str = "", port: int = 0, *, unix_socket: str | None = None, background = True, request_handler = McpHttpRequestHandler):
         if self._running:
-            print("[MCP] Server is already running")
+            _log("[MCP] Server is already running")
             return
 
         # Create server with deferred binding
@@ -687,17 +691,17 @@ class McpServer:
         self._running = True
 
         if unix_socket:
-            print(f"[MCP] Server started on unix:{unix_socket}")
+            _log(f"[MCP] Server started on unix:{unix_socket}")
         else:
-            print("[MCP] Server started:")
-            print(f"  Streamable HTTP: http://{host}:{port}/mcp")
-            print(f"  SSE: http://{host}:{port}/sse")
+            _log("[MCP] Server started:")
+            _log(f"  Streamable HTTP: http://{host}:{port}/mcp")
+            _log(f"  SSE: http://{host}:{port}/sse")
 
         def serve_forever():
             try:
                 self._http_server.serve_forever() # type: ignore
             except Exception as e:
-                print(f"[MCP] Server error: {e}")
+                _log(f"[MCP] Server error: {e}")
                 traceback.print_exc()
             finally:
                 self._running = False
@@ -731,7 +735,7 @@ class McpServer:
             self._server_thread.join()
             self._server_thread = None
 
-        print("[MCP] Server stopped")
+        _log("[MCP] Server stopped")
 
     def stdio(self, stdin: BinaryIO | None = None, stdout: BinaryIO | None = None):
         stdin = stdin or sys.stdin.buffer
@@ -874,7 +878,7 @@ class McpServer:
     def _mcp_notifications_cancelled(self, requestId: int | str, reason: str | None = None) -> None:
         """MCP notifications/cancelled - cancel an in-flight request"""
         if cancel_request(requestId):
-            print(f"[MCP] Cancelled request {requestId}: {reason or 'no reason'}")
+            _log(f"[MCP] Cancelled request {requestId}: {reason or 'no reason'}")
         # Notifications don't return a response
 
     def _mcp_resources_list(self, _meta: dict | None = None) -> dict:

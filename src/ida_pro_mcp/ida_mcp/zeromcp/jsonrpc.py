@@ -1,6 +1,7 @@
 import json
 import inspect
 import os
+import sys
 import threading
 import time
 import traceback
@@ -73,6 +74,10 @@ _LOG_SKIP_METHODS = {
 }
 JsonRpcParams: TypeAlias = dict[str, Any] | list[Any] | None
 
+
+def _log(message: str) -> None:
+    print(message, file=sys.stderr)
+
 class JsonRpcRequest(TypedDict):
     jsonrpc: str
     method: str
@@ -138,7 +143,7 @@ class JsonRpcRegistry:
             params_str = json.dumps(params, default=str)
             if len(params_str) > 200:
                 params_str = params_str[:200] + "..."
-            print(f"[MCP] >> {method}({params_str})")
+            _log(f"[MCP] >> {method}({params_str})")
 
         # Set current request ID in thread-local for cancellation tracking
         _current_request.id = request_id
@@ -150,7 +155,7 @@ class JsonRpcRegistry:
                 result_str = json.dumps(result, default=str)
                 if len(result_str) > 200:
                     result_str = result_str[:200] + "..."
-                print(f"[MCP] << {method} ({elapsed_ms:.1f}ms) {result_str}")
+                _log(f"[MCP] << {method} ({elapsed_ms:.1f}ms) {result_str}")
             if is_notification:
                 return None
             return {
@@ -161,7 +166,7 @@ class JsonRpcRegistry:
         except JsonRpcException as e:
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             if log_method:
-                print(f"[MCP] << {method} ({elapsed_ms:.1f}ms) ERROR: {e.message}")
+                _log(f"[MCP] << {method} ({elapsed_ms:.1f}ms) ERROR: {e.message}")
             if is_notification:
                 return None
             return self._error(request_id, e.code, e.message, e.data)
@@ -169,14 +174,14 @@ class JsonRpcRegistry:
             # LSP error code -32800: Request cancelled
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             if log_method:
-                print(f"[MCP] << {method} ({elapsed_ms:.1f}ms) CANCELLED")
+                _log(f"[MCP] << {method} ({elapsed_ms:.1f}ms) CANCELLED")
             if is_notification:
                 return None
             return self._error(request_id, -32800, str(e) or "Request cancelled")
         except Exception as e:
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             if log_method:
-                print(f"[MCP] << {method} ({elapsed_ms:.1f}ms) EXCEPTION: {e}")
+                _log(f"[MCP] << {method} ({elapsed_ms:.1f}ms) EXCEPTION: {e}")
             if is_notification:
                 return None
             error = self.map_exception(e)
