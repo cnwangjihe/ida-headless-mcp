@@ -906,6 +906,32 @@ class TestPoolServerDispatch(unittest.TestCase):
         result = resp["result"]["structuredContent"]
         self.assertTrue(result.get("ready"))
 
+    def test_health_maps_to_server_health_for_external_session(self):
+        mcp, pool = self._make_mcp_and_pool()
+        pool.sr.create("ext1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0, is_external=True)
+        pool.sr.increment_refcount("ext1")
+        pool.sr.bind_context("sse:agent-a", "ext1")
+        bridge = MagicMock()
+        bridge.alive = True
+        inst = InstanceInfo(index=0, socket_path="", process=None, ws_bridge=bridge)
+        pool.resolve_session_instance.return_value = (pool.sr.get("ext1"), inst)
+        pool.forward_tool_call.return_value = {"status": "ok", "module": "a.elf"}
+        self.build_dispatch(mcp, pool)
+
+        req = {
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "idalib_health", "arguments": {}},
+            "id": 1,
+        }
+        resp = self._dispatch(mcp, req, transport_session_id="sse:agent-a")
+
+        result = resp["result"]["structuredContent"]
+        self.assertTrue(result.get("ready"))
+        self.assertEqual(result["health"]["status"], "ok")
+        self.assertTrue(result["session"]["is_external"])
+        pool.forward_tool_call.assert_called_once_with(inst, "server_health", {})
+
     def test_health_no_session_returns_error(self):
         mcp, pool = self._make_mcp_and_pool()
         self.build_dispatch(mcp, pool)
@@ -940,6 +966,36 @@ class TestPoolServerDispatch(unittest.TestCase):
 
         result = resp["result"]["structuredContent"]
         self.assertTrue(result.get("ok"))
+
+    def test_warmup_maps_to_server_warmup_for_external_session(self):
+        mcp, pool = self._make_mcp_and_pool()
+        pool.sr.create("ext1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0, is_external=True)
+        pool.sr.increment_refcount("ext1")
+        pool.sr.bind_context("sse:agent-a", "ext1")
+        bridge = MagicMock()
+        bridge.alive = True
+        inst = InstanceInfo(index=0, socket_path="", process=None, ws_bridge=bridge)
+        pool.resolve_session_instance.return_value = (pool.sr.get("ext1"), inst)
+        pool.forward_tool_call.return_value = {"ok": True}
+        self.build_dispatch(mcp, pool)
+
+        req = {
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {
+                "name": "idalib_warmup",
+                "arguments": {"build_caches": False},
+            },
+            "id": 1,
+        }
+        resp = self._dispatch(mcp, req, transport_session_id="sse:agent-a")
+
+        result = resp["result"]["structuredContent"]
+        self.assertTrue(result.get("ready"))
+        self.assertTrue(result["session"]["is_external"])
+        pool.forward_tool_call.assert_called_once_with(
+            inst, "server_warmup", {"build_caches": False}
+        )
 
     def test_warmup_no_session_returns_error(self):
         mcp, pool = self._make_mcp_and_pool()
@@ -982,6 +1038,24 @@ class TestPoolServerDispatch(unittest.TestCase):
         self.assertIn("force", close_props)
         # non-management tool should get session_id injected
         self.assertIn("session_id", tools_by_name["list_funcs"]["inputSchema"]["properties"])
+
+    def test_tools_list_always_exposes_management_tools(self):
+        """GUI plugin tool lists do not contain idalib_*; pool must still expose them."""
+        mcp, pool = self._make_mcp_and_pool()
+        pool.forward_tools_list.return_value = [
+            {"name": "server_health", "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "list_funcs", "inputSchema": {"type": "object", "properties": {}}},
+        ]
+        self.build_dispatch(mcp, pool)
+
+        req = {"jsonrpc": "2.0", "method": "tools/list", "id": 1}
+        resp = mcp.registry.dispatch(req)
+
+        tool_names = {t["name"] for t in resp["result"]["tools"]}
+        self.assertIn("idalib_health", tool_names)
+        self.assertIn("idalib_warmup", tool_names)
+        self.assertIn("idalib_current", tool_names)
+        self.assertIn("server_health", tool_names)
 
     # --- dispatch protocol pass-through ---
 

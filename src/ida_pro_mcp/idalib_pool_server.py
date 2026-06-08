@@ -92,7 +92,7 @@ def _accept_pool_websocket(handler) -> WebSocketConnection | None:
 # Management tool names that the proxy intercepts
 # --------------------------------------------------------------------------
 
-IDALIB_MANAGEMENT_TOOLS = {
+IDALIB_MANAGEMENT_TOOL_ORDER = [
     "idalib_open",
     "idalib_close",
     "idalib_switch",
@@ -101,7 +101,9 @@ IDALIB_MANAGEMENT_TOOLS = {
     "idalib_save",
     "idalib_health",
     "idalib_warmup",
-}
+]
+
+IDALIB_MANAGEMENT_TOOLS = set(IDALIB_MANAGEMENT_TOOL_ORDER)
 
 # Backend tools that are not exposed in pool mode
 _HIDDEN_BACKEND_TOOLS = {"idalib_unbind"}
@@ -308,23 +310,22 @@ def _prepare_tools(tools: list[dict]) -> list[dict]:
     hidden.  All other IDA tools get an optional ``session_id`` parameter
     injected so clients can route per-tool.
     """
-    seen_mgmt: set[str] = set()
-    result = []
+    result = [
+        copy.deepcopy(_MGMT_TOOL_OVERRIDES[name])
+        for name in IDALIB_MANAGEMENT_TOOL_ORDER
+        if name in _MGMT_TOOL_OVERRIDES
+    ]
     for tool in tools:
         name = tool.get("name", "")
         if name in _HIDDEN_BACKEND_TOOLS:
             continue
-        if name in _MGMT_TOOL_OVERRIDES:
-            if name not in seen_mgmt:
-                result.append(copy.deepcopy(_MGMT_TOOL_OVERRIDES[name]))
-                seen_mgmt.add(name)
+        if name in IDALIB_MANAGEMENT_TOOLS:
             continue
         tool = copy.deepcopy(tool)
-        if name not in IDALIB_MANAGEMENT_TOOLS:
-            schema = tool.setdefault("inputSchema", {})
-            props = schema.setdefault("properties", {})
-            if "session_id" not in props:
-                props["session_id"] = _SESSION_ID_SCHEMA
+        schema = tool.setdefault("inputSchema", {})
+        props = schema.setdefault("properties", {})
+        if "session_id" not in props:
+            props["session_id"] = _SESSION_ID_SCHEMA
         result.append(tool)
     return result
 
@@ -509,9 +510,16 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
         if not sid:
             return {"ready": False, "error": "No session bound. Use idalib_open first."}
         try:
-            _sess, inst = pool.resolve_session_instance(sid)
+            sess, inst = pool.resolve_session_instance(sid)
         except (KeyError, RuntimeError) as e:
             return {"ready": False, "error": str(e)}
+        if getattr(inst, "is_external", False) is True:
+            health = pool.forward_tool_call(inst, "server_health", {})
+            return {
+                "ready": bool(isinstance(health, dict) and health.get("status") == "ok"),
+                "session": sess.to_dict(refcount=pool.get_refcount(sid)),
+                "health": health,
+            }
         return pool.forward_tool_call(inst, "idalib_health", arguments)
 
     def _handle_idalib_warmup(arguments: dict) -> dict:
@@ -522,9 +530,16 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
         if not sid:
             return {"ready": False, "error": "No session bound. Use idalib_open first."}
         try:
-            _sess, inst = pool.resolve_session_instance(sid)
+            sess, inst = pool.resolve_session_instance(sid)
         except (KeyError, RuntimeError) as e:
             return {"ready": False, "error": str(e)}
+        if getattr(inst, "is_external", False) is True:
+            warmup = pool.forward_tool_call(inst, "server_warmup", arguments)
+            return {
+                "ready": bool(isinstance(warmup, dict) and warmup.get("ok")),
+                "session": sess.to_dict(refcount=pool.get_refcount(sid)),
+                "warmup": warmup,
+            }
         return pool.forward_tool_call(inst, "idalib_warmup", arguments)
 
     _mgmt_handlers: dict[str, Any] = {
