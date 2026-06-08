@@ -47,9 +47,13 @@ class PoolClient:
             "id": 1,
         })
         conn = HTTPConnection(self.host, self.port, timeout=120)
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
         if self.session_id:
-            headers["Mcp-Session-Id"] = self.session_id
+            headers["MCP-Session-Id"] = self.session_id
+            headers["MCP-Protocol-Version"] = "2025-11-25"
         try:
             conn.request("POST", "/mcp", body, headers)
             resp = conn.getresponse()
@@ -63,7 +67,7 @@ class PoolClient:
 
     def initialize(self) -> dict:
         return self.request("initialize", {
-            "protocolVersion": "2025-06-18",
+            "protocolVersion": "2025-11-25",
             "capabilities": {},
             "clientInfo": {"name": "test", "version": "1.0"},
         })

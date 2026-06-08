@@ -54,7 +54,11 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
                 "POST",
                 "/mcp",
                 payload,
-                {"Content-Type": "application/json"},
+                {
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream",
+                    "MCP-Protocol-Version": "2025-11-25",
+                },
             )
             response = conn.getresponse()
             raw_data = response.read().decode()

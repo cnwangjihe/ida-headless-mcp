@@ -20,6 +20,15 @@ from io import BufferedIOBase
 
 from .jsonrpc import JsonRpcRegistry, JsonRpcError, JsonRpcException, get_current_request_id, register_pending_request, unregister_pending_request, cancel_request
 
+LATEST_MCP_PROTOCOL_VERSION = "2025-11-25"
+DEFAULT_HTTP_PROTOCOL_VERSION = "2025-03-26"
+SUPPORTED_HTTP_PROTOCOL_VERSIONS = {
+    LATEST_MCP_PROTOCOL_VERSION,
+    "2025-06-18",
+    DEFAULT_HTTP_PROTOCOL_VERSION,
+}
+
+
 class McpToolError(Exception):
     def __init__(self, message: str):
         super().__init__(message)
@@ -116,10 +125,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         """Override to suppress default logging or customize"""
         pass
 
-    def send_cors_headers(self, *, preflight = False):
-        origin = self.headers.get("Origin", "")
-        if not origin:
-            return
+    def _is_origin_allowed(self, origin: str) -> bool:
         def is_allowed():
             allowed = self.mcp_server.cors_allowed_origins
             if allowed is None:
@@ -130,12 +136,25 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
                 allowed = [allowed]
             assert isinstance(allowed, list)
             return "*" in allowed or origin in allowed
-        if not is_allowed():
+        return is_allowed()
+
+    def _check_streamable_origin(self) -> bool:
+        origin = self.headers.get("Origin")
+        if origin and not self._is_origin_allowed(origin):
+            self.send_error(403, "Invalid Origin")
+            return False
+        return True
+
+    def send_cors_headers(self, *, preflight = False):
+        origin = self.headers.get("Origin", "")
+        if not origin:
+            return
+        if not self._is_origin_allowed(origin):
             return
         self.send_header("Access-Control-Allow-Origin", origin)
         if preflight:
-            self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept, X-Requested-With, Mcp-Session-Id, Mcp-Protocol-Version, Authorization")
+            self.send_header("Access-Control-Allow-Methods", "POST, GET, DELETE, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept, X-Requested-With, MCP-Session-Id, MCP-Protocol-Version, Authorization")
             if self.headers.get("Access-Control-Request-Private-Network") == "true":
                 self.send_header("Access-Control-Allow-Private-Network", "true")
 
@@ -170,20 +189,29 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             return
         match urlparse(self.path).path:
             case "/sse":
+                if not self._check_streamable_origin():
+                    return
                 self._handle_sse_get()
             case "/mcp":
-                self.send_error(405, "Method Not Allowed")
+                if not self._check_streamable_origin():
+                    return
+                self._send_method_not_allowed()
             case _:
                 self.send_error(404, "Not Found")
 
     def do_POST(self):
         if not self._check_auth():
             return
+        path = urlparse(self.path).path
+        if path in ("/mcp", "/sse") and not self._check_streamable_origin():
+            return
+        if path == "/mcp" and not self._check_streamable_post_headers():
+            return
         body = self._read_body()
         if body is None:
             return
 
-        match urlparse(self.path).path:
+        match path:
             case "/sse":
                 self._handle_sse_post(body)
             case "/mcp":
@@ -191,11 +219,65 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             case _:
                 self.send_error(404, "Not Found")
 
+    def do_DELETE(self):
+        if not self._check_auth():
+            return
+        match urlparse(self.path).path:
+            case "/mcp":
+                if not self._check_streamable_origin():
+                    return
+                # This server does not support client-initiated MCP session
+                # termination. The Streamable HTTP spec permits 405 here.
+                self._send_method_not_allowed()
+            case _:
+                self.send_error(404, "Not Found")
+
     def do_OPTIONS(self):
         """Handle CORS preflight requests"""
+        if urlparse(self.path).path in ("/mcp", "/sse") and not self._check_streamable_origin():
+            return
         self.send_response(200)
         self.send_cors_headers(preflight=True)
         self.end_headers()
+
+    def _send_method_not_allowed(self):
+        self.send_response(405)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Allow", "POST")
+        self.send_cors_headers()
+        self.end_headers()
+        self.wfile.write(b"Method Not Allowed\n")
+
+    def _media_types(self, header_name: str) -> set[str]:
+        media: set[str] = set()
+        for raw in self.headers.get_all(header_name, []):
+            for part in raw.split(","):
+                item = part.split(";", 1)[0].strip().lower()
+                if item:
+                    media.add(item)
+        return media
+
+    def _accepts_media_type(self, media: set[str], required: str) -> bool:
+        if "*/*" in media or required in media:
+            return True
+        required_type = required.split("/", 1)[0]
+        return f"{required_type}/*" in media
+
+    def _check_streamable_post_headers(self) -> bool:
+        content_types = self._media_types("Content-Type")
+        if "application/json" not in content_types:
+            self.send_error(415, "Unsupported Media Type")
+            return False
+
+        accept_types = self._media_types("Accept")
+        required_accept = ("application/json", "text/event-stream")
+        if not all(self._accepts_media_type(accept_types, required) for required in required_accept):
+            self.send_error(
+                406,
+                "Not Acceptable: Accept must include application/json and text/event-stream",
+            )
+            return False
+        return True
 
     def _read_body(self) -> bytes | None:
         if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
@@ -334,36 +416,144 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_jsonrpc_http_error(self, status: int, code: int, message: str):
+        body = json.dumps({
+            "jsonrpc": "2.0",
+            "error": {
+                "code": code,
+                "message": message,
+            },
+        }).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_cors_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_empty_response(self, status: int, *, mcp_session_id: str | None = None):
+        self.send_response(status)
+        self.send_header("Content-Length", "0")
+        if mcp_session_id is not None:
+            self.send_header("MCP-Session-Id", mcp_session_id)
+        self.send_cors_headers()
+        self.end_headers()
+
+    def _negotiate_protocol_version(self, request: dict) -> str:
+        params = request.get("params")
+        if isinstance(params, dict):
+            requested = params.get("protocolVersion")
+            if isinstance(requested, str) and requested in SUPPORTED_HTTP_PROTOCOL_VERSIONS:
+                return requested
+        return LATEST_MCP_PROTOCOL_VERSION
+
+    def _resolve_http_protocol_version(
+        self,
+        *,
+        request_method: str | None,
+        request: dict,
+        mcp_session_id: str | None,
+    ) -> str | None:
+        header_version = self.headers.get("MCP-Protocol-Version")
+        session_version = (
+            self.mcp_server.get_http_session_protocol_version(mcp_session_id)
+            if mcp_session_id is not None
+            else None
+        )
+
+        if request_method == "initialize":
+            if header_version is not None:
+                header_version = header_version.strip()
+                if header_version not in SUPPORTED_HTTP_PROTOCOL_VERSIONS:
+                    self.send_error(400, "Invalid or unsupported MCP-Protocol-Version")
+                    return None
+            return self._negotiate_protocol_version(request)
+
+        if header_version is not None:
+            header_version = header_version.strip()
+            if header_version not in SUPPORTED_HTTP_PROTOCOL_VERSIONS:
+                self.send_error(400, "Invalid or unsupported MCP-Protocol-Version")
+                return None
+            if session_version is not None and header_version != session_version:
+                self.send_error(
+                    400,
+                    "MCP-Protocol-Version does not match the initialized session",
+                )
+                return None
+            return header_version
+
+        if session_version is not None:
+            return session_version
+        return DEFAULT_HTTP_PROTOCOL_VERSION
+
+    def _is_valid_mcp_session_id(self, session_id: str) -> bool:
+        return bool(session_id) and all(0x21 <= ord(ch) <= 0x7E for ch in session_id)
+
     def _handle_mcp_post(self, body: bytes):
-        request_method: str | None = None
         try:
             parsed = json.loads(body)
-            if isinstance(parsed, dict):
-                method = parsed.get("method")
-                if isinstance(method, str):
-                    request_method = method
-        except Exception:
-            pass
+        except Exception as e:
+            self._send_jsonrpc_http_error(400, -32700, f"JSON parse error: {e}")
+            return
 
-        mcp_session_id = self.headers.get("Mcp-Session-Id")
+        if not isinstance(parsed, dict):
+            self._send_jsonrpc_http_error(400, -32600, "Invalid request: must be a JSON object")
+            return
+
+        if parsed.get("jsonrpc") != "2.0":
+            self._send_jsonrpc_http_error(400, -32600, "Invalid request: 'jsonrpc' must be '2.0'")
+            return
+
+        request_method: str | None = None
+        method = parsed.get("method")
+        if isinstance(method, str):
+            request_method = method
+        elif method is not None:
+            self._send_jsonrpc_http_error(400, -32600, "Invalid request: 'method' must be a string")
+            return
+
+        is_response = request_method is None and "id" in parsed and (
+            "result" in parsed or "error" in parsed
+        )
+        if request_method is None and not is_response:
+            self._send_jsonrpc_http_error(400, -32600, "Invalid request: 'method' is required")
+            return
+
+        is_notification = request_method is not None and "id" not in parsed
+        is_initialize = request_method == "initialize"
+
+        mcp_session_id = self.headers.get("MCP-Session-Id")
+        if mcp_session_id is not None and not self._is_valid_mcp_session_id(mcp_session_id):
+            self.send_error(400, "Invalid MCP-Session-Id")
+            return
+        protocol_version = self._resolve_http_protocol_version(
+            request_method=request_method,
+            request=parsed,
+            mcp_session_id=mcp_session_id,
+        )
+        if protocol_version is None:
+            return
+
         if self.mcp_server.require_streamable_http_session:
-            if request_method == "initialize":
+            if is_initialize:
                 if mcp_session_id is None:
                     mcp_session_id = str(uuid.uuid4())
-                self.mcp_server.register_http_session(mcp_session_id)
+                self.mcp_server.register_http_session(mcp_session_id, protocol_version)
             else:
                 if mcp_session_id is None:
                     self.send_error(
                         400,
-                        "Missing Mcp-Session-Id header. Call initialize first and "
-                        "reuse the returned Mcp-Session-Id.",
+                        "Missing MCP-Session-Id header. Call initialize first and "
+                        "reuse the returned MCP-Session-Id.",
                     )
                     return
                 if not self.mcp_server.has_http_session(mcp_session_id):
-                    print(
-                        f"[MCP] Re-registering HTTP session {mcp_session_id} after reconnect"
-                    )
-                    self.mcp_server.register_http_session(mcp_session_id)
+                    self.send_error(404, "MCP session not found")
+                    return
+
+        if is_response:
+            self._send_empty_response(202, mcp_session_id=mcp_session_id)
+            return
 
         # Parse extensions from query params and store in thread-local
         extensions = self._parse_extensions(self.path)
@@ -375,9 +565,9 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         )
 
         # Dispatch to MCP registry
-        setattr(self.mcp_server._protocol_version, "data", "2025-06-18")
+        setattr(self.mcp_server._protocol_version, "data", protocol_version)
         try:
-            response = self.mcp_server.registry.dispatch(body)
+            response = self.mcp_server.registry.dispatch(parsed)
         finally:
             setattr(self.mcp_server._enabled_extensions, "data", set())
             setattr(self.mcp_server._protocol_version, "data", None)
@@ -388,14 +578,18 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             if mcp_session_id is not None:
-                self.send_header("Mcp-Session-Id", mcp_session_id)
+                self.send_header("MCP-Session-Id", mcp_session_id)
             self.send_cors_headers()
             self.end_headers()
             self.wfile.write(body)
 
-        # Check if notification (returns None)
-        if response is None:
-            send_response(202, b"Accepted")
+        if is_notification:
+            if response is None:
+                self._send_empty_response(202, mcp_session_id=mcp_session_id)
+            else:
+                self._send_jsonrpc_http_error(400, -32600, "Notification was not accepted")
+        elif response is None:
+            self._send_jsonrpc_http_error(400, -32603, "Request did not produce a response")
         else:
             send_response(200, json.dumps(response).encode("utf-8"))
 
@@ -414,7 +608,7 @@ class McpServer:
         self._server_thread: threading.Thread | None = None
         self._running = False
         self._sse_connections: dict[str, _McpSseConnection] = {}
-        self._http_sessions: set[str] = set()
+        self._http_sessions: dict[str, str] = {}
         self._http_sessions_lock = threading.Lock()
         self._protocol_version = threading.local()
         self._transport_session_id = threading.local()
@@ -567,13 +761,23 @@ class McpServer:
     def get_current_transport_session_id(self) -> str | None:
         return getattr(self._transport_session_id, "data", None)
 
-    def register_http_session(self, session_id: str) -> None:
+    def register_http_session(
+        self,
+        session_id: str,
+        protocol_version: str = LATEST_MCP_PROTOCOL_VERSION,
+    ) -> None:
         with self._http_sessions_lock:
-            self._http_sessions.add(session_id)
+            self._http_sessions[session_id] = protocol_version
 
     def has_http_session(self, session_id: str) -> bool:
         with self._http_sessions_lock:
             return session_id in self._http_sessions
+
+    def get_http_session_protocol_version(self, session_id: str | None) -> str | None:
+        if session_id is None:
+            return None
+        with self._http_sessions_lock:
+            return self._http_sessions.get(session_id)
 
     def cors_localhost(self, origin: str) -> bool:
         """Allow CORS requests from localhost on ANY port."""

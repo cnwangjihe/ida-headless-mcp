@@ -225,7 +225,16 @@ class InstanceManager:
         conn.sock = sock
         try:
             body = json.dumps(request)
-            conn.request("POST", "/mcp", body, {"Content-Type": "application/json"})
+            conn.request(
+                "POST",
+                "/mcp",
+                body,
+                {
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream",
+                    "MCP-Protocol-Version": "2025-11-25",
+                },
+            )
             resp = conn.getresponse()
             data = resp.read().decode()
             if resp.status >= 400:
