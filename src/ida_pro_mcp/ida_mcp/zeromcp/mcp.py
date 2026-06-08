@@ -81,7 +81,7 @@ class _McpSseConnection:
 class _UnixHTTPServerMixin:
     """Mixin that makes an HTTPServer subclass listen on a Unix domain socket."""
 
-    address_family = socket.AF_UNIX
+    address_family = getattr(socket, "AF_UNIX", socket.AF_INET)
 
     def server_bind(self):
         if isinstance(self.server_address, str) and os.path.exists(self.server_address):
@@ -654,6 +654,8 @@ class McpServer:
         # Create server with deferred binding
         assert issubclass(request_handler, McpHttpRequestHandler)
         if unix_socket:
+            if not hasattr(socket, "AF_UNIX"):
+                raise RuntimeError("Unix domain sockets are not supported on this platform")
             server_cls = UnixThreadingHTTPServer if background else UnixHTTPServer
             server_address: str | tuple[str, int] = unix_socket
         else:

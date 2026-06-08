@@ -1,5 +1,7 @@
 import io
+import socket
 import unittest
+from contextlib import contextmanager
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
@@ -49,6 +51,19 @@ class _FakeHTTPServer(_FakeServerBase):
     instances = []
 
 
+@contextmanager
+def _without_af_unix():
+    sentinel = object()
+    original = getattr(socket, "AF_UNIX", sentinel)
+    if original is not sentinel:
+        delattr(socket, "AF_UNIX")
+    try:
+        yield
+    finally:
+        if original is not sentinel:
+            setattr(socket, "AF_UNIX", original)
+
+
 class McpServeTransportTests(unittest.TestCase):
     def setUp(self):
         _FakeThreadingHTTPServer.reset()
@@ -70,6 +85,12 @@ class McpServeTransportTests(unittest.TestCase):
         self.assertTrue(_FakeThreadingHTTPServer.instances[0].bound)
         self.assertTrue(_FakeThreadingHTTPServer.instances[0].activated)
         self.assertTrue(_FakeThreadingHTTPServer.instances[0].served)
+
+    def test_unix_socket_requires_af_unix_at_runtime(self):
+        server = McpServer("ida-pro-mcp")
+        with _without_af_unix():
+            with self.assertRaisesRegex(RuntimeError, "Unix domain sockets"):
+                server.serve(unix_socket="/tmp/ida-mcp.sock")
 
 
 class McpProtocolNotificationTests(unittest.TestCase):

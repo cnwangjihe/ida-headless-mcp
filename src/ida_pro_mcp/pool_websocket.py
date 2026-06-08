@@ -78,8 +78,8 @@ class ExternalInstanceBridge:
         """
         try:
             while self.alive:
-                # Wait for a forward request or timeout for housekeeping
-                self._request_event.wait(timeout=30)
+                # Also poll for unsolicited plugin messages such as check_agents.
+                self._request_event.wait(timeout=0.1)
                 self._request_event.clear()
 
                 # Process all pending forward requests
@@ -106,21 +106,16 @@ class ExternalInstanceBridge:
                 # Check for unsolicited messages from plugin
                 # (e.g., check_agents request)
                 try:
-                    self.ws.socket.settimeout(0.1)
-                    raw = self.ws.recv()
+                    raw = self.ws.recv(timeout=0.1)
                     msg = json.loads(raw)
                     if msg.get("type") == "check_agents" and on_check_agents:
                         count = on_check_agents()
                         self.send_agent_count(count)
                 except TimeoutError:
                     pass
-                except Exception:
-                    pass
-                finally:
-                    try:
-                        self.ws.socket.settimeout(None)
-                    except Exception:
-                        pass
+                except Exception as e:
+                    logger.info("External instance disconnected: %s", e)
+                    self.alive = False
 
         except Exception as e:
             logger.info("External instance bridge loop ended: %s", e)

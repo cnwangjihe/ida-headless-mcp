@@ -18,6 +18,13 @@ if TYPE_CHECKING:
     from . import ida_mcp
 
 
+def ensure_plugin_dir_on_path():
+    """Make the sibling ida_mcp package importable from IDA's plugin loader."""
+    plugin_dir = os.path.dirname(__file__)
+    if plugin_dir not in sys.path:
+        sys.path.insert(0, plugin_dir)
+
+
 def unload_package(package_name: str):
     """Remove every module that belongs to the package from sys.modules."""
     to_remove = [
@@ -31,6 +38,8 @@ def unload_package(package_name: str):
 
 CONFIG_ACTION_ID = "mcp:configure"
 CONFIG_ACTION_LABEL = "MCP Configuration"
+LOCAL_SERVER_ACTION_ID = "mcp:local_server"
+LOCAL_SERVER_ACTION_LABEL = "MCP Local Server"
 
 
 class MCPConfigForm(idaapi.Form):
@@ -87,7 +96,7 @@ class MCPConfigHandler(idaapi.action_handler_t):
         # Apply new endpoint immediately if the server is running.
         if self.plugin.mcp is not None:
             print("[MCP] Applying configuration change without manual restart...")
-            self.plugin.run(0)
+            self.plugin.start_local_server()
         return 1
 
     def update(self, ctx):
@@ -102,12 +111,11 @@ class MCPUIHooks(ida_kernwin.UI_Hooks):
             "Edit/Plugins/", CONFIG_ACTION_ID, idaapi.SETMENU_APP
         )
         ida_kernwin.attach_action_to_menu(
-            "Edit/Plugins/", POOL_ACTION_ID, idaapi.SETMENU_APP
+            "Edit/Plugins/", LOCAL_SERVER_ACTION_ID, idaapi.SETMENU_APP
         )
         self.unhook()
 
 
-POOL_ACTION_ID = "mcp:pool"
 POOL_ACTION_LABEL = "MCP Pool"
 
 
@@ -172,9 +180,8 @@ class PoolConnector:
             if TYPE_CHECKING:
                 from .ida_mcp.rpc import MCP_SERVER
             else:
-                sys.path.insert(0, os.path.join(os.path.dirname(__file__), "ida_mcp"))
-                from rpc import MCP_SERVER
-                sys.path.pop(0)
+                ensure_plugin_dir_on_path()
+                from ida_mcp.rpc import MCP_SERVER
 
             response = MCP_SERVER.registry.dispatch(msg)
             if response is not None:
@@ -251,9 +258,8 @@ class MCPPoolHandler(idaapi.action_handler_t):
         if TYPE_CHECKING:
             from .ida_mcp.http import config_json_get, config_json_set
         else:
-            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "ida_mcp"))
-            from http import config_json_get, config_json_set
-            sys.path.pop(0)
+            ensure_plugin_dir_on_path()
+            from ida_mcp.http import config_json_get, config_json_set
 
         default_url = config_json_get("pool_url", "http://127.0.0.1:8750")
         default_name = ida_nalt.get_root_filename() or "ida-session"
@@ -322,11 +328,24 @@ class MCPPoolHandler(idaapi.action_handler_t):
         return idaapi.AST_ENABLE_ALWAYS
 
 
+class MCPLocalServerHandler(idaapi.action_handler_t):
+    def __init__(self, plugin: "MCP"):
+        idaapi.action_handler_t.__init__(self)
+        self.plugin = plugin
+
+    def activate(self, ctx):
+        self.plugin.start_local_server()
+        return 1
+
+    def update(self, ctx):
+        return idaapi.AST_ENABLE_ALWAYS
+
+
 class MCP(idaapi.plugin_t):
     flags = idaapi.PLUGIN_KEEP
     comment = "MCP Plugin"
-    help = "MCP"
-    wanted_name = "MCP"
+    help = POOL_ACTION_LABEL
+    wanted_name = POOL_ACTION_LABEL
     wanted_hotkey = "Ctrl-Alt-M"
 
     DEFAULT_HOST = "127.0.0.1"
@@ -338,12 +357,13 @@ class MCP(idaapi.plugin_t):
             hotkey = hotkey.replace("Alt", "Option")
 
         print(
-            f"[MCP] Plugin loaded, use Edit -> Plugins -> MCP ({hotkey}) to start the server"
+            f"[MCP] Plugin loaded, use Edit -> Plugins -> MCP Pool ({hotkey}) to connect to a pool"
         )
         self.mcp: "ida_mcp.rpc.McpServer | None" = None
         self.host = self.DEFAULT_HOST
         self.port = self.DEFAULT_PORT
         self.pool_connector: PoolConnector | None = None
+        self._pool_handler = MCPPoolHandler(self)
 
         ida_kernwin.register_action(
             ida_kernwin.action_desc_t(
@@ -354,9 +374,9 @@ class MCP(idaapi.plugin_t):
         )
         ida_kernwin.register_action(
             ida_kernwin.action_desc_t(
-                POOL_ACTION_ID,
-                POOL_ACTION_LABEL,
-                MCPPoolHandler(self),
+                LOCAL_SERVER_ACTION_ID,
+                LOCAL_SERVER_ACTION_LABEL,
+                MCPLocalServerHandler(self),
             )
         )
         self._ui_hooks = MCPUIHooks()
@@ -365,6 +385,9 @@ class MCP(idaapi.plugin_t):
         return idaapi.PLUGIN_KEEP
 
     def run(self, arg):
+        return self._pool_handler.activate(None)
+
+    def start_local_server(self):
         if self.mcp:
             self.mcp.stop()
             self.mcp = None
@@ -374,6 +397,7 @@ class MCP(idaapi.plugin_t):
         if TYPE_CHECKING:
             from .ida_mcp import MCP_SERVER, IdaMcpHttpRequestHandler, init_caches
         else:
+            ensure_plugin_dir_on_path()
             from ida_mcp import MCP_SERVER, IdaMcpHttpRequestHandler, init_caches
 
         try:
@@ -402,7 +426,7 @@ class MCP(idaapi.plugin_t):
         if hasattr(self, "_ui_hooks"):
             self._ui_hooks.unhook()
         ida_kernwin.unregister_action(CONFIG_ACTION_ID)
-        ida_kernwin.unregister_action(POOL_ACTION_ID)
+        ida_kernwin.unregister_action(LOCAL_SERVER_ACTION_ID)
         if self.pool_connector:
             try:
                 agents = self.pool_connector.check_agents(timeout=3)
@@ -418,5 +442,3 @@ class MCP(idaapi.plugin_t):
 
 def PLUGIN_ENTRY():
     return MCP()
-
-

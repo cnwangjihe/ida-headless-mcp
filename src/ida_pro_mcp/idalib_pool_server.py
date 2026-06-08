@@ -52,10 +52,41 @@ McpServer = _mcp_mod.McpServer
 McpHttpRequestHandler = _mcp_mod.McpHttpRequestHandler
 JsonRpcResponse = _jsonrpc_mod.JsonRpcResponse
 
+from websockets.datastructures import Headers  # noqa: E402
+from websockets.http11 import Request  # noqa: E402
+from websockets.protocol import OPEN  # noqa: E402
+from websockets.sync.connection import Connection as WebSocketConnection  # noqa: E402
+from websockets.sync.server import ServerProtocol  # noqa: E402
+
 from ida_pro_mcp.idalib_pool_manager import PoolManager  # noqa: E402
 from ida_pro_mcp.pool_websocket import ExternalInstanceBridge  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+
+def _accept_pool_websocket(handler) -> WebSocketConnection | None:
+    """Accept /pool/ws after BaseHTTPRequestHandler parsed the HTTP request."""
+    request_headers = Headers(handler.headers.items())
+    request = Request(handler.path, request_headers)
+
+    handshake = ServerProtocol()
+    response = handshake.accept(request)
+    handler.request.sendall(response.serialize())
+    handler.close_connection = True
+
+    if response.status_code != 101:
+        logger.warning(
+            "WebSocket handshake rejected: HTTP %s %s",
+            response.status_code,
+            response.reason_phrase,
+        )
+        return None
+
+    return WebSocketConnection(
+        handler.request,
+        ServerProtocol(state=OPEN),
+        ping_interval=None,
+    )
 
 # --------------------------------------------------------------------------
 # Management tool names that the proxy intercepts
@@ -621,18 +652,8 @@ def build_pool_handler_class(pool: PoolManager):
                 super().do_GET()
 
         def _handle_pool_ws(self):
-            try:
-                from websockets.sync.server import ServerConnection
-                from websockets.http11 import Request
-            except ImportError:
-                self.send_error(500, "websockets library not available")
-                return
-
-            ws = ServerConnection(self.request)
-            try:
-                ws.handshake()
-            except Exception as e:
-                logger.warning("WebSocket handshake failed: %s", e)
+            ws = _accept_pool_websocket(self)
+            if ws is None:
                 return
 
             bridge = ExternalInstanceBridge(ws)
