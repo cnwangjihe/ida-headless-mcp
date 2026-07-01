@@ -20,9 +20,13 @@ Key invariants
 from __future__ import annotations
 
 import http.client
+import hashlib
 import json
 import logging
+import ntpath
 import os
+import re
+import secrets
 import signal
 import socket
 import subprocess
@@ -30,12 +34,44 @@ import sys
 import tempfile
 import threading
 import time
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+_WINDOWS_ABS_RE = re.compile(r"^[A-Za-z]:[\\/]")
+_SESSION_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _looks_windows_abs(path: str) -> bool:
+    return bool(_WINDOWS_ABS_RE.match(path) or path.startswith("\\\\"))
+
+
+def _normalize_path(path: str) -> str:
+    if not path:
+        return ""
+    if _looks_windows_abs(path):
+        return ntpath.normpath(path)
+    return os.path.abspath(path)
+
+
+def _path_basename(path: str) -> str:
+    if not path:
+        return ""
+    if _looks_windows_abs(path) or "\\" in path:
+        return ntpath.basename(path)
+    return os.path.basename(path)
+
+
+def _session_base_name(path: str) -> str:
+    name = _path_basename(path) or "session"
+    root, ext = os.path.splitext(name)
+    if ext.lower() in {".idb", ".i64"} and root:
+        name = root
+    name = _SESSION_NAME_RE.sub("_", name).strip("._-")
+    return name or "session"
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -56,7 +92,7 @@ class SessionInfo:
             "session_id": self.session_id,
             "input_path": self.input_path,
             "idb_path": self.idb_path,
-            "filename": os.path.basename(self.input_path),
+            "filename": _path_basename(self.input_path),
             "refcount": refcount,
             "is_external": self.is_external,
             "last_accessed": self.last_accessed,
@@ -160,6 +196,24 @@ class InstanceManager:
         if inst in self.instances:
             self.instances.remove(inst)
 
+    def discard(self, inst: InstanceInfo) -> None:
+        """Forget an instance that is already unusable."""
+        if inst.is_external and inst.ws_bridge:
+            inst.ws_bridge.alive = False
+        log_file = getattr(inst, "_log_file", None)
+        if log_file:
+            try:
+                log_file.close()
+            except Exception:
+                pass
+        if inst.socket_path and os.path.exists(inst.socket_path):
+            try:
+                os.unlink(inst.socket_path)
+            except OSError:
+                pass
+        if inst in self.instances:
+            self.instances.remove(inst)
+
     def kill_all(self) -> None:
         for inst in list(self.instances):
             self.kill(inst)
@@ -172,8 +226,12 @@ class InstanceManager:
         return None
 
     def find_idle(self) -> InstanceInfo | None:
-        for inst in self.instances:
+        for inst in list(self.instances):
             if inst.session_id is None:
+                if not inst.is_alive():
+                    logger.info("Discarding dead idle instance %d", inst.index)
+                    self.discard(inst)
+                    continue
                 return inst
         return None
 
@@ -281,6 +339,8 @@ class SessionRegistry:
         *,
         is_external: bool = False,
     ) -> SessionInfo:
+        if session_id in self.sessions:
+            raise ValueError(f"Session already exists: {session_id}")
         sess = SessionInfo(
             session_id=session_id,
             input_path=input_path,
@@ -342,7 +402,18 @@ class SessionRegistry:
         return min(session_ids, key=lambda sid: self.sessions[sid].created_at)
 
     def generate_id(self) -> str:
-        return str(uuid.uuid4())[:8]
+        while True:
+            candidate = f"session_{secrets.token_hex(3)}"
+            if candidate not in self.sessions:
+                return candidate
+
+    def generate_id_for_path(self, display_path: str, identity_path: str) -> str:
+        base = _session_base_name(display_path)
+        digest = hashlib.sha256(identity_path.encode("utf-8")).hexdigest()[:6]
+        candidate = f"{base}_{digest}"
+        while candidate in self.sessions:
+            candidate = f"{base}_{digest}_{secrets.token_hex(3)}"
+        return candidate
 
     # --- Context bindings (no refcount effect) ---
 
@@ -427,7 +498,8 @@ class PoolManager:
     def shutdown_all(self) -> None:
         with self._lock:
             instances_to_save = [
-                inst for inst in self.im.instances if inst.session_id
+                inst for inst in self.im.instances
+                if inst.session_id and not inst.is_external
             ]
 
         for inst in instances_to_save:
@@ -450,11 +522,10 @@ class PoolManager:
     def open_session(
         self,
         binary_path: str,
-        session_id: str | None = None,
         run_auto_analysis: bool = True,
         allow_duplicate_input: bool = False,
     ) -> dict:
-        resolved = os.path.abspath(binary_path)
+        resolved = _normalize_path(binary_path)
         is_idb = resolved.endswith((".idb", ".i64"))
 
         with self._lock:
@@ -487,16 +558,49 @@ class PoolManager:
                         "message": f"Binary already open as session '{existing_sid}'.",
                     }
 
-            inst = self._allocate_instance_locked()
-            if session_id is None:
-                session_id = self.sr.generate_id()
+            session_id = self.sr.generate_id_for_path(resolved, resolved)
 
-        # Forward to backend
-        resp = self.im.forward_tool_call(inst, "idalib_open", {
-            "input_path": resolved,
-            "run_auto_analysis": run_auto_analysis,
-            "session_id": session_id,
-        })
+        last_error: Exception | None = None
+        inst: InstanceInfo | None = None
+        for attempt in range(2):
+            with self._lock:
+                inst = self._allocate_instance_locked()
+            try:
+                resp = self.im.forward_tool_call(inst, "idalib_open", {
+                    "input_path": resolved,
+                    "run_auto_analysis": run_auto_analysis,
+                    "session_id": session_id,
+                })
+                break
+            except (ConnectionRefusedError, OSError) as e:
+                last_error = e
+                logger.warning(
+                    "Backend instance %d unavailable while opening %s: %s",
+                    inst.index, resolved, e,
+                )
+                with self._lock:
+                    if inst.session_id is None:
+                        if inst.is_alive():
+                            self.im.kill(inst)
+                        else:
+                            self.im.discard(inst)
+                if attempt == 0:
+                    continue
+                return {
+                    "success": False,
+                    "error": (
+                        "Backend instance unavailable while opening "
+                        f"{resolved}: {last_error}"
+                    ),
+                }
+        else:
+            return {
+                "success": False,
+                "error": (
+                    "Backend instance unavailable while opening "
+                    f"{resolved}: {last_error}"
+                ),
+            }
 
         if isinstance(resp, dict) and resp.get("error"):
             return resp
@@ -508,9 +612,9 @@ class PoolManager:
 
         with self._lock:
             # Post-open conflict check: input_path may differ from what we passed
-            canonical_input = os.path.abspath(canonical_input) if canonical_input else resolved
+            canonical_input = _normalize_path(canonical_input) if canonical_input else resolved
             if idb_path:
-                idb_path = os.path.abspath(idb_path)
+                idb_path = _normalize_path(idb_path)
 
             existing_for_input = self.sr.find_by_input_path(canonical_input)
             if existing_for_input and not allow_duplicate_input:
@@ -582,10 +686,14 @@ class PoolManager:
         session_id: str | None = None,
         allow_duplicate_input: bool = False,
     ) -> dict:
-        """Register an external IDA plugin instance via WebSocket."""
-        input_path = os.path.abspath(input_path)
+        """Register an external IDA plugin instance via WebSocket.
+
+        ``session_id`` is accepted for legacy callers but ignored.  The pool
+        is the sole authority for new session IDs.
+        """
+        input_path = _normalize_path(input_path)
         if idb_path:
-            idb_path = os.path.abspath(idb_path)
+            idb_path = _normalize_path(idb_path)
 
         with self._lock:
             # Check idb_path conflict (same IDB already open)
@@ -611,8 +719,9 @@ class PoolManager:
                 }
 
             inst = self.im.register_external(ws_bridge)
-            if not session_id:
-                session_id = self.sr.generate_id()
+            identity_path = idb_path or input_path
+            display_path = input_path or identity_path
+            session_id = self.sr.generate_id_for_path(display_path, identity_path)
 
             sess = self.sr.create(
                 session_id, input_path, idb_path, inst.index,

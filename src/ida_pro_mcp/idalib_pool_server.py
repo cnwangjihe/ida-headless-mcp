@@ -126,10 +126,10 @@ _MGMT_TOOL_OVERRIDES: dict[str, dict] = {
         "name": "idalib_open",
         "description": (
             "Open a binary or IDB for analysis. If the same binary/IDB is "
-            "already open, shares the existing session. The returned "
-            "session_id may differ from the one you requested — always use "
-            "the returned session_id for subsequent calls. Each idalib_open "
-            "must be balanced by an idalib_close when you are done."
+            "already open, shares the existing session. The pool generates "
+            "the returned session_id; always use it for subsequent calls. "
+            "Each idalib_open must be balanced by an idalib_close when you "
+            "are done."
         ),
         "inputSchema": {
             "type": "object",
@@ -143,14 +143,6 @@ _MGMT_TOOL_OVERRIDES: dict[str, dict] = {
                 "run_auto_analysis": {
                     "type": "boolean",
                     "description": "Run automatic analysis on the binary (default: true)",
-                },
-                "session_id": {
-                    "type": "string",
-                    "description": (
-                        "Suggested session ID. This is advisory only — if the "
-                        "binary is already open, the existing session_id is "
-                        "returned instead."
-                    ),
                 },
                 "allow_duplicate_input": {
                     "type": "boolean",
@@ -375,13 +367,13 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
 
     def _handle_idalib_open(arguments: dict) -> dict:
         input_path = arguments.get("input_path", "")
-        session_id = arguments.get("session_id")
         run_auto = arguments.get("run_auto_analysis", True)
         allow_dup = arguments.get("allow_duplicate_input", False)
 
         result = pool.open_session(
-            input_path, session_id=session_id,
-            run_auto_analysis=run_auto, allow_duplicate_input=allow_dup,
+            input_path,
+            run_auto_analysis=run_auto,
+            allow_duplicate_input=allow_dup,
         )
         if not result.get("success"):
             return result
@@ -500,6 +492,8 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
             _sess, inst = pool.resolve_session_instance(sid)
         except (KeyError, RuntimeError) as e:
             return {"error": str(e)}
+        if getattr(inst, "is_external", False) is True:
+            return pool.forward_tool_call(inst, "idb_save", arguments)
         return pool.forward_tool_call(inst, "idalib_save", arguments)
 
     def _handle_idalib_health(arguments: dict) -> dict:
@@ -685,7 +679,6 @@ def build_pool_handler_class(pool: PoolManager):
                     ws_bridge=bridge,
                     input_path=reg.get("input_path", ""),
                     idb_path=reg.get("idb_path", ""),
-                    session_id=reg.get("session_id"),
                     allow_duplicate_input=reg.get("allow_duplicate_input", False),
                 )
                 ws.send(json.dumps(result))

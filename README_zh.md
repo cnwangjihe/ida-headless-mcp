@@ -179,7 +179,7 @@ claude mcp add --transport http --scope user ida-pro-mcp http://<host>:8745/mcp
 
 | 工具 | 说明 |
 |------|------|
-| `idalib_open(path, session_id?)` | 打开 binary，自动分配实例 |
+| `idalib_open(path)` | 打开 binary，pool 返回生成的 `session_id` |
 | `idalib_close(session_id)` | 关闭会话（保存 IDB） |
 | `idalib_switch(session_id)` | 设置默认会话（无 IDB 开销） |
 | `idalib_list()` | 列出所有会话 |

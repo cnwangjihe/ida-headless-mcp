@@ -34,6 +34,15 @@ class TestSessionRegistry(unittest.TestCase):
         self.assertEqual(sess.instance_index, 0)
         self.assertIs(self.sr.get("s1"), sess)
 
+    def test_create_duplicate_session_id_raises_without_overwrite(self):
+        self.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
+
+        with self.assertRaises(ValueError):
+            self.sr.create("s1", "/tmp/b.elf", "/tmp/b.elf.i64", instance_index=1)
+
+        self.assertEqual(self.sr.get("s1").input_path, "/tmp/a.elf")
+        self.assertEqual(self.sr.find_by_input_path("/tmp/b.elf"), [])
+
     def test_create_initializes_refcount_to_zero(self):
         self.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
         self.assertEqual(self.sr.get_refcount("s1"), 0)
@@ -169,6 +178,26 @@ class TestSessionRegistryEdgeCases(unittest.TestCase):
     def test_generate_id_is_unique(self):
         ids = {self.sr.generate_id() for _ in range(100)}
         self.assertEqual(len(ids), 100)
+
+    def test_generate_id_for_path_uses_name_and_hash(self):
+        sid = self.sr.generate_id_for_path("/tmp/dp.i64", "/tmp/dp.i64")
+        self.assertRegex(sid, r"^dp_[0-9a-f]{6}$")
+
+    def test_generate_id_for_path_preserves_binary_suffixes(self):
+        sid = self.sr.generate_id_for_path(
+            "/tmp/libsg_ssl.so.1.1.i64",
+            "/tmp/libsg_ssl.so.1.1.i64",
+        )
+        self.assertRegex(sid, r"^libsg_ssl\.so\.1\.1_[0-9a-f]{6}$")
+
+    def test_generate_id_for_path_adds_random_suffix_on_collision(self):
+        first = self.sr.generate_id_for_path("/tmp/dp.i64", "/tmp/dp.i64")
+        self.sr.create(first, "/tmp/dp", "/tmp/dp.i64", instance_index=0)
+
+        second = self.sr.generate_id_for_path("/tmp/dp.i64", "/tmp/dp.i64")
+
+        self.assertRegex(second, r"^dp_[0-9a-f]{6}_[0-9a-f]{6}$")
+        self.assertNotEqual(first, second)
 
     def test_unbind_session_everywhere_nonexistent_is_noop(self):
         self.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
@@ -373,6 +402,34 @@ class TestPoolServerDispatch(unittest.TestCase):
         self.assertEqual(result["session"]["refcount"], 1)
         self.assertEqual(pool.sr.get_context_session_id("sse:agent-a"), "s1")
         self.assertEqual(pool.sr.get_refcount("s1"), 1)
+
+    def test_open_ignores_legacy_session_id_argument(self):
+        mcp, pool = self._make_mcp_and_pool()
+        pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
+        pool.open_session.return_value = {
+            "success": True,
+            "existing": False,
+            "session": pool.sr.get("s1").to_dict(),
+            "message": "created",
+        }
+        self.build_dispatch(mcp, pool)
+
+        request = {
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {
+                "name": "idalib_open",
+                "arguments": {"input_path": "/tmp/a.elf", "session_id": "dp"},
+            },
+            "id": 1,
+        }
+        self._dispatch(mcp, request, transport_session_id="sse:agent-a")
+
+        pool.open_session.assert_called_once_with(
+            "/tmp/a.elf",
+            run_auto_analysis=True,
+            allow_duplicate_input=False,
+        )
 
     def test_open_existing_binary_shares_session(self):
         mcp, pool = self._make_mcp_and_pool()
@@ -871,6 +928,31 @@ class TestPoolServerDispatch(unittest.TestCase):
         self.assertTrue(result.get("ok"))
         pool.resolve_session_instance.assert_called_once_with("s1")
 
+    def test_save_maps_to_idb_save_for_external_session(self):
+        mcp, pool = self._make_mcp_and_pool()
+        pool.sr.create("ext1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0, is_external=True)
+        pool.sr.bind_context("sse:agent-a", "ext1")
+        bridge = MagicMock()
+        bridge.alive = True
+        inst = InstanceInfo(index=0, socket_path="", process=None, ws_bridge=bridge)
+        pool.resolve_session_instance.return_value = (pool.sr.get("ext1"), inst)
+        pool.forward_tool_call.return_value = {"ok": True, "path": "/tmp/a.elf.i64"}
+        self.build_dispatch(mcp, pool)
+
+        req = {
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "idalib_save", "arguments": {"path": "/tmp/a.elf.i64"}},
+            "id": 1,
+        }
+        resp = self._dispatch(mcp, req, transport_session_id="sse:agent-a")
+
+        result = resp["result"]["structuredContent"]
+        self.assertTrue(result.get("ok"))
+        pool.forward_tool_call.assert_called_once_with(
+            inst, "idb_save", {"path": "/tmp/a.elf.i64"}
+        )
+
     def test_save_no_session_returns_error(self):
         mcp, pool = self._make_mcp_and_pool()
         self.build_dispatch(mcp, pool)
@@ -1033,6 +1115,8 @@ class TestPoolServerDispatch(unittest.TestCase):
         tools_by_name = {t["name"]: t for t in resp["result"]["tools"]}
         # idalib_open should have pool-specific description (not the backend one)
         self.assertIn("idalib_close", tools_by_name["idalib_open"]["description"])
+        open_props = tools_by_name["idalib_open"]["inputSchema"]["properties"]
+        self.assertNotIn("session_id", open_props)
         # idalib_close should expose force param
         close_props = tools_by_name["idalib_close"]["inputSchema"]["properties"]
         self.assertIn("force", close_props)
@@ -1105,11 +1189,10 @@ class TestPoolServerDispatch(unittest.TestCase):
         resp = self._dispatch(mcp, req, transport_session_id="sse:a")
         self.assertIn("error", resp)
 
-    def test_hidden_tools_filtered_from_list(self):
+    def test_removed_unbind_tool_is_absent_from_list(self):
         mcp, pool = self._make_mcp_and_pool()
         pool.forward_tools_list.return_value = [
             {"name": "get_functions", "inputSchema": {"type": "object", "properties": {}}},
-            {"name": "idalib_unbind", "inputSchema": {"type": "object", "properties": {}}},
         ]
         self.build_dispatch(mcp, pool)
 
@@ -1201,6 +1284,19 @@ class TestPoolManager(unittest.TestCase):
         self.assertEqual(len(pool.sr._context_bindings), 0)
         self.assertEqual(len(pool.sr._refcounts), 0)
 
+    def test_shutdown_all_skips_external_instance_save(self):
+        pool = self._make_pool()
+        pool.sr.create("ext1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0, is_external=True)
+        bridge = MagicMock()
+        bridge.alive = True
+        inst = InstanceInfo(index=0, socket_path="", process=None, session_id="ext1", ws_bridge=bridge)
+        pool.im.instances = [inst]
+
+        pool.shutdown_all()
+
+        pool.im.forward_tool_call.assert_not_called()
+        pool.im.kill_all.assert_called_once()
+
     def test_open_session_path_dedup(self):
         """Opening the same path twice returns the existing session."""
         pool = self._make_pool()
@@ -1214,11 +1310,55 @@ class TestPoolManager(unittest.TestCase):
         self.assertTrue(r1["success"])
         self.assertFalse(r1["existing"])
         sid = r1["session"]["session_id"]
+        self.assertRegex(sid, r"^a\.elf_[0-9a-f]{6}$")
 
         r2 = pool.open_session("/tmp/a.elf")
         self.assertTrue(r2["success"])
         self.assertTrue(r2["existing"])
         self.assertEqual(r2["session"]["session_id"], sid)
+
+    def test_open_session_generates_new_id_for_different_path(self):
+        pool = self._make_pool()
+        inst1 = MagicMock()
+        inst1.index = 0
+        inst1.session_id = None
+        inst1.is_alive.return_value = False
+        inst2 = MagicMock()
+        inst2.index = 1
+        inst2.session_id = None
+        pool.im.find_idle.side_effect = [inst1, inst2]
+        pool.im.forward_tool_call.return_value = {"success": True}
+
+        r1 = pool.open_session("/tmp/dp.i64")
+        r2 = pool.open_session("/other/dp.i64")
+
+        self.assertTrue(r1["success"])
+        self.assertTrue(r2["success"])
+        self.assertNotEqual(r1["session"]["session_id"], r2["session"]["session_id"])
+        self.assertRegex(r1["session"]["session_id"], r"^dp_[0-9a-f]{6}$")
+        self.assertRegex(r2["session"]["session_id"], r"^dp_[0-9a-f]{6}$")
+
+    def test_open_session_retries_after_backend_connection_refused(self):
+        pool = self._make_pool()
+        inst1 = MagicMock()
+        inst1.index = 0
+        inst1.session_id = None
+        inst1.is_alive.return_value = False
+        inst2 = MagicMock()
+        inst2.index = 1
+        inst2.session_id = None
+        pool.im.find_idle.side_effect = [inst1, inst2]
+        pool.im.forward_tool_call.side_effect = [
+            ConnectionRefusedError("refused"),
+            {"success": True},
+        ]
+
+        result = pool.open_session("/tmp/a.elf")
+
+        self.assertTrue(result["success"])
+        pool.im.discard.assert_called_once_with(inst1)
+        pool.im.kill.assert_not_called()
+        self.assertEqual(pool.im.forward_tool_call.call_count, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -1368,7 +1508,7 @@ class TestExternalRegistration(unittest.TestCase):
             bridge, "/tmp/a.elf", "/tmp/a.elf.i64", session_id="ext1",
         )
         self.assertTrue(result["success"])
-        self.assertEqual(result["session"]["session_id"], "ext1")
+        self.assertRegex(result["session"]["session_id"], r"^a\.elf_[0-9a-f]{6}$")
         self.assertTrue(result["session"]["is_external"])
         self.assertEqual(result["session"]["refcount"], 1)
 
@@ -1420,6 +1560,7 @@ class TestExternalRegistration(unittest.TestCase):
             allow_duplicate_input=True,
         )
         self.assertTrue(result["success"])
+        self.assertRegex(result["session"]["session_id"], r"^a\.elf_[0-9a-f]{6}$")
 
     def test_unregister_external(self):
         pool = PoolManager.__new__(PoolManager)
@@ -1431,16 +1572,17 @@ class TestExternalRegistration(unittest.TestCase):
 
         bridge = MagicMock()
         bridge.alive = True
-        pool.register_external(bridge, "/tmp/a.elf", "/tmp/a.elf.i64", session_id="ext1")
+        reg = pool.register_external(bridge, "/tmp/a.elf", "/tmp/a.elf.i64", session_id="ext1")
+        sid = reg["session"]["session_id"]
 
         # Simulate agent refcount
-        pool.sr.increment_refcount("ext1")  # agent opens
-        self.assertEqual(pool.sr.get_refcount("ext1"), 2)  # user + agent
+        pool.sr.increment_refcount(sid)  # agent opens
+        self.assertEqual(pool.sr.get_refcount(sid), 2)  # user + agent
 
-        result = pool.unregister_external("ext1")
+        result = pool.unregister_external(sid)
         self.assertTrue(result["success"])
         self.assertEqual(result["active_agents"], 1)
-        self.assertIsNone(pool.sr.get("ext1"))
+        self.assertIsNone(pool.sr.get(sid))
 
     def test_get_external_agent_count(self):
         pool = PoolManager.__new__(PoolManager)
@@ -1452,11 +1594,12 @@ class TestExternalRegistration(unittest.TestCase):
 
         bridge = MagicMock()
         bridge.alive = True
-        pool.register_external(bridge, "/tmp/a.elf", "/tmp/a.elf.i64", session_id="ext1")
-        self.assertEqual(pool.get_external_agent_count("ext1"), 0)
+        reg = pool.register_external(bridge, "/tmp/a.elf", "/tmp/a.elf.i64", session_id="ext1")
+        sid = reg["session"]["session_id"]
+        self.assertEqual(pool.get_external_agent_count(sid), 0)
 
-        pool.sr.increment_refcount("ext1")
-        self.assertEqual(pool.get_external_agent_count("ext1"), 1)
+        pool.sr.increment_refcount(sid)
+        self.assertEqual(pool.get_external_agent_count(sid), 1)
 
 
 class TestExternalCloseGuard(TestPoolServerDispatch):

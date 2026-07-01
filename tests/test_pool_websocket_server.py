@@ -26,19 +26,17 @@ class _DummyPool:
         ws_bridge,
         input_path,
         idb_path,
-        session_id,
         allow_duplicate_input,
     ):
         self.registered = {
             "input_path": input_path,
             "idb_path": idb_path,
-            "session_id": session_id,
             "allow_duplicate_input": allow_duplicate_input,
         }
         return {
             "success": True,
             "session": {
-                "session_id": session_id or "ext1",
+                "session_id": "a_123abc",
                 "input_path": input_path,
                 "idb_path": idb_path,
                 "filename": os.path.basename(input_path),
@@ -90,7 +88,7 @@ class TestPoolWebSocketServer(unittest.TestCase):
             )
             register_response = json.loads(ws.recv())
             self.assertTrue(register_response["success"])
-            self.assertEqual(register_response["session"]["session_id"], "win-gui")
+            self.assertEqual(register_response["session"]["session_id"], "a_123abc")
 
             ws.send(json.dumps({"type": "check_agents"}))
             agent_count = json.loads(ws.recv())
@@ -99,10 +97,11 @@ class TestPoolWebSocketServer(unittest.TestCase):
 
         self.assertEqual(pool.registered["input_path"], r"C:\work\a.exe")
         self.assertEqual(pool.registered["idb_path"], r"C:\work\a.i64")
+        self.assertNotIn("session_id", pool.registered)
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline and not pool.unregistered:
             time.sleep(0.05)
-        self.assertEqual(pool.unregistered, ["win-gui"])
+        self.assertEqual(pool.unregistered, ["a_123abc"])
 
 
 if __name__ == "__main__":

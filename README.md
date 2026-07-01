@@ -179,7 +179,7 @@ claude mcp add --transport http --scope user ida-pro-mcp http://<host>:8745/mcp
 
 | Tool | Description |
 |------|-------------|
-| `idalib_open(path, session_id?)` | Open a binary, auto-assign to an instance |
+| `idalib_open(path)` | Open a binary, pool returns the generated `session_id` |
 | `idalib_close(session_id)` | Close a session (saves IDB) |
 | `idalib_switch(session_id)` | Set the default session (no IDB cost) |
 | `idalib_list()` | List all sessions |
