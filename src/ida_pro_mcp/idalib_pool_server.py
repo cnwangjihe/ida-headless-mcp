@@ -105,6 +105,13 @@ IDALIB_MANAGEMENT_TOOL_ORDER = [
 
 IDALIB_MANAGEMENT_TOOLS = set(IDALIB_MANAGEMENT_TOOL_ORDER)
 
+_LOCAL_PROTOCOL_METHOD_RESULTS: dict[str, dict] = {
+    "ping": {},
+    "prompts/list": {"prompts": []},
+    "resources/list": {"resources": []},
+    "resources/templates/list": {"resourceTemplates": []},
+}
+
 # --------------------------------------------------------------------------
 # Tool schema injection
 # --------------------------------------------------------------------------
@@ -610,6 +617,13 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
 
         if method == "tools/list":
             return _handle_tools_list(request_obj)
+
+        if method in _LOCAL_PROTOCOL_METHOD_RESULTS:
+            return {
+                "jsonrpc": "2.0",
+                "result": copy.deepcopy(_LOCAL_PROTOCOL_METHOD_RESULTS[method]),
+                "id": request_id,
+            }
 
         if method == "tools/call":
             try:

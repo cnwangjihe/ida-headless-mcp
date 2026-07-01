@@ -1173,6 +1173,27 @@ class TestPoolServerDispatch(unittest.TestCase):
         resp = mcp.registry.dispatch(req)
         self.assertIsNone(resp)
 
+    def test_protocol_discovery_methods_do_not_require_bound_session(self):
+        mcp, pool = self._make_mcp_and_pool()
+        self.build_dispatch(mcp, pool)
+
+        expected = {
+            "ping": {},
+            "prompts/list": {"prompts": []},
+            "resources/list": {"resources": []},
+            "resources/templates/list": {"resourceTemplates": []},
+        }
+
+        for idx, (method, result) in enumerate(expected.items(), start=1):
+            with self.subTest(method=method):
+                req = {"jsonrpc": "2.0", "method": method, "id": idx}
+                resp = self._dispatch(mcp, req, transport_session_id="sse:a")
+
+                self.assertNotIn("error", resp)
+                self.assertEqual(resp["result"], result)
+
+        pool.resolve_session_instance.assert_not_called()
+
     # --- management handler exception ---
 
     def test_management_handler_exception_returns_error(self):
