@@ -105,9 +105,6 @@ IDALIB_MANAGEMENT_TOOL_ORDER = [
 
 IDALIB_MANAGEMENT_TOOLS = set(IDALIB_MANAGEMENT_TOOL_ORDER)
 
-# Backend tools that are not exposed in pool mode
-_HIDDEN_BACKEND_TOOLS = {"idalib_unbind"}
-
 # --------------------------------------------------------------------------
 # Tool schema injection
 # --------------------------------------------------------------------------
@@ -298,9 +295,8 @@ def _prepare_tools(tools: list[dict]) -> list[dict]:
     """Prepare tool schemas for the proxy.
 
     Management tools are replaced with pool-specific schemas that describe
-    the refcount/routing semantics.  Backend-only tools (idalib_unbind) are
-    hidden.  All other IDA tools get an optional ``session_id`` parameter
-    injected so clients can route per-tool.
+    the refcount/routing semantics. All other IDA tools get an optional
+    ``session_id`` parameter injected so clients can route per-tool.
     """
     result = [
         copy.deepcopy(_MGMT_TOOL_OVERRIDES[name])
@@ -309,8 +305,6 @@ def _prepare_tools(tools: list[dict]) -> list[dict]:
     ]
     for tool in tools:
         name = tool.get("name", "")
-        if name in _HIDDEN_BACKEND_TOOLS:
-            continue
         if name in IDALIB_MANAGEMENT_TOOLS:
             continue
         tool = copy.deepcopy(tool)

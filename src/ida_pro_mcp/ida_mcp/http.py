@@ -1,12 +1,11 @@
 import html
 import json
 import re
-import ida_netnode
 from urllib.parse import urlparse, parse_qs
-from typing import TypeVar, cast
+from typing import cast
 from http.server import HTTPServer
 
-from .sync import idasync
+from .config import config_json_get, config_json_set
 from .rpc import (
     McpRpcRegistry,
     McpHttpRequestHandler,
@@ -14,31 +13,6 @@ from .rpc import (
     MCP_UNSAFE,
     get_cached_output,
 )
-
-
-T = TypeVar("T")
-
-
-@idasync
-def config_json_get(key: str, default: T) -> T:
-    node = ida_netnode.netnode(f"$ ida_mcp.{key}")
-    json_blob: bytes | None = node.getblob(0, "C")
-    if json_blob is None:
-        return default
-    try:
-        return json.loads(json_blob)
-    except Exception as e:
-        print(
-            f"[WARNING] Invalid JSON stored in netnode '{key}': '{json_blob}' from netnode: {e}"
-        )
-        return default
-
-
-@idasync
-def config_json_set(key: str, value):
-    node = ida_netnode.netnode(f"$ ida_mcp.{key}", 0, True)
-    json_blob = json.dumps(value).encode("utf-8")
-    node.setblob(json_blob, 0, "C")
 
 
 def handle_enabled_tools(registry: McpRpcRegistry, config_key: str):
@@ -64,6 +38,17 @@ def handle_enabled_tools(registry: McpRpcRegistry, config_key: str):
     return original_tools
 
 
+ORIGINAL_TOOLS: dict | None = None
+
+
+def ensure_enabled_tools_initialized() -> dict:
+    """Apply local-server tool filtering only when the local HTTP UI is used."""
+    global ORIGINAL_TOOLS
+    if ORIGINAL_TOOLS is None:
+        ORIGINAL_TOOLS = handle_enabled_tools(MCP_SERVER.tools, "enabled_tools")
+    return ORIGINAL_TOOLS
+
+
 DEFAULT_CORS_POLICY = "local"
 
 
@@ -79,12 +64,9 @@ def get_cors_policy(port: int) -> str:
         case _:
             return "*"
 
-
-ORIGINAL_TOOLS = handle_enabled_tools(MCP_SERVER.tools, "enabled_tools")
-
-
 class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
     def __init__(self, request, client_address, server):
+        ensure_enabled_tools_initialized()
         super().__init__(request, client_address, server)
         self.update_cors_policy()
 
@@ -211,6 +193,7 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
 
     def _handle_config_get(self):
         """Sends the configuration page with checkboxes."""
+        original_tools = ensure_enabled_tools_initialized()
         cors_policy = config_json_get("cors_policy", DEFAULT_CORS_POLICY)
 
         body = """<html>
@@ -348,7 +331,7 @@ input[type="submit"]:hover {
 
         body += "<h2>Enabled Tools</h2>"
         body += quick_select
-        for name, func in ORIGINAL_TOOLS.items():
+        for name, func in original_tools.items():
             description = (
                 (func.__doc__ or "No description").strip().splitlines()[0].strip()
             )
@@ -379,10 +362,11 @@ input[type="submit"]:hover {
         self.update_cors_policy()
 
         # Update the server's tools
-        enabled_tools = {name: name in postvars for name in ORIGINAL_TOOLS.keys()}
+        original_tools = ensure_enabled_tools_initialized()
+        enabled_tools = {name: name in postvars for name in original_tools.keys()}
         self.mcp_server.tools.methods = {
             name: func
-            for name, func in ORIGINAL_TOOLS.items()
+            for name, func in original_tools.items()
             if enabled_tools.get(name)
         }
         config_json_set("enabled_tools", enabled_tools)

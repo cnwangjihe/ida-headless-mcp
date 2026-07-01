@@ -161,12 +161,6 @@ def idalib_switch(
 
 
 @tool
-def idalib_unbind() -> dict:
-    """Unbind context (handled by pool proxy)."""
-    return {"error": "idalib_unbind is handled by the pool proxy, not the backend."}
-
-
-@tool
 def idalib_list() -> dict:
     """List sessions (handled by pool proxy)."""
     return {"sessions": [_session_dict()] if _current_session_id else [], "count": 1 if _current_session_id else 0}

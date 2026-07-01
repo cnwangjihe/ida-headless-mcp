@@ -67,6 +67,44 @@ class ExternalInstanceBridge:
         except Exception:
             self.alive = False
 
+    def _handle_control_message(self, msg: dict, on_check_agents=None) -> bool:
+        """Handle plugin-side control messages.
+
+        Returns True if the message was consumed and isn't a JSON-RPC response.
+        """
+        if msg.get("type") == "check_agents" and on_check_agents:
+            count = on_check_agents()
+            self.send_agent_count(count)
+            return True
+        return False
+
+    def _recv_jsonrpc_response(self, request: dict, on_check_agents=None) -> dict:
+        """Read until the JSON-RPC response for ``request`` is received."""
+        expected_id = request.get("id")
+        while self.alive:
+            raw = self.ws.recv()
+            msg = json.loads(raw)
+            if not isinstance(msg, dict):
+                continue
+            if self._handle_control_message(msg, on_check_agents):
+                continue
+            if msg.get("jsonrpc") != "2.0":
+                logger.warning(
+                    "Ignoring non-JSON-RPC message from external instance: %s",
+                    msg,
+                )
+                continue
+            if expected_id is not None and msg.get("id") != expected_id:
+                logger.warning(
+                    "Ignoring JSON-RPC response with unexpected id %r "
+                    "(expected %r)",
+                    msg.get("id"),
+                    expected_id,
+                )
+                continue
+            return msg
+        raise ConnectionError("External instance disconnected")
+
     def run_loop(self, on_check_agents=None):
         """Main loop for the handler thread.
 
@@ -90,8 +128,9 @@ class ExternalInstanceBridge:
                         break
                     try:
                         self.ws.send(json.dumps(request))
-                        raw = self.ws.recv()
-                        response = json.loads(raw)
+                        response = self._recv_jsonrpc_response(
+                            request, on_check_agents
+                        )
                         self._response_queue.put(response)
                     except Exception as e:
                         logger.warning("Forward to external instance failed: %s", e)
@@ -108,9 +147,8 @@ class ExternalInstanceBridge:
                 try:
                     raw = self.ws.recv(timeout=0.1)
                     msg = json.loads(raw)
-                    if msg.get("type") == "check_agents" and on_check_agents:
-                        count = on_check_agents()
-                        self.send_agent_count(count)
+                    if isinstance(msg, dict):
+                        self._handle_control_message(msg, on_check_agents)
                 except TimeoutError:
                     pass
                 except Exception as e:

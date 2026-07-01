@@ -154,7 +154,7 @@ class TestPoolIntegration(unittest.TestCase):
         return client
 
     def test_01_tools_list_no_unbind(self):
-        """idalib_unbind should not appear in the tool list."""
+        """Removed idalib_unbind tool should not appear in the tool list."""
         client = self._make_client()
         tools = client.tools_list()
         names = [t["name"] for t in tools]
