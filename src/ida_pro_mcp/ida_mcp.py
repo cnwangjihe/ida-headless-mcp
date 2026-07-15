@@ -12,7 +12,7 @@ import idaapi
 import ida_kernwin
 import ida_nalt
 import ida_loader
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     from . import ida_mcp
@@ -122,7 +122,9 @@ class PoolConnector:
     """Manages WebSocket connection from plugin to a pool server."""
 
     def __init__(self, pool_url: str, input_path: str, idb_path: str,
-                 auth_token: str = "", allow_duplicate_input: bool = False):
+                 mcp_server: "ida_mcp.rpc.McpServer",
+                 auth_token: str = "", allow_duplicate_input: bool = False,
+                 on_disconnect: Callable[["PoolConnector"], None] | None = None):
         from websockets.sync.client import connect as ws_connect
 
         ws_url = pool_url.replace("http://", "ws://").replace("https://", "wss://")
@@ -132,7 +134,10 @@ class PoolConnector:
             headers["Authorization"] = f"Bearer {auth_token}"
 
         self.ws = ws_connect(ws_url, additional_headers=headers, proxy=None)
+        self.mcp_server = mcp_server
         self._alive = True
+        self._disconnecting = False
+        self._on_disconnect = on_disconnect
         self._agent_count = 0
         self._agent_count_event = threading.Event()
 
@@ -158,35 +163,37 @@ class PoolConnector:
     def registration_response(self) -> dict:
         return self._reg_response
 
+    @property
+    def alive(self) -> bool:
+        return self._alive
+
     def _listen(self):
-        while self._alive:
-            try:
-                raw = self.ws.recv()
-            except Exception:
-                break
-            try:
-                msg = json.loads(raw)
-            except (json.JSONDecodeError, TypeError):
-                continue
-
-            if msg.get("type") == "agent_count":
-                self._agent_count = msg.get("active_agents", 0)
-                self._agent_count_event.set()
-                continue
-
-            if TYPE_CHECKING:
-                from .ida_mcp import MCP_SERVER
-            else:
-                ensure_plugin_dir_on_path()
-                from ida_mcp import MCP_SERVER
-
-            response = MCP_SERVER.registry.dispatch(msg)
-            if response is not None:
+        try:
+            while self._alive:
                 try:
-                    self.ws.send(json.dumps(response))
+                    raw = self.ws.recv()
                 except Exception:
                     break
-        self._alive = False
+                try:
+                    msg = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+
+                if msg.get("type") == "agent_count":
+                    self._agent_count = msg.get("active_agents", 0)
+                    self._agent_count_event.set()
+                    continue
+
+                response = self.mcp_server.registry.dispatch(msg)
+                if response is not None:
+                    try:
+                        self.ws.send(json.dumps(response))
+                    except Exception:
+                        break
+        finally:
+            self._alive = False
+            if not self._disconnecting and self._on_disconnect is not None:
+                self._on_disconnect(self)
 
     def check_agents(self, timeout: float = 5) -> int:
         self._agent_count_event.clear()
@@ -198,12 +205,15 @@ class PoolConnector:
         return self._agent_count
 
     def disconnect(self):
+        self._disconnecting = True
         self._alive = False
         try:
             self.ws.close()
         except Exception:
             pass
-        self._thread.join(timeout=5)
+        thread = getattr(self, "_thread", None)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=5)
 
 
 class MCPPoolForm(idaapi.Form):
@@ -406,6 +416,26 @@ class MCP(idaapi.plugin_t):
         self._save_local_server_config()
         return True
 
+    def _execute_ui(self, callback):
+        try:
+            return ida_kernwin.execute_sync(
+                callback,
+                getattr(ida_kernwin, "MFF_FAST", 0),
+            )
+        except Exception:
+            return callback()
+
+    def _handle_pool_disconnected(self, connector: PoolConnector):
+        def cleanup():
+            if self.pool_connector is not connector:
+                return 0
+            self.pool_connector = None
+            print("[MCP] Pool server disconnected")
+            self.update_menu_state()
+            return 1
+
+        self._execute_ui(cleanup)
+
     def connect_pool(self):
         if self.pool_connector is not None:
             print("[MCP] Already connected to pool")
@@ -443,11 +473,18 @@ class MCP(idaapi.plugin_t):
         # Pool mode must use a fresh registry. A previous local-server config
         # page may have filtered MCP_SERVER.tools in this GUI process.
         unload_package("ida_mcp")
+        if TYPE_CHECKING:
+            from .ida_mcp import MCP_SERVER
+        else:
+            ensure_plugin_dir_on_path()
+            from ida_mcp import MCP_SERVER
 
         try:
             connector = PoolConnector(
                 pool_url, input_path, idb_path,
+                MCP_SERVER,
                 auth_token,
+                on_disconnect=self._handle_pool_disconnected,
             )
         except Exception as e:
             print(f"[MCP] Pool connection failed: {e}")
@@ -466,8 +503,10 @@ class MCP(idaapi.plugin_t):
                 try:
                     connector = PoolConnector(
                         pool_url, input_path, idb_path,
+                        MCP_SERVER,
                         auth_token,
                         allow_duplicate_input=True,
+                        on_disconnect=self._handle_pool_disconnected,
                     )
                 except Exception as e:
                     print(f"[MCP] Pool connection failed: {e}")
@@ -481,6 +520,9 @@ class MCP(idaapi.plugin_t):
                 return 0
 
         self.pool_connector = connector
+        if not connector.alive:
+            self._handle_pool_disconnected(connector)
+            return 0
         sid = reg["session"]["session_id"]
         print(f"[MCP] Connected to pool at {pool_url} (session: {sid})")
         self.update_menu_state()

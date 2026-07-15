@@ -151,6 +151,7 @@ class InstanceManager:
             stdin=subprocess.DEVNULL,
             stdout=log_file,
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
         inst = InstanceInfo(
             index=idx,
@@ -503,13 +504,8 @@ class PoolManager:
             ]
 
         for inst in instances_to_save:
-            try:
-                self.im.forward_tool_call(inst, "idalib_save", {})
-            except Exception:
-                logger.warning(
-                    "Failed to save instance %d (session %s), continuing shutdown",
-                    inst.index, inst.session_id,
-                )
+            if self._save_instance_for_shutdown(inst):
+                self._close_instance_for_shutdown(inst)
 
         with self._lock:
             self.im.kill_all()
@@ -518,6 +514,44 @@ class PoolManager:
             self.sr._idb_path_index.clear()
             self.sr._context_bindings.clear()
             self.sr._refcounts.clear()
+
+    def _save_instance_for_shutdown(self, inst: InstanceInfo) -> bool:
+        try:
+            result = self.im.forward_tool_call(inst, "idalib_save", {})
+        except Exception as e:
+            logger.warning(
+                "Failed to save instance %d (session %s): %s; continuing shutdown",
+                inst.index, inst.session_id, e,
+            )
+            return False
+
+        if isinstance(result, dict) and result.get("ok") is False:
+            logger.warning(
+                "Failed to save instance %d (session %s): %s; continuing shutdown",
+                inst.index, inst.session_id,
+                result.get("error") or result,
+            )
+            return False
+
+        return True
+
+    def _close_instance_for_shutdown(self, inst: InstanceInfo) -> None:
+        try:
+            result = self.im.forward_tool_call(
+                inst, "idalib_close", {"session_id": inst.session_id}
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to close instance %d (session %s): %s; continuing shutdown",
+                inst.index, inst.session_id, e,
+            )
+            return
+
+        if isinstance(result, dict) and result.get("error"):
+            logger.warning(
+                "Failed to close instance %d (session %s): %s; continuing shutdown",
+                inst.index, inst.session_id, result["error"],
+            )
 
     def open_session(
         self,

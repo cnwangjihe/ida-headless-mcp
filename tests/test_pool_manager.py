@@ -5,9 +5,10 @@ requiring idapro or running idalib_server subprocesses.
 """
 
 import json
+import tempfile
 import threading
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from ida_pro_mcp.idalib_pool_manager import (
     InstanceInfo,
@@ -1318,6 +1319,62 @@ class TestPoolManager(unittest.TestCase):
         pool.im.forward_tool_call.assert_not_called()
         pool.im.kill_all.assert_called_once()
 
+    def test_shutdown_all_saves_then_closes_local_instances(self):
+        pool = self._make_pool()
+        pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
+        inst = InstanceInfo(
+            index=0, socket_path="/tmp/0.sock",
+            process=MagicMock(), session_id="s1",
+        )
+        pool.im.instances = [inst]
+        pool.im.forward_tool_call.side_effect = [
+            {"ok": True, "path": "/tmp/a.elf.i64"},
+            {"success": True},
+        ]
+
+        pool.shutdown_all()
+
+        pool.im.forward_tool_call.assert_has_calls([
+            call(inst, "idalib_save", {}),
+            call(inst, "idalib_close", {"session_id": "s1"}),
+        ])
+        pool.im.kill_all.assert_called_once()
+
+    def test_shutdown_all_logs_failed_save_result_and_skips_close(self):
+        pool = self._make_pool()
+        pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
+        inst = InstanceInfo(
+            index=0, socket_path="/tmp/0.sock",
+            process=MagicMock(), session_id="s1",
+        )
+        pool.im.instances = [inst]
+        pool.im.forward_tool_call.return_value = {"ok": False, "error": "disk full"}
+
+        with self.assertLogs("ida_pro_mcp.idalib_pool_manager", level="WARNING") as logs:
+            pool.shutdown_all()
+
+        self.assertEqual(pool.im.forward_tool_call.call_args_list, [
+            call(inst, "idalib_save", {}),
+        ])
+        self.assertIn("disk full", "\n".join(logs.output))
+        pool.im.kill_all.assert_called_once()
+
+    def test_shutdown_all_logs_save_rpc_exception_reason(self):
+        pool = self._make_pool()
+        pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
+        inst = InstanceInfo(
+            index=0, socket_path="/tmp/0.sock",
+            process=MagicMock(), session_id="s1",
+        )
+        pool.im.instances = [inst]
+        pool.im.forward_tool_call.side_effect = BrokenPipeError("socket closed")
+
+        with self.assertLogs("ida_pro_mcp.idalib_pool_manager", level="WARNING") as logs:
+            pool.shutdown_all()
+
+        self.assertIn("socket closed", "\n".join(logs.output))
+        pool.im.kill_all.assert_called_once()
+
     def test_open_session_path_dedup(self):
         """Opening the same path twice returns the existing session."""
         pool = self._make_pool()
@@ -1684,6 +1741,24 @@ class TestInstanceInfoExternal(unittest.TestCase):
         bridge.alive = False
         inst = InstanceInfo(index=0, socket_path="", process=None, ws_bridge=bridge)
         self.assertFalse(inst.is_alive())
+
+
+class TestInstanceManager(unittest.TestCase):
+
+    def test_spawn_starts_backend_in_new_session(self):
+        with tempfile.TemporaryDirectory() as socket_dir:
+            im = InstanceManager(socket_dir)
+            proc = MagicMock()
+            with patch(
+                "ida_pro_mcp.idalib_pool_manager.subprocess.Popen",
+                return_value=proc,
+            ) as popen:
+                with patch.object(InstanceManager, "_wait_for_ready"):
+                    inst = im.spawn()
+            inst._log_file.close()
+
+        self.assertIs(inst.process, proc)
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
 
 
 if __name__ == "__main__":
