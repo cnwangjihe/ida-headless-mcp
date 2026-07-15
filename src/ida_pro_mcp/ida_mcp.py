@@ -56,6 +56,8 @@ MCP_ACTION_IDS = [
     SHUTDOWN_LOCAL_SERVER_ACTION_ID,
 ]
 
+POOL_WEBSOCKET_MAX_SIZE = 64 * 1024 * 1024
+
 
 def action_state(enabled: bool):
     if enabled:
@@ -133,7 +135,12 @@ class PoolConnector:
         if auth_token:
             headers["Authorization"] = f"Bearer {auth_token}"
 
-        self.ws = ws_connect(ws_url, additional_headers=headers, proxy=None)
+        self.ws = ws_connect(
+            ws_url,
+            additional_headers=headers,
+            proxy=None,
+            max_size=POOL_WEBSOCKET_MAX_SIZE,
+        )
         self.mcp_server = mcp_server
         self._alive = True
         self._disconnecting = False

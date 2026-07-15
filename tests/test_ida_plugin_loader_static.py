@@ -123,6 +123,15 @@ class TestIdaPluginLoaderStatic(unittest.TestCase):
         ]
         self.assertTrue(proxy_keywords, "ws_connect must set proxy=None")
         self.assertIsNone(proxy_keywords[0].value.value)
+        max_size_keywords = [
+            kw
+            for kw in ws_connect_calls[0].keywords
+            if kw.arg == "max_size"
+        ]
+        self.assertTrue(
+            max_size_keywords,
+            "PoolConnector must raise the WebSocket message size limit",
+        )
 
     def test_pool_listener_does_not_import_ida_mcp_from_background_thread(self):
         tree = ast.parse(PLUGIN_LOADER.read_text(), filename=str(PLUGIN_LOADER))

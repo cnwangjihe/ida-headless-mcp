@@ -33,7 +33,7 @@ class ExternalInstanceBridge:
         self.ws = ws
         self.alive = True
         self.forward_lock = threading.Lock()
-        self._request_queue: queue.Queue[dict] = queue.Queue()
+        self._request_queue: queue.Queue[tuple[dict, float]] = queue.Queue()
         self._response_queue: queue.Queue[dict] = queue.Queue()
         self._request_event = threading.Event()
         self._agent_count_response: queue.Queue[dict] = queue.Queue()
@@ -47,7 +47,7 @@ class ExternalInstanceBridge:
         if not self.alive:
             raise ConnectionError("External instance disconnected")
         with self.forward_lock:
-            self._request_queue.put(request)
+            self._request_queue.put((request, timeout))
             self._request_event.set()
             try:
                 return self._response_queue.get(timeout=timeout)
@@ -78,14 +78,41 @@ class ExternalInstanceBridge:
             return True
         return False
 
-    def _recv_jsonrpc_response(self, request: dict, on_check_agents=None) -> dict:
+    def _jsonrpc_error(self, request: dict, message: str) -> dict:
+        return {
+            "jsonrpc": "2.0",
+            "error": {"code": -32000, "message": message},
+            "id": request.get("id"),
+        }
+
+    def _recv_jsonrpc_response(
+        self,
+        request: dict,
+        on_check_agents=None,
+        timeout: float | None = None,
+    ) -> dict:
         """Read until the JSON-RPC response for ``request`` is received."""
         expected_id = request.get("id")
         while self.alive:
-            raw = self.ws.recv()
-            msg = json.loads(raw)
+            try:
+                raw = self.ws.recv(timeout=timeout)
+            except TimeoutError:
+                return self._jsonrpc_error(
+                    request,
+                    f"External instance did not respond within {timeout}s",
+                )
+            try:
+                msg = json.loads(raw)
+            except (json.JSONDecodeError, TypeError) as e:
+                return self._jsonrpc_error(
+                    request,
+                    f"External instance returned invalid JSON: {e}",
+                )
             if not isinstance(msg, dict):
-                continue
+                return self._jsonrpc_error(
+                    request,
+                    "External instance returned a non-object JSON-RPC response",
+                )
             if self._handle_control_message(msg, on_check_agents):
                 continue
             if msg.get("jsonrpc") != "2.0":
@@ -123,22 +150,23 @@ class ExternalInstanceBridge:
                 # Process all pending forward requests
                 while not self._request_queue.empty():
                     try:
-                        request = self._request_queue.get_nowait()
+                        request, timeout = self._request_queue.get_nowait()
                     except queue.Empty:
                         break
                     try:
                         self.ws.send(json.dumps(request))
                         response = self._recv_jsonrpc_response(
-                            request, on_check_agents
+                            request, on_check_agents, timeout
                         )
                         self._response_queue.put(response)
                     except Exception as e:
                         logger.warning("Forward to external instance failed: %s", e)
-                        self._response_queue.put({
-                            "jsonrpc": "2.0",
-                            "error": {"code": -32000, "message": f"External instance error: {e}"},
-                            "id": request.get("id"),
-                        })
+                        self._response_queue.put(
+                            self._jsonrpc_error(
+                                request,
+                                f"External instance connection error: {e}",
+                            )
+                        )
                         self.alive = False
                         return
 

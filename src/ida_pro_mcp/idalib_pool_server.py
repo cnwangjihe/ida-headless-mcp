@@ -63,13 +63,15 @@ from ida_pro_mcp.pool_websocket import ExternalInstanceBridge  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
+POOL_WEBSOCKET_MAX_SIZE = 64 * 1024 * 1024
+
 
 def _accept_pool_websocket(handler) -> WebSocketConnection | None:
     """Accept /pool/ws after BaseHTTPRequestHandler parsed the HTTP request."""
     request_headers = Headers(handler.headers.items())
     request = Request(handler.path, request_headers)
 
-    handshake = ServerProtocol()
+    handshake = ServerProtocol(max_size=POOL_WEBSOCKET_MAX_SIZE)
     response = handshake.accept(request)
     handler.request.sendall(response.serialize())
     handler.close_connection = True
@@ -84,7 +86,7 @@ def _accept_pool_websocket(handler) -> WebSocketConnection | None:
 
     return WebSocketConnection(
         handler.request,
-        ServerProtocol(state=OPEN),
+        ServerProtocol(state=OPEN, max_size=POOL_WEBSOCKET_MAX_SIZE),
         ping_interval=None,
     )
 

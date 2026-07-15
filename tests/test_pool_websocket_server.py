@@ -103,6 +103,42 @@ class TestPoolWebSocketServer(unittest.TestCase):
             time.sleep(0.05)
         self.assertEqual(pool.unregistered, ["a_123abc"])
 
+    def test_pool_ws_accepts_messages_larger_than_default_websocket_limit(self):
+        pool = _DummyPool()
+        handler_cls = build_pool_handler_class(pool)
+        port = _find_free_port()
+        server = ThreadingHTTPServer(("127.0.0.1", port), handler_cls)
+        server.daemon_threads = True
+        server.mcp_server = _DummyMcp()
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        with connect(f"ws://127.0.0.1:{port}/pool/ws", proxy=None) as ws:
+            ws.send(
+                json.dumps(
+                    {
+                        "type": "register",
+                        "input_path": "/tmp/a.exe",
+                        "idb_path": "/tmp/a.i64",
+                        "allow_duplicate_input": False,
+                    }
+                )
+            )
+            register_response = json.loads(ws.recv())
+            self.assertTrue(register_response["success"])
+
+            ws.send(json.dumps({
+                "type": "ignored",
+                "payload": "x" * (1024 * 1024 + 1),
+            }))
+            ws.send(json.dumps({"type": "check_agents"}))
+
+            agent_count = json.loads(ws.recv())
+            self.assertEqual(agent_count["type"], "agent_count")
+            self.assertEqual(agent_count["active_agents"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
