@@ -22,6 +22,7 @@ import ida_nalt
 from ida_pro_mcp.ida_mcp import MCP_SERVER, MCP_UNSAFE
 from ida_pro_mcp.ida_mcp.api_core import server_health, server_warmup
 from ida_pro_mcp.ida_mcp.rpc import tool
+from ida_pro_mcp.ida_mcp.zeromcp.jsonrpc import cancel_all_pending_requests
 
 logger = logging.getLogger(__name__)
 
@@ -257,6 +258,12 @@ def main():
 
     signal.signal(signal.SIGINT, request_shutdown)
     signal.signal(signal.SIGTERM, request_shutdown)
+    if hasattr(signal, "SIGUSR1"):
+        def request_cancel(signum, frame):
+            cancelled = cancel_all_pending_requests()
+            logger.info("Cancellation requested for %d active call(s)", cancelled)
+
+        signal.signal(signal.SIGUSR1, request_cancel)
 
     if args.auth_token:
         MCP_SERVER.auth_token = args.auth_token

@@ -14,8 +14,8 @@ JsonRpcId: TypeAlias = str | int | float | None
 _current_request = threading.local()
 
 # Global pending requests for cancellation
-_pending_requests_lock = threading.Lock()
-_pending_requests: dict[int | str, threading.Event] = {}
+_pending_requests_lock = threading.RLock()
+_pending_requests: dict[tuple[str | None, int | str], threading.Event] = {}
 
 
 def get_current_request_id() -> JsonRpcId:
@@ -28,30 +28,43 @@ def get_current_cancel_event() -> threading.Event | None:
     return getattr(_current_request, "cancel_event", None)
 
 
-def register_pending_request(request_id: int | str) -> threading.Event:
+def register_pending_request(
+    request_id: int | str, context_id: str | None = None
+) -> threading.Event:
     """Register a request as pending and return its cancel event."""
     event = threading.Event()
     with _pending_requests_lock:
-        _pending_requests[request_id] = event
+        _pending_requests[(context_id, request_id)] = event
     _current_request.cancel_event = event
     return event
 
 
-def unregister_pending_request(request_id: int | str) -> None:
+def unregister_pending_request(
+    request_id: int | str, context_id: str | None = None
+) -> None:
     """Unregister a pending request."""
     with _pending_requests_lock:
-        _pending_requests.pop(request_id, None)
+        _pending_requests.pop((context_id, request_id), None)
     _current_request.cancel_event = None
 
 
-def cancel_request(request_id: int | str) -> bool:
+def cancel_request(request_id: int | str, context_id: str | None = None) -> bool:
     """Signal cancellation for a pending request. Returns True if request was found."""
     with _pending_requests_lock:
-        event = _pending_requests.get(request_id)
+        event = _pending_requests.get((context_id, request_id))
         if event:
             event.set()
             return True
     return False
+
+
+def cancel_all_pending_requests() -> int:
+    """Signal every in-flight request and return the number cancelled."""
+    with _pending_requests_lock:
+        events = list(_pending_requests.values())
+        for event in events:
+            event.set()
+        return len(events)
 
 
 def _parse_bool_env(name: str, default: bool) -> bool:

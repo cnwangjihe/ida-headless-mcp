@@ -144,6 +144,53 @@ class TestExternalInstanceBridge(unittest.TestCase):
         self.assertEqual(second["result"], {"generation": 2})
         self.assertNotEqual(ws.sent[0]["id"], ws.sent[1]["id"])
 
+    def test_notification_is_sent_while_forward_is_waiting(self):
+        request_started = threading.Event()
+        pending_request = {}
+
+        def response_factory(request):
+            if request.get("method") == "tools/call":
+                pending_request.update(request)
+                request_started.set()
+                return None
+            if request.get("method") == "notifications/cancelled":
+                return {
+                    "jsonrpc": "2.0",
+                    "result": {"cancelled": True},
+                    "id": pending_request["id"],
+                }
+            return None
+
+        ws = _FakeWebSocket([], response_factory=response_factory)
+        bridge = ExternalInstanceBridge(ws)
+        loop = threading.Thread(target=bridge.run_loop, daemon=True)
+        loop.start()
+        self.addCleanup(lambda: setattr(bridge, "alive", False))
+        result = {}
+        forwarding = threading.Thread(
+            target=lambda: result.setdefault(
+                "response",
+                bridge.forward_request(
+                    {"jsonrpc": "2.0", "method": "tools/call", "id": 9},
+                    timeout=2,
+                ),
+            )
+        )
+        forwarding.start()
+        self.assertTrue(request_started.wait(2))
+
+        bridge.send_notification({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": 9},
+        })
+        forwarding.join(2)
+
+        self.assertFalse(forwarding.is_alive())
+        self.assertEqual(result["response"]["id"], 9)
+        self.assertEqual(result["response"]["result"], {"cancelled": True})
+        self.assertEqual(ws.sent[1]["method"], "notifications/cancelled")
+
 
 if __name__ == "__main__":
     unittest.main()

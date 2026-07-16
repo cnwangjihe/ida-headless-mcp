@@ -38,7 +38,10 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
 
     if request_obj["method"] == "initialize":
         return dispatch_original(request)
-    if request_obj["method"].startswith("notifications/"):
+    if (
+        request_obj["method"].startswith("notifications/")
+        and request_obj["method"] != "notifications/cancelled"
+    ):
         return dispatch_original(request)
 
     payload: bytes | str | dict = request
@@ -66,7 +69,7 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
                 raise RuntimeError(
                     f"HTTP {response.status} {response.reason}: {raw_data}"
                 )
-            return json.loads(raw_data)
+            return json.loads(raw_data) if raw_data else None
         finally:
             conn.close()
     except Exception as e:

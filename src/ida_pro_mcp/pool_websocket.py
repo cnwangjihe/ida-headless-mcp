@@ -37,6 +37,7 @@ class ExternalInstanceBridge:
         self._request_queue: queue.Queue[
             tuple[dict, dict, float, queue.Queue[dict]]
         ] = queue.Queue()
+        self._notification_queue: queue.Queue[dict] = queue.Queue()
         self._request_event = threading.Event()
         self._next_request_id = 1
 
@@ -73,6 +74,21 @@ class ExternalInstanceBridge:
                     "External instance did not respond within "
                     f"{timeout}s"
                 )
+
+    def send_notification(self, notification: dict) -> None:
+        """Queue a JSON-RPC notification for the socket-owning handler thread."""
+        if not self.alive:
+            raise ConnectionError("External instance disconnected")
+        self._notification_queue.put(dict(notification))
+        self._request_event.set()
+
+    def _send_pending_notifications(self) -> None:
+        while True:
+            try:
+                notification = self._notification_queue.get_nowait()
+            except queue.Empty:
+                return
+            self.ws.send(json.dumps(notification))
 
     def send_agent_count(self, count: int) -> None:
         """Send an agent_count response to the plugin (called from handler)."""
@@ -119,9 +135,11 @@ class ExternalInstanceBridge:
                         request,
                         "External instance did not respond before the deadline",
                     )
+                timeout = min(timeout, 0.1)
             try:
                 raw = self.ws.recv(timeout=timeout)
             except TimeoutError:
+                self._send_pending_notifications()
                 if deadline is not None and time.monotonic() < deadline:
                     continue
                 return self._jsonrpc_error(
@@ -173,6 +191,7 @@ class ExternalInstanceBridge:
                 # Also poll for unsolicited plugin messages such as check_agents.
                 self._request_event.wait(timeout=0.1)
                 self._request_event.clear()
+                self._send_pending_notifications()
 
                 # Process all pending forward requests
                 while not self._request_queue.empty():

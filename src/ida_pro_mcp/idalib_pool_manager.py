@@ -1055,6 +1055,26 @@ class PoolManager:
     # Forwarding shortcuts
     # ------------------------------------------------------------------
 
+    def cancel_instance_request(self, inst: InstanceInfo, notification: dict) -> bool:
+        """Deliver cancellation without waiting for the active instance lock."""
+        if inst.is_external:
+            if inst.ws_bridge is None or not inst.ws_bridge.alive:
+                return False
+            inst.ws_bridge.send_notification(notification)
+            return True
+
+        if (
+            inst.process is None
+            or inst.process.poll() is not None
+            or not hasattr(signal, "SIGUSR1")
+        ):
+            return False
+        try:
+            inst.process.send_signal(signal.SIGUSR1)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
     def forward_tool_call(self, inst: InstanceInfo, tool_name: str, arguments: dict) -> Any:
         with self._operation():
             with inst.operation_lock:

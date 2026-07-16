@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import patch
 
@@ -22,6 +23,7 @@ class _BaseFakeConnection:
         self.port = port
         self.timeout = timeout
         self.request_calls = 0
+        self.request_body = None
         self.closed = False
         type(self).instances.append(self)
 
@@ -31,6 +33,7 @@ class _BaseFakeConnection:
 
     def request(self, method, path, body, headers):
         self.request_calls += 1
+        self.request_body = body
 
     def close(self):
         self.closed = True
@@ -52,11 +55,17 @@ class _ConnectFailureConnection(_BaseFakeConnection):
         raise ConnectionRefusedError("refused")
 
 
+class _EmptyResponseConnection(_BaseFakeConnection):
+    def getresponse(self):
+        return _FakeResponse(status=202, reason="Accepted", body=b"")
+
+
 class DispatchProxyTransportTests(unittest.TestCase):
     def setUp(self):
         _ResponseFailureConnection.reset()
         _Http503Connection.reset()
         _ConnectFailureConnection.reset()
+        _EmptyResponseConnection.reset()
 
     def test_dispatch_proxy_does_not_retry_post_send_failures(self):
         request = {"jsonrpc": "2.0", "method": "tools/call", "params": {}, "id": 1}
@@ -94,6 +103,25 @@ class DispatchProxyTransportTests(unittest.TestCase):
         self.assertEqual(len(_ConnectFailureConnection.instances), 1)
         self.assertEqual(_ConnectFailureConnection.instances[0].request_calls, 1)
         self.assertTrue(_ConnectFailureConnection.instances[0].closed)
+
+    def test_cancel_notification_is_forwarded_to_ida(self):
+        request = {
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": 7, "reason": "test"},
+        }
+        with patch(
+            "ida_pro_mcp.server.http.client.HTTPConnection",
+            _EmptyResponseConnection,
+        ):
+            response = server.dispatch_proxy(request)
+
+        self.assertIsNone(response)
+        self.assertEqual(len(_EmptyResponseConnection.instances), 1)
+        connection = _EmptyResponseConnection.instances[0]
+        self.assertEqual(connection.request_calls, 1)
+        self.assertEqual(json.loads(connection.request_body), request)
+        self.assertTrue(connection.closed)
 
 
 if __name__ == "__main__":

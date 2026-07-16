@@ -24,6 +24,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -334,6 +335,8 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
 
     dispatch_original = mcp.registry.dispatch
     _tools_cache: list[dict] | None = None
+    _active_forwards_lock = threading.Lock()
+    _active_forwards: dict[tuple[str | None, int | str], tuple[Any, object]] = {}
 
     def _ensure_tools_cache() -> list[dict]:
         nonlocal _tools_cache
@@ -365,6 +368,24 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
             "error": {"code": code, "message": message},
             "id": request_id,
         }
+
+    def _forward_request(inst, request_obj: dict) -> JsonRpcResponse | None:
+        request_id = request_obj.get("id")
+        key = None
+        token = None
+        if isinstance(request_id, (int, str)):
+            key = (_get_transport_ctx(), request_id)
+            token = object()
+            with _active_forwards_lock:
+                _active_forwards[key] = (inst, token)
+        try:
+            return pool.forward_raw(inst, request_obj)
+        finally:
+            if key is not None:
+                with _active_forwards_lock:
+                    current = _active_forwards.get(key)
+                    if current is not None and current[1] is token:
+                        _active_forwards.pop(key, None)
 
     # --- Management tool handlers ---
 
@@ -590,7 +611,7 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
         fwd_args = forwarded.get("params", {}).get("arguments", {})
         fwd_args.pop("session_id", None)
 
-        return pool.forward_raw(inst, forwarded)
+        return _forward_request(inst, forwarded)
 
     # --- tools/list handler ---
 
@@ -613,6 +634,16 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
         request_id = request_obj.get("id")
 
         if method == "initialize":
+            return dispatch_original(request)
+        if method == "notifications/cancelled":
+            params = request_obj.get("params") or {}
+            cancelled_id = params.get("requestId") if isinstance(params, dict) else None
+            if isinstance(cancelled_id, (int, str)):
+                key = (_get_transport_ctx(), cancelled_id)
+                with _active_forwards_lock:
+                    active = _active_forwards.get(key)
+                if active is not None:
+                    pool.cancel_instance_request(active[0], request_obj)
             return dispatch_original(request)
         if method.startswith("notifications/"):
             return dispatch_original(request)
@@ -646,7 +677,7 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
             _sess, inst = pool.resolve_session_instance(sid)
         except (KeyError, RuntimeError) as e:
             return _error_response(request_id, -32001, str(e))
-        return pool.forward_raw(inst, request_obj)
+        return _forward_request(inst, request_obj)
 
     mcp.registry.dispatch = dispatch_proxy
 

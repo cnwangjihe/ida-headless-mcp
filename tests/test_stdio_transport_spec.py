@@ -1,5 +1,6 @@
 import io
 import json
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 
@@ -64,7 +65,7 @@ class StdioTransportSpecTests(unittest.TestCase):
         self.assertEqual(response["result"]["protocolVersion"], "2025-11-25")
 
     def test_stdio_cancel_notification_logs_to_stderr(self):
-        jsonrpc_mod.register_pending_request("req-1")
+        jsonrpc_mod.register_pending_request("req-1", "stdio:default")
         try:
             transport_stdout, process_stdout, process_stderr = self._run_stdio([
                 {
@@ -77,11 +78,70 @@ class StdioTransportSpecTests(unittest.TestCase):
                 }
             ])
         finally:
-            jsonrpc_mod.unregister_pending_request("req-1")
+            jsonrpc_mod.unregister_pending_request("req-1", "stdio:default")
 
         self.assertEqual(transport_stdout, b"")
         self.assertEqual(process_stdout, "")
         self.assertIn("Cancelled request req-1", process_stderr)
+
+    def test_pending_request_ids_are_isolated_by_transport_context(self):
+        first = jsonrpc_mod.register_pending_request(1, "http:first")
+        second = jsonrpc_mod.register_pending_request(1, "http:second")
+        try:
+            self.assertTrue(jsonrpc_mod.cancel_request(1, "http:first"))
+            self.assertTrue(first.is_set())
+            self.assertFalse(second.is_set())
+        finally:
+            jsonrpc_mod.unregister_pending_request(1, "http:first")
+            jsonrpc_mod.unregister_pending_request(1, "http:second")
+
+    def test_stdio_reads_cancellation_while_tool_is_running(self):
+        started = threading.Event()
+        server = McpServer("ida-pro-mcp")
+
+        @server.tool
+        def wait_for_cancel() -> dict:
+            cancel_event = jsonrpc_mod.get_current_cancel_event()
+            started.set()
+            if cancel_event is not None and cancel_event.wait(2):
+                raise jsonrpc_mod.RequestCancelledError("cancelled by test")
+            return {"cancelled": False}
+
+        messages = [
+            {
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "wait_for_cancel", "arguments": {}},
+                "id": 7,
+            },
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": 7, "reason": "test"},
+            },
+        ]
+
+        class CoordinatedInput:
+            def __init__(self):
+                self.index = 0
+
+            def readline(self):
+                if self.index >= len(messages):
+                    return b""
+                if self.index == 1:
+                    if not started.wait(2):
+                        raise AssertionError("tool did not start")
+                message = messages[self.index]
+                self.index += 1
+                return json.dumps(message).encode("utf-8") + b"\n"
+
+        stdout = io.BytesIO()
+        server.stdio(stdin=CoordinatedInput(), stdout=stdout)
+
+        response = json.loads(stdout.getvalue())
+        self.assertEqual(response["id"], 7)
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("cancelled by test", response["result"]["content"][0]["text"])
 
 
 if __name__ == "__main__":

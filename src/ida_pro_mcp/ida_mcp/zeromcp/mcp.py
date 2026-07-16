@@ -743,8 +743,25 @@ class McpServer:
     def stdio(self, stdin: BinaryIO | None = None, stdout: BinaryIO | None = None):
         stdin = stdin or sys.stdin.buffer
         stdout = stdout or sys.stdout.buffer
-        while True:
+        write_lock = threading.Lock()
+        workers: set[threading.Thread] = set()
+
+        def dispatch(request: bytes) -> None:
+            setattr(self._transport_session_id, "data", "stdio:default")
             try:
+                response = self.registry.dispatch(request)
+            finally:
+                setattr(self._transport_session_id, "data", None)
+            if response is not None:
+                with write_lock:
+                    try:
+                        stdout.write(json.dumps(response).encode("utf-8") + b"\n")
+                        stdout.flush()
+                    except BrokenPipeError:
+                        pass
+
+        try:
+            while True:
                 request = stdin.readline()
                 if not request: # EOF
                     break
@@ -754,16 +771,26 @@ class McpServer:
                 if not request:
                     continue
 
-                setattr(self._transport_session_id, "data", "stdio:default")
                 try:
-                    response = self.registry.dispatch(request)
-                finally:
-                    setattr(self._transport_session_id, "data", None)
-                if response is not None:
-                    stdout.write(json.dumps(response).encode("utf-8") + b"\n")
-                    stdout.flush()
-            except (BrokenPipeError, KeyboardInterrupt): # Client disconnected
-                break
+                    parsed = json.loads(request)
+                    is_notification = (
+                        isinstance(parsed, dict) and "id" not in parsed
+                    )
+                except Exception:
+                    is_notification = False
+
+                if is_notification:
+                    dispatch(request)
+                else:
+                    worker = threading.Thread(target=dispatch, args=(request,))
+                    worker.start()
+                    workers.add(worker)
+                    workers = {thread for thread in workers if thread.is_alive()}
+        except (BrokenPipeError, KeyboardInterrupt): # Client disconnected
+            pass
+        finally:
+            for worker in workers:
+                worker.join()
 
     def get_current_transport_session_id(self) -> str | None:
         return getattr(self._transport_session_id, "data", None)
@@ -855,8 +882,9 @@ class McpServer:
 
         # Register request for cancellation tracking
         request_id = get_current_request_id()
+        context_id = self.get_current_transport_session_id()
         if request_id is not None:
-            register_pending_request(request_id)
+            register_pending_request(request_id, context_id)
 
         try:
             # Wrap tool call in JSON-RPC request
@@ -883,7 +911,7 @@ class McpServer:
             }
         finally:
             if request_id is not None:
-                unregister_pending_request(request_id)
+                unregister_pending_request(request_id, context_id)
 
     def _mcp_notifications_initialized(self, _meta: dict | None = None) -> None:
         """MCP notifications/initialized - acknowledge client readiness"""
@@ -891,7 +919,7 @@ class McpServer:
 
     def _mcp_notifications_cancelled(self, requestId: int | str, reason: str | None = None) -> None:
         """MCP notifications/cancelled - cancel an in-flight request"""
-        if cancel_request(requestId):
+        if cancel_request(requestId, self.get_current_transport_session_id()):
             _log(f"[MCP] Cancelled request {requestId}: {reason or 'no reason'}")
         # Notifications don't return a response
 

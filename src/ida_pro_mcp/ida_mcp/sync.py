@@ -46,6 +46,7 @@ class CancelledError(RequestCancelledError):
 logger = logging.getLogger(__name__)
 _TOOL_TIMEOUT_ENV = "IDA_MCP_TOOL_TIMEOUT_SEC"
 _DEFAULT_TOOL_TIMEOUT_SEC = 60.0
+_EXECUTE_SYNC_WAIT_GRACE_SEC = 5.0
 
 
 def _get_tool_timeout_seconds() -> float:
@@ -58,26 +59,41 @@ def _get_tool_timeout_seconds() -> float:
         return _DEFAULT_TOOL_TIMEOUT_SEC
 
 
-call_stack = queue.LifoQueue()
+_call_stack = threading.local()
+
+
+def _current_call_stack() -> list[str]:
+    stack = getattr(_call_stack, "data", None)
+    if stack is None:
+        stack = []
+        _call_stack.data = stack
+    return stack
 
 
 def _run_with_batch(ff):
     """Execute *ff* inside batch mode with call-stack reentry detection."""
-    if not call_stack.empty():
-        last_func_name = call_stack.get()
+    stack = _current_call_stack()
+    if stack:
+        last_func_name = stack[-1]
         error_str = f"Call stack is not empty while calling the function {ff.__name__} from {last_func_name}"
         raise IDASyncError(error_str)
 
-    call_stack.put(ff.__name__)
-    old_batch = idc.batch(1)
+    stack.append(ff.__name__)
+    old_batch = None
+    batch_enabled = False
     try:
+        old_batch = idc.batch(1)
+        batch_enabled = True
         return ff()
     finally:
-        idc.batch(old_batch)
-        call_stack.get()
+        try:
+            if batch_enabled:
+                idc.batch(old_batch)
+        finally:
+            stack.pop()
 
 
-def _sync_wrapper(ff):
+def _sync_wrapper(ff, wait_timeout: float | None = None):
     """Call a function ff on the IDA main thread in write mode.
 
     If already on the main thread (common in headless idalib with
@@ -95,8 +111,19 @@ def _sync_wrapper(ff):
         except Exception as x:
             res_container.put(x)
 
-    idaapi.execute_sync(runned, idaapi.MFF_WRITE)
-    res = res_container.get()
+    execute_result = idaapi.execute_sync(runned, idaapi.MFF_WRITE)
+    if execute_result == -1:
+        raise IDASyncError(f"Failed to schedule {ff.__name__} on the IDA main thread")
+
+    queue_timeout = wait_timeout if wait_timeout and wait_timeout > 0 else _DEFAULT_TOOL_TIMEOUT_SEC
+    total_wait = queue_timeout + _EXECUTE_SYNC_WAIT_GRACE_SEC
+    try:
+        res = res_container.get(timeout=total_wait)
+    except queue.Empty as e:
+        raise IDASyncError(
+            f"IDA main-thread callback for {ff.__name__} did not complete "
+            f"within {total_wait:.2f}s"
+        ) from e
     if isinstance(res, Exception):
         raise res
     return res
@@ -145,8 +172,8 @@ def sync_wrapper(ff, timeout_override: float | None = None):
                 sys.setprofile(old_profile)
 
         timed_ff.__name__ = ff.__name__
-        return _sync_wrapper(timed_ff)
-    return _sync_wrapper(ff)
+        return _sync_wrapper(timed_ff, timeout)
+    return _sync_wrapper(ff, timeout)
 
 
 def idasync(f):

@@ -5,6 +5,7 @@ requiring idapro or running idalib_server subprocesses.
 """
 
 import json
+import signal
 import tempfile
 import threading
 import time
@@ -636,6 +637,62 @@ class TestPoolServerDispatch(unittest.TestCase):
 
         self.assertNotIn("error", resp)
         pool.resolve_session_instance.assert_called_once_with("s2")
+
+    def test_cancel_notification_targets_active_backend_request(self):
+        mcp, pool = self._make_mcp_and_pool()
+        pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
+        pool.sr.bind_context("http:agent-a", "s1")
+        inst = MagicMock(spec=InstanceInfo)
+        pool.resolve_session_instance.return_value = (pool.sr.get("s1"), inst)
+        started = threading.Event()
+        release = threading.Event()
+
+        def forward(_inst, request):
+            started.set()
+            self.assertTrue(release.wait(2))
+            return {
+                "jsonrpc": "2.0",
+                "result": {"content": [], "isError": False},
+                "id": request["id"],
+            }
+
+        pool.forward_raw.side_effect = forward
+        self.build_dispatch(mcp, pool)
+        response = {}
+        tool_thread = threading.Thread(
+            target=lambda: response.setdefault(
+                "tool",
+                self._dispatch(
+                    mcp,
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "tools/call",
+                        "params": {"name": "get_functions", "arguments": {}},
+                        "id": 42,
+                    },
+                    transport_session_id="http:agent-a",
+                ),
+            )
+        )
+        tool_thread.start()
+        self.assertTrue(started.wait(2))
+
+        cancel_response = self._dispatch(
+            mcp,
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": 42, "reason": "test"},
+            },
+            transport_session_id="http:agent-a",
+        )
+
+        self.assertIsNone(cancel_response)
+        pool.cancel_instance_request.assert_called_once()
+        self.assertIs(pool.cancel_instance_request.call_args.args[0], inst)
+        release.set()
+        tool_thread.join(2)
+        self.assertFalse(tool_thread.is_alive())
 
     def test_tool_routing_no_session_returns_error(self):
         mcp, pool = self._make_mcp_and_pool()
@@ -1297,6 +1354,36 @@ class TestPoolManager(unittest.TestCase):
         pool.sr.bind_context("ctx-a", "s1")
         result = pool.list_sessions(context_id="ctx-a")
         self.assertEqual(result["current_context_session_id"], "s1")
+
+    @unittest.skipUnless(hasattr(signal, "SIGUSR1"), "SIGUSR1 is unavailable")
+    def test_cancel_local_instance_uses_out_of_band_signal(self):
+        pool = self._make_pool()
+        process = MagicMock()
+        process.poll.return_value = None
+        inst = InstanceInfo(0, "/tmp/0.sock", process)
+
+        delivered = pool.cancel_instance_request(
+            inst,
+            {"jsonrpc": "2.0", "method": "notifications/cancelled"},
+        )
+
+        self.assertTrue(delivered)
+        process.send_signal.assert_called_once_with(signal.SIGUSR1)
+
+    def test_cancel_external_instance_queues_notification(self):
+        pool = self._make_pool()
+        bridge = MagicMock()
+        bridge.alive = True
+        inst = InstanceInfo(0, "", None, ws_bridge=bridge)
+        notification = {
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+        }
+
+        delivered = pool.cancel_instance_request(inst, notification)
+
+        self.assertTrue(delivered)
+        bridge.send_notification.assert_called_once_with(notification)
 
     def test_shutdown_all_clears_everything(self):
         pool = self._make_pool()
