@@ -237,8 +237,8 @@ def main():
         _current_session_id = "initial"
         logger.info("Initial database opened")
 
-    def cleanup_and_exit(signum, frame):
-        logger.info("Shutting down...")
+    def close_current_database() -> None:
+        global _current_session_id, _current_input_path, _current_idb_path
         if _current_session_id is not None:
             try:
                 idb_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
@@ -247,18 +247,28 @@ def main():
             except Exception as e:
                 logger.warning("Failed to save on shutdown: %s", e)
             idapro.close_database()
-        sys.exit(0)
+            _current_session_id = None
+            _current_input_path = ""
+            _current_idb_path = ""
 
-    signal.signal(signal.SIGINT, cleanup_and_exit)
-    signal.signal(signal.SIGTERM, cleanup_and_exit)
+    def request_shutdown(signum, frame):
+        logger.info("Shutdown requested")
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGINT, request_shutdown)
+    signal.signal(signal.SIGTERM, request_shutdown)
 
     if args.auth_token:
         MCP_SERVER.auth_token = args.auth_token
 
-    if args.unix_socket:
-        MCP_SERVER.serve(unix_socket=args.unix_socket, background=False)
-    else:
-        MCP_SERVER.serve(host=args.host, port=args.port, background=False)
+    try:
+        if args.unix_socket:
+            MCP_SERVER.serve(unix_socket=args.unix_socket, background=False)
+        else:
+            MCP_SERVER.serve(host=args.host, port=args.port, background=False)
+    finally:
+        logger.info("Shutting down...")
+        close_current_database()
 
 
 if __name__ == "__main__":

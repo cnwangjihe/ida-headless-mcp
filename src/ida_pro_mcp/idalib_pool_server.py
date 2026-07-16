@@ -785,43 +785,50 @@ def main():
     if args.auth_token:
         mcp.auth_token = args.auth_token
 
-    logger.info("Spawning initial instance for tool discovery...")
-    pool.spawn_instance()
+    def request_shutdown(signum, frame):
+        logger.info("Shutdown requested")
+        raise SystemExit(0)
 
-    build_dispatch(mcp, pool)
+    signal.signal(signal.SIGINT, request_shutdown)
+    signal.signal(signal.SIGTERM, request_shutdown)
 
-    if args.input_path is not None:
-        if not args.input_path.exists():
-            print(f"Error: Input file not found: {args.input_path}", file=sys.stderr)
-            sys.exit(1)
-        logger.info("Opening initial binary: %s", args.input_path)
-        result = pool.open_session(str(args.input_path))
-        if isinstance(result, dict) and result.get("error"):
-            print(f"Error opening binary: {result['error']}", file=sys.stderr)
-            sys.exit(1)
-        sid = result.get("session", {}).get("session_id")
-        logger.info("Initial session: %s (no context binding — use idalib_open from a client)", sid)
+    try:
+        logger.info("Spawning initial instance for tool discovery...")
+        pool.spawn_instance()
 
-    def cleanup(signum, frame):
+        build_dispatch(mcp, pool)
+
+        if args.input_path is not None:
+            if not args.input_path.exists():
+                print(f"Error: Input file not found: {args.input_path}", file=sys.stderr)
+                sys.exit(1)
+            logger.info("Opening initial binary: %s", args.input_path)
+            result = pool.open_session(str(args.input_path))
+            if isinstance(result, dict) and result.get("error"):
+                print(f"Error opening binary: {result['error']}", file=sys.stderr)
+                sys.exit(1)
+            sid = result.get("session", {}).get("session_id")
+            logger.info(
+                "Initial session: %s "
+                "(no context binding — use idalib_open from a client)",
+                sid,
+            )
+
+        transport = args.transport
+        if transport == "stdio":
+            mcp.stdio()
+        else:
+            from urllib.parse import urlparse
+            url = urlparse(transport)
+            if not url.hostname or not url.port:
+                print(f"Error: invalid transport URL: {transport}", file=sys.stderr)
+                sys.exit(1)
+            handler_cls = build_pool_handler_class(pool)
+            mcp.serve(host=url.hostname, port=url.port, background=False,
+                      request_handler=handler_cls)
+    finally:
         logger.info("Shutting down pool...")
         pool.shutdown_all()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, cleanup)
-    signal.signal(signal.SIGTERM, cleanup)
-
-    transport = args.transport
-    if transport == "stdio":
-        mcp.stdio()
-    else:
-        from urllib.parse import urlparse
-        url = urlparse(transport)
-        if not url.hostname or not url.port:
-            print(f"Error: invalid transport URL: {transport}", file=sys.stderr)
-            sys.exit(1)
-        handler_cls = build_pool_handler_class(pool)
-        mcp.serve(host=url.hostname, port=url.port, background=False,
-                  request_handler=handler_cls)
 
 
 if __name__ == "__main__":
