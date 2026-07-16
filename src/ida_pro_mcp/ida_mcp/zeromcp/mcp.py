@@ -605,6 +605,7 @@ class McpServer:
         self.post_body_limit = 10 * 1024 * 1024  # 10MB
         self.auth_token: str | None = None  # Bearer token; None = no auth
         self.tools = McpRpcRegistry()
+        self.disabled_tools: set[str] = set()
         self.resources = McpRpcRegistry()
         self.prompts = McpRpcRegistry()
 
@@ -816,6 +817,8 @@ class McpServer:
         enabled = getattr(self._enabled_extensions, "data", set())
         tools = []
         for func_name, func in self.tools.methods.items():
+            if func_name in self.disabled_tools:
+                continue
             # Check if tool belongs to an extension group
             tool_group = self._get_tool_extension(func_name)
             if tool_group and tool_group not in enabled:
@@ -832,6 +835,15 @@ class McpServer:
 
     def _mcp_tools_call(self, name: str, arguments: dict | None = None, _meta: dict | None = None) -> dict:
         """MCP tools/call method"""
+        if name in self.disabled_tools:
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": f"Tool '{name}' is disabled by safe mode",
+                }],
+                "isError": True,
+            }
+
         # Check if tool requires an extension that isn't enabled
         enabled = getattr(self._enabled_extensions, "data", set())
         tool_group = self._get_tool_extension(name)

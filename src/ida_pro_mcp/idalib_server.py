@@ -19,7 +19,7 @@ import ida_auto
 import ida_loader
 import ida_nalt
 
-from ida_pro_mcp.ida_mcp import MCP_SERVER
+from ida_pro_mcp.ida_mcp import MCP_SERVER, MCP_UNSAFE
 from ida_pro_mcp.ida_mcp.api_core import server_health, server_warmup
 from ida_pro_mcp.ida_mcp.rpc import tool
 
@@ -193,9 +193,13 @@ def main():
         "--port", type=int, default=8745,
         help="Port to listen on (default: 8745)",
     )
-    parser.add_argument(
-        "--unsafe", action="store_true",
-        help="Enable unsafe functions (DANGEROUS)",
+    safety = parser.add_mutually_exclusive_group()
+    safety.add_argument(
+        "--safe", action="store_true",
+        help="Disable tools marked as unsafe (unsafe tools are enabled by default)",
+    )
+    safety.add_argument(
+        "--unsafe", dest="safe", action="store_false", help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--unix-socket", type=str, default=None,
@@ -220,6 +224,9 @@ def main():
         idapro.enable_console_messages(False)
 
     logging.basicConfig(level=log_level)
+
+    if args.safe:
+        MCP_SERVER.disabled_tools.update(MCP_UNSAFE)
 
     if args.input_path is not None:
         if not args.input_path.exists():

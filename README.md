@@ -72,6 +72,9 @@ idalib-pool --max-instances 3
 # With authentication
 idalib-pool --auth-token mysecret
 # or: IDA_MCP_AUTH_TOKEN=mysecret idalib-pool
+
+# Disable tools marked as unsafe (they are enabled by default)
+idalib-pool --safe
 ```
 
 ### Workflow example

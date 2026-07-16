@@ -1,6 +1,6 @@
 # ida_dbg
 
-Debugger control and tracing (unsafe operations require --unsafe flag).
+Debugger control and tracing (enabled by default; use --safe to disable unsafe operations).
 
 ## Process Control
 

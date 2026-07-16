@@ -746,9 +746,13 @@ def main():
         "--socket-dir", type=str, default=None,
         help="Directory for instance Unix sockets (default: auto temp dir)",
     )
-    parser.add_argument(
-        "--unsafe", action="store_true",
-        help="Pass --unsafe to idalib instances",
+    safety = parser.add_mutually_exclusive_group()
+    safety.add_argument(
+        "--safe", action="store_true",
+        help="Disable tools marked as unsafe (unsafe tools are enabled by default)",
+    )
+    safety.add_argument(
+        "--unsafe", dest="safe", action="store_false", help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--auth-token", type=str,
@@ -767,8 +771,8 @@ def main():
     idalib_args: list[str] = []
     if args.verbose:
         idalib_args.append("--verbose")
-    if args.unsafe:
-        idalib_args.append("--unsafe")
+    if args.safe:
+        idalib_args.append("--safe")
 
     pool = PoolManager(
         max_instances=args.max_instances,

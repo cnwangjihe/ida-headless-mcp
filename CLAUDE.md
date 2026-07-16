@@ -73,7 +73,7 @@ def dangerous_op(...):
 uv run ida-pro-mcp
 uv run ida-pro-mcp --transport http://127.0.0.1:8744/sse
 uv run idalib-pool --transport http://127.0.0.1:8750
-uv run ida-pro-mcp --unsafe
+uv run idalib-pool --safe
 ```
 
 ### MCP inspector

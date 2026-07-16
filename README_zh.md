@@ -72,6 +72,9 @@ idalib-pool --max-instances 3
 # 带认证
 idalib-pool --auth-token mysecret
 # 或：IDA_MCP_AUTH_TOKEN=mysecret idalib-pool
+
+# 禁用标记为 unsafe 的工具（默认启用）
+idalib-pool --safe
 ```
 
 ### 工作流示例
