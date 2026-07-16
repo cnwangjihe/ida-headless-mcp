@@ -34,6 +34,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,10 @@ logger = logging.getLogger(__name__)
 
 _WINDOWS_ABS_RE = re.compile(r"^[A-Za-z]:[\\/]")
 _SESSION_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+class PoolShuttingDownError(RuntimeError):
+    pass
 
 
 def _looks_windows_abs(path: str) -> bool:
@@ -107,6 +112,11 @@ class InstanceInfo:
     process: subprocess.Popen | None
     session_id: str | None = None  # None = idle
     ws_bridge: Any | None = None  # ExternalInstanceBridge for external instances
+    reserved: bool = False
+    closing: bool = False
+    operation_lock: threading.RLock = field(
+        default_factory=threading.RLock, repr=False
+    )
 
     @property
     def is_external(self) -> bool:
@@ -134,9 +144,12 @@ class InstanceManager:
         self.idalib_args = idalib_args or []
         self.instances: list[InstanceInfo] = []
         self._next_index = 0
+        self._lock = threading.RLock()
 
-    def spawn(self) -> InstanceInfo:
-        idx = self._next_index
+    def spawn(self, *, reserved: bool = False) -> InstanceInfo:
+        with self._lock:
+            idx = self._next_index
+            self._next_index += 1
         sock_path = os.path.join(self.socket_dir, f"{idx}.sock")
         log_path = os.path.join(self.socket_dir, f"{idx}.log")
         cmd = [
@@ -157,24 +170,27 @@ class InstanceManager:
             index=idx,
             socket_path=sock_path,
             process=proc,
+            reserved=reserved,
         )
         inst._log_file = log_file  # type: ignore[attr-defined]
-        self._next_index += 1
-        self.instances.append(inst)
+        with self._lock:
+            self.instances.append(inst)
         self._wait_for_ready(inst)
         return inst
 
     def register_external(self, ws_bridge) -> InstanceInfo:
         """Register an external instance connected via WebSocket."""
-        idx = self._next_index
+        with self._lock:
+            idx = self._next_index
+            self._next_index += 1
         inst = InstanceInfo(
             index=idx,
             socket_path="",
             process=None,
             ws_bridge=ws_bridge,
         )
-        self._next_index += 1
-        self.instances.append(inst)
+        with self._lock:
+            self.instances.append(inst)
         logger.info("Registered external instance %d", idx)
         return inst
 
@@ -194,8 +210,9 @@ class InstanceManager:
             log_file = getattr(inst, "_log_file", None)
             if log_file:
                 log_file.close()
-        if inst in self.instances:
-            self.instances.remove(inst)
+        with self._lock:
+            if inst in self.instances:
+                self.instances.remove(inst)
 
     def discard(self, inst: InstanceInfo) -> None:
         """Forget an instance that is already unusable."""
@@ -212,23 +229,38 @@ class InstanceManager:
                 os.unlink(inst.socket_path)
             except OSError:
                 pass
-        if inst in self.instances:
-            self.instances.remove(inst)
+        with self._lock:
+            if inst in self.instances:
+                self.instances.remove(inst)
 
     def kill_all(self) -> None:
-        for inst in list(self.instances):
+        with self._lock:
+            instances = list(self.instances)
+        for inst in instances:
             self.kill(inst)
-        self.instances.clear()
+        with self._lock:
+            self.instances.clear()
 
     def find(self, index: int) -> InstanceInfo | None:
-        for inst in self.instances:
-            if inst.index == index:
-                return inst
+        with self._lock:
+            for inst in self.instances:
+                if inst.index == index:
+                    return inst
         return None
 
+    def snapshot(self) -> list[InstanceInfo]:
+        with self._lock:
+            return list(self.instances)
+
+    def contains(self, inst: InstanceInfo) -> bool:
+        with self._lock:
+            return inst in self.instances
+
     def find_idle(self) -> InstanceInfo | None:
-        for inst in list(self.instances):
-            if inst.session_id is None:
+        with self._lock:
+            instances = list(self.instances)
+        for inst in instances:
+            if inst.session_id is None and not inst.reserved and not inst.closing:
                 if not inst.is_alive():
                     logger.info("Discarding dead idle instance %d", inst.index)
                     self.discard(inst)
@@ -302,12 +334,13 @@ class InstanceManager:
         finally:
             conn.close()
 
-    def forward_tools_list(self) -> list[dict]:
+    def forward_tools_list(self, inst: InstanceInfo | None = None) -> list[dict]:
         candidates = [i for i in self.instances if i.is_alive()]
         if not candidates:
             return []
+        inst = inst or candidates[0]
         request = {"jsonrpc": "2.0", "method": "tools/list", "id": 1}
-        resp = self.forward_raw(candidates[0], request)
+        resp = self.forward_raw(inst, request)
         return resp.get("result", {}).get("tools", [])
 
 
@@ -475,6 +508,10 @@ class SessionRegistry:
 # ---------------------------------------------------------------------------
 
 class PoolManager:
+    _RUNNING = "running"
+    _SHUTTING_DOWN = "shutting_down"
+    _STOPPED = "stopped"
+
     def __init__(
         self,
         max_instances: int = 1,
@@ -488,32 +525,80 @@ class PoolManager:
         self.im = InstanceManager(socket_dir, idalib_args)
         self.sr = SessionRegistry()
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+        self._state = self._RUNNING
+        self._active_operations = 0
+        self._opening_inputs: dict[str, int] = {}
+        self._reserved_session_ids: set[str] = set()
+
+    @contextmanager
+    def _operation(self):
+        with self._condition:
+            if self._state != self._RUNNING:
+                raise PoolShuttingDownError("Pool is shutting down")
+            self._active_operations += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._active_operations -= 1
+                if self._active_operations == 0:
+                    self._condition.notify_all()
+
+    def _reserve_session_id_locked(self, display_path: str, identity_path: str) -> str:
+        session_id = self.sr.generate_id_for_path(display_path, identity_path)
+        while session_id in self._reserved_session_ids:
+            session_id = f"{session_id}_{secrets.token_hex(3)}"
+        self._reserved_session_ids.add(session_id)
+        return session_id
 
     # ------------------------------------------------------------------
     # High-level operations
     # ------------------------------------------------------------------
 
     def spawn_instance(self) -> InstanceInfo:
-        return self.im.spawn()
+        with self._operation():
+            return self.im.spawn()
 
     def shutdown_all(self) -> None:
-        with self._lock:
+        with self._condition:
+            if self._state == self._STOPPED:
+                return
+            if self._state == self._SHUTTING_DOWN:
+                while self._state != self._STOPPED:
+                    self._condition.wait()
+                return
+
+            self._state = self._SHUTTING_DOWN
+            while self._active_operations:
+                self._condition.wait()
+
             instances_to_save = [
-                inst for inst in self.im.instances
+                inst for inst in self.im.snapshot()
                 if inst.session_id and not inst.is_external
             ]
+            for inst in self.im.snapshot():
+                inst.closing = True
 
-        for inst in instances_to_save:
-            if self._save_instance_for_shutdown(inst):
-                self._close_instance_for_shutdown(inst)
-
-        with self._lock:
-            self.im.kill_all()
-            self.sr.sessions.clear()
-            self.sr._input_path_index.clear()
-            self.sr._idb_path_index.clear()
-            self.sr._context_bindings.clear()
-            self.sr._refcounts.clear()
+        try:
+            for inst in instances_to_save:
+                with inst.operation_lock:
+                    if self._save_instance_for_shutdown(inst):
+                        self._close_instance_for_shutdown(inst)
+        finally:
+            with self._condition:
+                try:
+                    self.im.kill_all()
+                    self.sr.sessions.clear()
+                    self.sr._input_path_index.clear()
+                    self.sr._idb_path_index.clear()
+                    self.sr._context_bindings.clear()
+                    self.sr._refcounts.clear()
+                    self._opening_inputs.clear()
+                    self._reserved_session_ids.clear()
+                finally:
+                    self._state = self._STOPPED
+                    self._condition.notify_all()
 
     def _save_instance_for_shutdown(self, inst: InstanceInfo) -> bool:
         try:
@@ -559,67 +644,117 @@ class PoolManager:
         run_auto_analysis: bool = True,
         allow_duplicate_input: bool = False,
     ) -> dict:
+        try:
+            with self._operation():
+                return self._open_session(
+                    binary_path,
+                    run_auto_analysis=run_auto_analysis,
+                    allow_duplicate_input=allow_duplicate_input,
+                )
+        except PoolShuttingDownError as e:
+            return {"success": False, "error": str(e)}
+
+    def _open_session(
+        self,
+        binary_path: str,
+        run_auto_analysis: bool,
+        allow_duplicate_input: bool,
+    ) -> dict:
         resolved = _normalize_path(binary_path)
         is_idb = resolved.endswith((".idb", ".i64"))
 
-        with self._lock:
-            # IDB path: check exact IDB match first
-            if is_idb:
-                existing_sid = self.sr.find_by_idb_path(resolved)
-                if existing_sid is not None:
-                    self.sr.touch(existing_sid)
-                    sess = self.sr.get(existing_sid)
-                    return {
-                        "success": True,
-                        "existing": True,
-                        "session": sess.to_dict(refcount=self.sr.get_refcount(existing_sid)),
-                        "message": f"IDB already open as session '{existing_sid}'.",
-                    }
-            else:
-                # Non-IDB path: check input_path index
-                matching_sids = self.sr.find_by_input_path(resolved)
-                if matching_sids:
-                    if len(matching_sids) == 1:
-                        existing_sid = matching_sids[0]
-                    else:
-                        existing_sid = self.sr.disambiguate(matching_sids, resolved)
-                    self.sr.touch(existing_sid)
-                    sess = self.sr.get(existing_sid)
-                    return {
-                        "success": True,
-                        "existing": True,
-                        "session": sess.to_dict(refcount=self.sr.get_refcount(existing_sid)),
-                        "message": f"Binary already open as session '{existing_sid}'.",
-                    }
+        with self._condition:
+            while True:
+                if self._state != self._RUNNING:
+                    raise PoolShuttingDownError("Pool is shutting down")
+                if not allow_duplicate_input and self._opening_inputs.get(resolved, 0):
+                    self._condition.wait()
+                    continue
 
-            session_id = self.sr.generate_id_for_path(resolved, resolved)
+                # IDB path: check exact IDB match first
+                if is_idb:
+                    existing_sid = self.sr.find_by_idb_path(resolved)
+                    if existing_sid is not None:
+                        self.sr.touch(existing_sid)
+                        sess = self.sr.get(existing_sid)
+                        return {
+                            "success": True,
+                            "existing": True,
+                            "session": sess.to_dict(
+                                refcount=self.sr.get_refcount(existing_sid)
+                            ),
+                            "message": f"IDB already open as session '{existing_sid}'.",
+                        }
+                else:
+                    matching_sids = self.sr.find_by_input_path(resolved)
+                    if matching_sids:
+                        existing_sid = (
+                            matching_sids[0]
+                            if len(matching_sids) == 1
+                            else self.sr.disambiguate(matching_sids, resolved)
+                        )
+                        self.sr.touch(existing_sid)
+                        sess = self.sr.get(existing_sid)
+                        return {
+                            "success": True,
+                            "existing": True,
+                            "session": sess.to_dict(
+                                refcount=self.sr.get_refcount(existing_sid)
+                            ),
+                            "message": (
+                                f"Binary already open as session '{existing_sid}'."
+                            ),
+                        }
 
-        last_error: Exception | None = None
-        inst: InstanceInfo | None = None
-        for attempt in range(2):
-            with self._lock:
-                inst = self._allocate_instance_locked()
-            try:
-                resp = self.im.forward_tool_call(inst, "idalib_open", {
-                    "input_path": resolved,
-                    "run_auto_analysis": run_auto_analysis,
-                    "session_id": session_id,
-                })
-                break
-            except (ConnectionRefusedError, OSError) as e:
-                last_error = e
-                logger.warning(
-                    "Backend instance %d unavailable while opening %s: %s",
-                    inst.index, resolved, e,
+                session_id = self._reserve_session_id_locked(resolved, resolved)
+                self._opening_inputs[resolved] = (
+                    self._opening_inputs.get(resolved, 0) + 1
                 )
+                break
+
+        try:
+            last_error: Exception | None = None
+            inst: InstanceInfo | None = None
+            for attempt in range(2):
                 with self._lock:
-                    if inst.session_id is None:
-                        if inst.is_alive():
+                    inst = self._allocate_instance_locked()
+                try:
+                    with inst.operation_lock:
+                        resp = self.im.forward_tool_call(inst, "idalib_open", {
+                            "input_path": resolved,
+                            "run_auto_analysis": run_auto_analysis,
+                            "session_id": session_id,
+                        })
+                    break
+                except (ConnectionRefusedError, OSError) as e:
+                    last_error = e
+                    logger.warning(
+                        "Backend instance %d unavailable while opening %s: %s",
+                        inst.index, resolved, e,
+                    )
+                    should_remove = False
+                    is_alive = False
+                    with self._lock:
+                        if inst.session_id is None:
+                            inst.reserved = False
+                            inst.closing = True
+                            should_remove = True
+                            is_alive = inst.is_alive()
+                    if should_remove:
+                        if is_alive:
                             self.im.kill(inst)
                         else:
                             self.im.discard(inst)
-                if attempt == 0:
-                    continue
+                    if attempt == 0:
+                        continue
+                    return {
+                        "success": False,
+                        "error": (
+                            "Backend instance unavailable while opening "
+                            f"{resolved}: {last_error}"
+                        ),
+                    }
+            else:
                 return {
                     "success": False,
                     "error": (
@@ -627,61 +762,84 @@ class PoolManager:
                         f"{resolved}: {last_error}"
                     ),
                 }
-        else:
-            return {
-                "success": False,
-                "error": (
-                    "Backend instance unavailable while opening "
-                    f"{resolved}: {last_error}"
-                ),
-            }
 
-        if isinstance(resp, dict) and resp.get("error"):
-            return resp
+            if isinstance(resp, dict) and resp.get("error"):
+                with self._lock:
+                    inst.reserved = False
+                return resp
 
-        # Extract canonical paths from backend response
-        backend_session = resp.get("session", {}) if isinstance(resp, dict) else {}
-        canonical_input = backend_session.get("input_path", resolved)
-        idb_path = backend_session.get("idb_path", "")
+            backend_session = (
+                resp.get("session", {}) if isinstance(resp, dict) else {}
+            )
+            canonical_input = backend_session.get("input_path", resolved)
+            idb_path = backend_session.get("idb_path", "")
 
-        with self._lock:
-            # Post-open conflict check: input_path may differ from what we passed
-            canonical_input = _normalize_path(canonical_input) if canonical_input else resolved
-            if idb_path:
-                idb_path = _normalize_path(idb_path)
+            conflict_sid: str | None = None
+            with self._lock:
+                canonical_input = (
+                    _normalize_path(canonical_input) if canonical_input else resolved
+                )
+                if idb_path:
+                    idb_path = _normalize_path(idb_path)
 
-            existing_for_input = self.sr.find_by_input_path(canonical_input)
-            if existing_for_input and not allow_duplicate_input:
-                # Conflict: same input binary already open under different IDB
-                conflict_sid = existing_for_input[0]
-                # Roll back: close the just-opened instance
+                existing_for_input = self.sr.find_by_input_path(canonical_input)
+                if existing_for_input and not allow_duplicate_input:
+                    conflict_sid = existing_for_input[0]
+                    inst.reserved = False
+                    inst.closing = True
+                else:
+                    sess = self.sr.create(
+                        session_id, canonical_input, idb_path, inst.index
+                    )
+                    inst.session_id = session_id
+                    inst.reserved = False
+
+            if conflict_sid is not None:
                 try:
-                    self.im.forward_tool_call(inst, "idalib_close", {"session_id": session_id})
+                    with inst.operation_lock:
+                        self.im.forward_tool_call(
+                            inst, "idalib_close", {"session_id": session_id}
+                        )
                 except Exception:
-                    pass
+                    logger.warning(
+                        "Failed to roll back conflicting session %s", session_id
+                    )
                 self.im.kill(inst)
                 return {
                     "success": False,
                     "error": (
                         f"Binary already open as session '{conflict_sid}'. "
-                        f"Use allow_duplicate_input=true to open another IDB "
-                        f"for the same binary."
+                        "Use allow_duplicate_input=true to open another IDB "
+                        "for the same binary."
                     ),
                 }
 
-            sess = self.sr.create(
-                session_id, canonical_input, idb_path, inst.index
-            )
-            inst.session_id = session_id
-
-        return {
-            "success": True,
-            "existing": False,
-            "session": sess.to_dict(refcount=self.sr.get_refcount(session_id)),
-            "message": f"Session created: {session_id}",
-        }
+            return {
+                "success": True,
+                "existing": False,
+                "session": sess.to_dict(
+                    refcount=self.sr.get_refcount(session_id)
+                ),
+                "message": f"Session created: {session_id}",
+            }
+        finally:
+            with self._condition:
+                self._reserved_session_ids.discard(session_id)
+                remaining = self._opening_inputs.get(resolved, 0) - 1
+                if remaining > 0:
+                    self._opening_inputs[resolved] = remaining
+                else:
+                    self._opening_inputs.pop(resolved, None)
+                self._condition.notify_all()
 
     def close_session(self, session_id: str) -> dict:
+        try:
+            with self._operation():
+                return self._close_session(session_id)
+        except PoolShuttingDownError as e:
+            return {"success": False, "error": str(e)}
+
+    def _close_session(self, session_id: str) -> dict:
         with self._lock:
             sess = self.sr.get(session_id)
             if sess is None:
@@ -690,21 +848,33 @@ class PoolManager:
             if inst is None:
                 self.sr.remove(session_id)
                 return {"success": True, "closed": True, "message": f"Session cleaned up: {session_id}"}
+            if inst.closing:
+                return {
+                    "success": False,
+                    "closed": False,
+                    "error": f"Session is already closing: {session_id}",
+                }
+            inst.closing = True
 
-        if not sess.is_external:
-            try:
-                self.im.forward_tool_call(inst, "idalib_save", {})
-            except Exception:
-                logger.warning("Failed to save before closing session %s", session_id)
-            try:
-                self.im.forward_tool_call(inst, "idalib_close", {"session_id": session_id})
-            except Exception:
-                logger.warning("Failed to forward close for session %s", session_id)
+        with inst.operation_lock:
+            if not sess.is_external:
+                try:
+                    self.im.forward_tool_call(inst, "idalib_save", {})
+                except Exception:
+                    logger.warning("Failed to save before closing session %s", session_id)
+                try:
+                    self.im.forward_tool_call(
+                        inst, "idalib_close", {"session_id": session_id}
+                    )
+                except Exception:
+                    logger.warning("Failed to forward close for session %s", session_id)
 
         with self._lock:
             self.sr.remove(session_id)
             inst.session_id = None
-            self.im.kill(inst)
+            inst.reserved = False
+
+        self.im.kill(inst)
 
         return {"success": True, "closed": True, "message": f"Session closed: {session_id}"}
 
@@ -713,6 +883,26 @@ class PoolManager:
     # ------------------------------------------------------------------
 
     def register_external(
+        self,
+        ws_bridge,
+        input_path: str,
+        idb_path: str,
+        session_id: str | None = None,
+        allow_duplicate_input: bool = False,
+    ) -> dict:
+        try:
+            with self._operation():
+                return self._register_external(
+                    ws_bridge,
+                    input_path,
+                    idb_path,
+                    session_id=session_id,
+                    allow_duplicate_input=allow_duplicate_input,
+                )
+        except PoolShuttingDownError as e:
+            return {"success": False, "error": str(e)}
+
+    def _register_external(
         self,
         ws_bridge,
         input_path: str,
@@ -772,6 +962,13 @@ class PoolManager:
 
     def unregister_external(self, session_id: str) -> dict:
         """Remove an external session from the pool."""
+        try:
+            with self._operation():
+                return self._unregister_external(session_id)
+        except PoolShuttingDownError as e:
+            return {"success": False, "error": str(e)}
+
+    def _unregister_external(self, session_id: str) -> dict:
         with self._lock:
             sess = self.sr.get(session_id)
             if not sess or not sess.is_external:
@@ -780,7 +977,10 @@ class PoolManager:
             self.sr.remove(session_id)
             inst = self.im.find(sess.instance_index)
             if inst:
+                inst.closing = True
                 inst.session_id = None
+        if inst:
+            with inst.operation_lock:
                 self.im.kill(inst)
         return {"success": True, "active_agents": agents}
 
@@ -805,6 +1005,13 @@ class PoolManager:
                 raise RuntimeError(
                     f"Instance for session '{session_id}' is gone. "
                     f"The session may need to be re-opened."
+                )
+            if inst.closing:
+                raise RuntimeError(f"Session '{session_id}' is closing.")
+            if not inst.is_alive():
+                raise RuntimeError(
+                    f"Instance for session '{session_id}' is not running. "
+                    "The session may need to be re-opened."
                 )
             return sess, inst
 
@@ -849,14 +1056,38 @@ class PoolManager:
     # ------------------------------------------------------------------
 
     def forward_tool_call(self, inst: InstanceInfo, tool_name: str, arguments: dict) -> Any:
-        return self.im.forward_tool_call(inst, tool_name, arguments)
+        with self._operation():
+            with inst.operation_lock:
+                self._ensure_instance_forwardable(inst)
+                return self.im.forward_tool_call(inst, tool_name, arguments)
 
     def forward_raw(self, inst: InstanceInfo, request: dict) -> dict:
-        return self.im.forward_raw(inst, request)
+        with self._operation():
+            with inst.operation_lock:
+                self._ensure_instance_forwardable(inst)
+                return self.im.forward_raw(inst, request)
 
     def forward_tools_list(self) -> list[dict]:
+        with self._operation():
+            candidates = [
+                inst for inst in self.im.snapshot()
+                if inst.is_alive() and not inst.closing
+            ]
+            if not candidates:
+                return []
+            inst = candidates[0]
+            with inst.operation_lock:
+                self._ensure_instance_forwardable(inst)
+                return self.im.forward_tools_list(inst)
+
+    def _ensure_instance_forwardable(self, inst: InstanceInfo) -> None:
         with self._lock:
-            return self.im.forward_tools_list()
+            if inst.closing:
+                raise RuntimeError(f"Instance {inst.index} is closing")
+            if not self.im.contains(inst):
+                raise RuntimeError(f"Instance {inst.index} is no longer registered")
+        if not inst.is_alive():
+            raise RuntimeError(f"Instance {inst.index} is not running")
 
     # ------------------------------------------------------------------
     # Instance allocation (internal, caller holds _lock)
@@ -865,9 +1096,12 @@ class PoolManager:
     def _allocate_instance_locked(self) -> InstanceInfo:
         inst = self.im.find_idle()
         if inst is not None:
+            inst.reserved = True
             return inst
         self._lock.release()
         try:
-            return self.im.spawn()
+            inst = self.im.spawn(reserved=True)
+            inst.reserved = True
+            return inst
         finally:
             self._lock.acquire()

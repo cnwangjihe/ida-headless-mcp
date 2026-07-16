@@ -7,6 +7,7 @@ requiring idapro or running idalib_server subprocesses.
 import json
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import MagicMock, call, patch
 
@@ -1240,6 +1241,8 @@ class TestPoolManager(unittest.TestCase):
         pool = PoolManager(max_instances=2, socket_dir="/tmp/fake-pool")
         pool.im = MagicMock(spec=InstanceManager)
         pool.im.instances = []
+        pool.im.snapshot.side_effect = lambda: list(pool.im.instances)
+        pool.im.contains.side_effect = lambda inst: inst in pool.im.instances
         return pool
 
     def test_close_session_not_found(self):
@@ -1439,6 +1442,231 @@ class TestPoolManager(unittest.TestCase):
         self.assertEqual(pool.im.forward_tool_call.call_count, 2)
 
 
+class TestPoolManagerConcurrency(unittest.TestCase):
+    def _live_instance(self, index: int, session_id: str | None = None):
+        process = MagicMock()
+        process.poll.return_value = None
+        return InstanceInfo(
+            index=index,
+            socket_path=f"/tmp/{index}.sock",
+            process=process,
+            session_id=session_id,
+        )
+
+    def test_concurrent_opens_reserve_different_instances(self):
+        pool = PoolManager(max_instances=2, socket_dir="/tmp/fake-pool")
+        first = self._live_instance(0)
+        second = self._live_instance(1)
+        pool.im.instances = [first]
+
+        first_started = threading.Event()
+        release_first = threading.Event()
+        calls = []
+
+        def spawn(*, reserved=False):
+            second.reserved = reserved
+            pool.im.instances.append(second)
+            return second
+
+        def forward(inst, tool_name, arguments):
+            calls.append((inst.index, arguments["input_path"]))
+            if inst is first:
+                first_started.set()
+                self.assertTrue(release_first.wait(2))
+            return {
+                "success": True,
+                "session": {
+                    "input_path": arguments["input_path"],
+                    "idb_path": arguments["input_path"] + ".i64",
+                },
+            }
+
+        pool.im.spawn = MagicMock(side_effect=spawn)
+        pool.im.forward_tool_call = MagicMock(side_effect=forward)
+        results = {}
+
+        thread_a = threading.Thread(
+            target=lambda: results.setdefault("a", pool.open_session("/tmp/a.elf"))
+        )
+        thread_b = threading.Thread(
+            target=lambda: results.setdefault("b", pool.open_session("/tmp/b.elf"))
+        )
+        thread_a.start()
+        self.assertTrue(first_started.wait(2))
+        thread_b.start()
+        thread_b.join(2)
+        release_first.set()
+        thread_a.join(2)
+
+        self.assertFalse(thread_a.is_alive())
+        self.assertFalse(thread_b.is_alive())
+        self.assertTrue(results["a"]["success"])
+        self.assertTrue(results["b"]["success"])
+        self.assertEqual(set(calls), {(0, "/tmp/a.elf"), (1, "/tmp/b.elf")})
+
+    def test_concurrent_open_of_same_path_reuses_completed_session(self):
+        pool = PoolManager(max_instances=1, socket_dir="/tmp/fake-pool")
+        inst = self._live_instance(0)
+        pool.im.instances = [inst]
+        first_started = threading.Event()
+        release_first = threading.Event()
+
+        def forward(_inst, tool_name, arguments):
+            first_started.set()
+            self.assertTrue(release_first.wait(2))
+            return {
+                "success": True,
+                "session": {
+                    "input_path": arguments["input_path"],
+                    "idb_path": arguments["input_path"] + ".i64",
+                },
+            }
+
+        pool.im.forward_tool_call = MagicMock(side_effect=forward)
+        results = {}
+        first_open = threading.Thread(
+            target=lambda: results.setdefault("first", pool.open_session("/tmp/a.elf"))
+        )
+        second_open = threading.Thread(
+            target=lambda: results.setdefault("second", pool.open_session("/tmp/a.elf"))
+        )
+        first_open.start()
+        self.assertTrue(first_started.wait(2))
+        second_open.start()
+        self.assertTrue(second_open.is_alive())
+
+        release_first.set()
+        first_open.join(2)
+        second_open.join(2)
+
+        self.assertFalse(results["first"]["existing"])
+        self.assertTrue(results["second"]["existing"])
+        self.assertEqual(
+            results["first"]["session"]["session_id"],
+            results["second"]["session"]["session_id"],
+        )
+        pool.im.forward_tool_call.assert_called_once()
+
+    def test_concurrent_close_only_closes_instance_once(self):
+        pool = PoolManager(max_instances=1, socket_dir="/tmp/fake-pool")
+        inst = self._live_instance(0, "s1")
+        pool.im.instances = [inst]
+        pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", 0)
+
+        save_started = threading.Event()
+        release_save = threading.Event()
+
+        def forward(_inst, tool_name, arguments):
+            if tool_name == "idalib_save":
+                save_started.set()
+                self.assertTrue(release_save.wait(2))
+                return {"ok": True}
+            return {"success": True}
+
+        pool.im.forward_tool_call = MagicMock(side_effect=forward)
+        pool.im.kill = MagicMock()
+        results = {}
+        first_close = threading.Thread(
+            target=lambda: results.setdefault("first", pool.close_session("s1"))
+        )
+        first_close.start()
+        self.assertTrue(save_started.wait(2))
+
+        results["second"] = pool.close_session("s1")
+        release_save.set()
+        first_close.join(2)
+
+        self.assertTrue(results["first"]["success"])
+        self.assertFalse(results["second"]["success"])
+        self.assertIn("already closing", results["second"]["error"])
+        pool.im.kill.assert_called_once_with(inst)
+
+    def test_shutdown_rejects_new_operations_and_waits_for_inflight(self):
+        pool = PoolManager(max_instances=1, socket_dir="/tmp/fake-pool")
+        inst = self._live_instance(0)
+        pool.im.instances = [inst]
+
+        forward_started = threading.Event()
+        release_forward = threading.Event()
+
+        def forward_raw(_inst, request):
+            forward_started.set()
+            self.assertTrue(release_forward.wait(2))
+            return {"jsonrpc": "2.0", "result": {}, "id": request["id"]}
+
+        pool.im.forward_raw = MagicMock(side_effect=forward_raw)
+        forwarding = threading.Thread(
+            target=lambda: pool.forward_raw(
+                inst, {"jsonrpc": "2.0", "method": "ping", "id": 1}
+            )
+        )
+        forwarding.start()
+        self.assertTrue(forward_started.wait(2))
+
+        shutdown = threading.Thread(target=pool.shutdown_all)
+        shutdown.start()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with pool._lock:
+                if pool._state == pool._SHUTTING_DOWN:
+                    break
+            time.sleep(0.01)
+
+        rejected = pool.open_session("/tmp/new.elf")
+        self.assertFalse(rejected["success"])
+        self.assertIn("shutting down", rejected["error"])
+        self.assertTrue(shutdown.is_alive())
+
+        release_forward.set()
+        forwarding.join(2)
+        shutdown.join(2)
+        self.assertFalse(shutdown.is_alive())
+        self.assertEqual(pool._state, pool._STOPPED)
+
+    def test_conflict_rollback_does_not_hold_pool_lock(self):
+        pool = PoolManager(max_instances=1, socket_dir="/tmp/fake-pool")
+        pool.sr.create(
+            "existing", "/tmp/canonical.elf", "/tmp/canonical.elf.i64", 99
+        )
+        inst = self._live_instance(0)
+        pool.im.instances = [inst]
+
+        rollback_started = threading.Event()
+        release_rollback = threading.Event()
+
+        def forward(_inst, tool_name, arguments):
+            if tool_name == "idalib_open":
+                return {
+                    "success": True,
+                    "session": {
+                        "input_path": "/tmp/canonical.elf",
+                        "idb_path": "/tmp/alias.i64",
+                    },
+                }
+            rollback_started.set()
+            self.assertTrue(release_rollback.wait(2))
+            return {"success": True}
+
+        pool.im.forward_tool_call = MagicMock(side_effect=forward)
+        pool.im.kill = MagicMock()
+        opening = threading.Thread(
+            target=lambda: pool.open_session("/tmp/alias.elf")
+        )
+        opening.start()
+        self.assertTrue(rollback_started.wait(2))
+
+        listed = threading.Event()
+        listing = threading.Thread(
+            target=lambda: (pool.list_sessions(), listed.set())
+        )
+        listing.start()
+        self.assertTrue(listed.wait(0.5))
+
+        release_rollback.set()
+        opening.join(2)
+        listing.join(2)
+
+
 # ---------------------------------------------------------------------------
 # Multi-agent scenario integration test
 # ---------------------------------------------------------------------------
@@ -1571,13 +1799,11 @@ class TestMultiAgentScenario(unittest.TestCase):
 class TestExternalRegistration(unittest.TestCase):
     """Tests for external IDA plugin registration via WebSocket bridge."""
 
+    def _make_pool(self):
+        return PoolManager(max_instances=2, socket_dir="/tmp/fake-pool")
+
     def test_register_external_creates_session(self):
-        pool = PoolManager.__new__(PoolManager)
-        pool._lock = threading.Lock()
-        pool.im = InstanceManager.__new__(InstanceManager)
-        pool.im.instances = []
-        pool.im._next_index = 0
-        pool.sr = SessionRegistry()
+        pool = self._make_pool()
 
         bridge = MagicMock()
         bridge.alive = True
@@ -1591,12 +1817,7 @@ class TestExternalRegistration(unittest.TestCase):
         self.assertEqual(result["session"]["refcount"], 1)
 
     def test_register_external_idb_conflict_rejected(self):
-        pool = PoolManager.__new__(PoolManager)
-        pool._lock = threading.Lock()
-        pool.im = InstanceManager.__new__(InstanceManager)
-        pool.im.instances = []
-        pool.im._next_index = 0
-        pool.sr = SessionRegistry()
+        pool = self._make_pool()
         pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=99)
 
         bridge = MagicMock()
@@ -1607,12 +1828,7 @@ class TestExternalRegistration(unittest.TestCase):
         self.assertIn("already open", result["error"])
 
     def test_register_external_input_conflict_needs_confirm(self):
-        pool = PoolManager.__new__(PoolManager)
-        pool._lock = threading.Lock()
-        pool.im = InstanceManager.__new__(InstanceManager)
-        pool.im.instances = []
-        pool.im._next_index = 0
-        pool.sr = SessionRegistry()
+        pool = self._make_pool()
         pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=99)
 
         bridge = MagicMock()
@@ -1623,12 +1839,7 @@ class TestExternalRegistration(unittest.TestCase):
         self.assertTrue(result.get("needs_confirm"))
 
     def test_register_external_input_conflict_with_allow(self):
-        pool = PoolManager.__new__(PoolManager)
-        pool._lock = threading.Lock()
-        pool.im = InstanceManager.__new__(InstanceManager)
-        pool.im.instances = []
-        pool.im._next_index = 0
-        pool.sr = SessionRegistry()
+        pool = self._make_pool()
         pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=99)
 
         bridge = MagicMock()
@@ -1641,12 +1852,7 @@ class TestExternalRegistration(unittest.TestCase):
         self.assertRegex(result["session"]["session_id"], r"^a\.elf_[0-9a-f]{6}$")
 
     def test_unregister_external(self):
-        pool = PoolManager.__new__(PoolManager)
-        pool._lock = threading.Lock()
-        pool.im = InstanceManager.__new__(InstanceManager)
-        pool.im.instances = []
-        pool.im._next_index = 0
-        pool.sr = SessionRegistry()
+        pool = self._make_pool()
 
         bridge = MagicMock()
         bridge.alive = True
@@ -1663,12 +1869,7 @@ class TestExternalRegistration(unittest.TestCase):
         self.assertIsNone(pool.sr.get(sid))
 
     def test_get_external_agent_count(self):
-        pool = PoolManager.__new__(PoolManager)
-        pool._lock = threading.Lock()
-        pool.im = InstanceManager.__new__(InstanceManager)
-        pool.im.instances = []
-        pool.im._next_index = 0
-        pool.sr = SessionRegistry()
+        pool = self._make_pool()
 
         bridge = MagicMock()
         bridge.alive = True
