@@ -15,6 +15,7 @@ import json
 import logging
 import queue
 import threading
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -33,10 +34,11 @@ class ExternalInstanceBridge:
         self.ws = ws
         self.alive = True
         self.forward_lock = threading.Lock()
-        self._request_queue: queue.Queue[tuple[dict, float]] = queue.Queue()
-        self._response_queue: queue.Queue[dict] = queue.Queue()
+        self._request_queue: queue.Queue[
+            tuple[dict, dict, float, queue.Queue[dict]]
+        ] = queue.Queue()
         self._request_event = threading.Event()
-        self._agent_count_response: queue.Queue[dict] = queue.Queue()
+        self._next_request_id = 1
 
     def forward_request(self, request: dict, timeout: float = 300) -> dict:
         """Send a JSON-RPC request to the plugin and return the response.
@@ -46,11 +48,26 @@ class ExternalInstanceBridge:
         """
         if not self.alive:
             raise ConnectionError("External instance disconnected")
+        if "id" not in request:
+            raise ValueError("forward_request requires a JSON-RPC request id")
+
         with self.forward_lock:
-            self._request_queue.put((request, timeout))
+            if not self.alive:
+                raise ConnectionError("External instance disconnected")
+
+            deadline = time.monotonic() + timeout
+            response_queue: queue.Queue[dict] = queue.Queue(maxsize=1)
+            wire_request = dict(request)
+            wire_request["id"] = f"pool-{self._next_request_id}"
+            self._next_request_id += 1
+            self._request_queue.put(
+                (request, wire_request, deadline, response_queue)
+            )
             self._request_event.set()
+
+            remaining = max(0.0, deadline - time.monotonic())
             try:
-                return self._response_queue.get(timeout=timeout)
+                return response_queue.get(timeout=remaining)
             except queue.Empty:
                 raise TimeoutError(
                     "External instance did not respond within "
@@ -89,17 +106,27 @@ class ExternalInstanceBridge:
         self,
         request: dict,
         on_check_agents=None,
-        timeout: float | None = None,
+        deadline: float | None = None,
     ) -> dict:
         """Read until the JSON-RPC response for ``request`` is received."""
         expected_id = request.get("id")
         while self.alive:
+            timeout = None
+            if deadline is not None:
+                timeout = max(0.0, deadline - time.monotonic())
+                if timeout == 0:
+                    return self._jsonrpc_error(
+                        request,
+                        "External instance did not respond before the deadline",
+                    )
             try:
                 raw = self.ws.recv(timeout=timeout)
             except TimeoutError:
+                if deadline is not None and time.monotonic() < deadline:
+                    continue
                 return self._jsonrpc_error(
                     request,
-                    f"External instance did not respond within {timeout}s",
+                    "External instance did not respond before the deadline",
                 )
             try:
                 msg = json.loads(raw)
@@ -150,20 +177,24 @@ class ExternalInstanceBridge:
                 # Process all pending forward requests
                 while not self._request_queue.empty():
                     try:
-                        request, timeout = self._request_queue.get_nowait()
+                        original_request, request, deadline, response_queue = (
+                            self._request_queue.get_nowait()
+                        )
                     except queue.Empty:
                         break
                     try:
                         self.ws.send(json.dumps(request))
                         response = self._recv_jsonrpc_response(
-                            request, on_check_agents, timeout
+                            request, on_check_agents, deadline
                         )
-                        self._response_queue.put(response)
+                        response = dict(response)
+                        response["id"] = original_request.get("id")
+                        response_queue.put(response)
                     except Exception as e:
                         logger.warning("Forward to external instance failed: %s", e)
-                        self._response_queue.put(
+                        response_queue.put(
                             self._jsonrpc_error(
-                                request,
+                                original_request,
                                 f"External instance connection error: {e}",
                             )
                         )
