@@ -1,9 +1,10 @@
 import argparse
 import http.client
 import json
+import logging
 import os
+import secrets
 import sys
-import traceback
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
@@ -24,6 +25,7 @@ except ImportError:
 
 IDA_HOST = "127.0.0.1"
 IDA_PORT = 13337
+logger = logging.getLogger(__name__)
 
 mcp = McpServer("ida-pro-mcp")
 dispatch_original = mcp.registry.dispatch
@@ -73,7 +75,8 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
         finally:
             conn.close()
     except Exception as e:
-        full_info = traceback.format_exc()
+        reference = secrets.token_hex(6)
+        logger.exception("IDA proxy request failed [%s]: %s", reference, e)
         request_id = request_obj.get("id")
         if request_id is None:
             return None  # Notification, no response needed
@@ -89,7 +92,7 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
                         f"Did you run Edit -> Plugins -> MCP ({shortcut}) to start the server?\n"
                         "The request was not retried automatically. "
                         "If this was a mutating operation, verify IDA state before retrying.\n"
-                        f"{full_info}"
+                        f"Reference: {reference}"
                     ),
                     "data": str(e),
                 },

@@ -75,6 +75,8 @@ class DispatchProxyTransportTests(unittest.TestCase):
         self.assertIsNotNone(response)
         self.assertIn("error", response)
         self.assertIn("not retried automatically", response["error"]["message"])
+        self.assertNotIn("Traceback", response["error"]["message"])
+        self.assertIn("Reference:", response["error"]["message"])
         self.assertIn("read timeout", response["error"]["data"])
         self.assertEqual(len(_ResponseFailureConnection.instances), 1)
         self.assertEqual(_ResponseFailureConnection.instances[0].request_calls, 1)

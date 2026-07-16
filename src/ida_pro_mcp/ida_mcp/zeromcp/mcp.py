@@ -904,10 +904,13 @@ class McpServer:
                 }
 
             result = tool_response.get("result") if tool_response else None
+            is_error = bool(
+                isinstance(result, dict) and result.get("error")
+            )
             return {
                 "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
                 "structuredContent": result if isinstance(result, dict) else {"result": result},
-                "isError": False,
+                "isError": is_error,
             }
         finally:
             if request_id is not None:

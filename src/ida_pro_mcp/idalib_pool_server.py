@@ -22,11 +22,11 @@ import copy
 import json
 import logging
 import os
+import secrets
 import signal
 import sys
 import threading
 import time
-import traceback
 from pathlib import Path
 from typing import Any
 
@@ -369,6 +369,20 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
             "id": request_id,
         }
 
+    def _tool_error_response(
+        request_id: Any, message: str
+    ) -> JsonRpcResponse | None:
+        if request_id is None:
+            return None
+        return {
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [{"type": "text", "text": message}],
+                "isError": True,
+            },
+            "id": request_id,
+        }
+
     def _forward_request(inst, request_obj: dict) -> JsonRpcResponse | None:
         request_id = request_obj.get("id")
         key = None
@@ -585,7 +599,7 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
             try:
                 result = handler(dict(arguments))
             except Exception as e:
-                return _error_response(request_id, -32000, str(e))
+                return _tool_error_response(request_id, str(e))
             return {
                 "jsonrpc": "2.0",
                 "result": {
@@ -600,12 +614,13 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
         try:
             session_id = _resolve_session_id(dict(arguments))
         except KeyError as e:
-            return _error_response(request_id, -32001, str(e))
+            return _tool_error_response(request_id, str(e.args[0]))
 
         try:
             _sess, inst = pool.resolve_session_instance(session_id)
         except (KeyError, RuntimeError) as e:
-            return _error_response(request_id, -32001, str(e))
+            message = str(e.args[0]) if isinstance(e, KeyError) else str(e)
+            return _tool_error_response(request_id, message)
 
         forwarded = copy.deepcopy(request_obj)
         fwd_args = forwarded.get("params", {}).get("arguments", {})
@@ -662,8 +677,14 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
             try:
                 return _handle_tools_call(request_obj)
             except Exception as e:
-                tb = traceback.format_exc()
-                return _error_response(request_id, -32000, f"{e}\n{tb}")
+                reference = secrets.token_hex(6)
+                logger.exception(
+                    "Unhandled pool tool error [%s]: %s", reference, e
+                )
+                return _tool_error_response(
+                    request_id,
+                    f"Internal tool error (reference: {reference})",
+                )
 
         # Everything else (resources, etc.) — route via context binding
         ctx = _get_transport_ctx()

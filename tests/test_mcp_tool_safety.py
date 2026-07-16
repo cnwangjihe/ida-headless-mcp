@@ -1,4 +1,6 @@
+import io
 import unittest
+from contextlib import redirect_stderr
 
 from ida_pro_mcp import idalib_pool_server
 
@@ -33,6 +35,34 @@ class McpToolSafetyTests(unittest.TestCase):
 
         self.assertTrue(result["isError"])
         self.assertIn("disabled by safe mode", result["content"][0]["text"])
+
+    def test_top_level_tool_error_is_marked_as_error(self):
+        @self.server.tool
+        def expected_failure() -> dict:
+            return {"error": "input was rejected"}
+
+        result = self.server._mcp_tools_call("expected_failure")
+
+        self.assertTrue(result["isError"])
+        self.assertEqual(
+            result["structuredContent"], {"error": "input was rejected"}
+        )
+
+    def test_internal_exception_is_logged_but_not_returned(self):
+        @self.server.tool
+        def unexpected_failure() -> dict:
+            raise RuntimeError("private traceback marker")
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            result = self.server._mcp_tools_call("unexpected_failure")
+
+        text = result["content"][0]["text"]
+        self.assertTrue(result["isError"])
+        self.assertIn("Internal error (reference:", text)
+        self.assertNotIn("private traceback marker", text)
+        self.assertIn("private traceback marker", stderr.getvalue())
+        self.assertIn("Traceback", stderr.getvalue())
 
 
 if __name__ == "__main__":

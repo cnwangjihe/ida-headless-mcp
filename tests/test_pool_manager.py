@@ -706,8 +706,11 @@ class TestPoolServerDispatch(unittest.TestCase):
         }
         resp = self._dispatch(mcp, req, transport_session_id="sse:agent-a")
 
-        self.assertIn("error", resp)
-        self.assertIn("No session bound", resp["error"]["message"])
+        self.assertNotIn("error", resp)
+        self.assertTrue(resp["result"]["isError"])
+        self.assertIn(
+            "No session bound", resp["result"]["content"][0]["text"]
+        )
 
     def test_list_returns_context_info(self):
         mcp, pool = self._make_mcp_and_pool()
@@ -1267,7 +1270,36 @@ class TestPoolServerDispatch(unittest.TestCase):
             "id": 1,
         }
         resp = self._dispatch(mcp, req, transport_session_id="sse:a")
-        self.assertIn("error", resp)
+        self.assertNotIn("error", resp)
+        self.assertTrue(resp["result"]["isError"])
+        self.assertIn("boom", resp["result"]["content"][0]["text"])
+
+    def test_unexpected_forward_exception_is_redacted(self):
+        mcp, pool = self._make_mcp_and_pool()
+        pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
+        pool.sr.bind_context("sse:a", "s1")
+        pool.resolve_session_instance.return_value = (
+            pool.sr.get("s1"), MagicMock(spec=InstanceInfo)
+        )
+        pool.forward_raw.side_effect = RuntimeError("private backend marker")
+        self.build_dispatch(mcp, pool)
+        req = {
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "get_functions", "arguments": {}},
+            "id": 1,
+        }
+
+        with self.assertLogs(
+            "ida_pro_mcp.idalib_pool_server", level="ERROR"
+        ) as logs:
+            resp = self._dispatch(mcp, req, transport_session_id="sse:a")
+
+        text = resp["result"]["content"][0]["text"]
+        self.assertTrue(resp["result"]["isError"])
+        self.assertIn("Internal tool error (reference:", text)
+        self.assertNotIn("private backend marker", text)
+        self.assertIn("private backend marker", "\n".join(logs.output))
 
     def test_removed_unbind_tool_is_absent_from_list(self):
         mcp, pool = self._make_mcp_and_pool()

@@ -1,6 +1,7 @@
 import json
 import inspect
 import os
+import secrets
 import sys
 import threading
 import time
@@ -123,7 +124,6 @@ class JsonRpcRegistry:
     def __init__(self):
         self.methods: dict[str, Callable] = {}
         self._cache: dict[Callable, tuple[inspect.Signature, dict, list[str]]] = {}
-        self.redact_exceptions = False
 
     def method(self, func: Callable, name: str | None = None) -> Callable:
         self.methods[name or func.__name__] = func # type: ignore
@@ -203,14 +203,16 @@ class JsonRpcRegistry:
             _current_request.id = None
 
     def map_exception(self, e: Exception) -> JsonRpcError:
-        if self.redact_exceptions:
-            return {
-                "code": -32603,
-                "message": f"Internal Error: {str(e)}",
-            }
+        reference = secrets.token_hex(6)
+        _log(
+            f"[MCP] Internal error [{reference}]: "
+            f"{type(e).__name__}: {e}"
+        )
+        traceback.print_exception(type(e), e, e.__traceback__, file=sys.stderr)
         return {
             "code": -32603,
-            "message": "\n".join(traceback.format_exception(e)).strip() + "\n\nPlease report a bug!",
+            "message": f"Internal error (reference: {reference})",
+            "data": {"reference": reference},
         }
 
     def _call(self, method: str, params: Any) -> Any:
