@@ -353,6 +353,7 @@ class TestPoolServerDispatch(unittest.TestCase):
         self.mcp_mod = idalib_pool_server._mcp_mod
         self.McpServer = self.mcp_mod.McpServer
         self.build_dispatch = idalib_pool_server.build_dispatch
+        self.PoolOutputCache = idalib_pool_server.PoolOutputCache
         self.pool_server = idalib_pool_server
 
     def _make_mcp_and_pool(self):
@@ -637,6 +638,99 @@ class TestPoolServerDispatch(unittest.TestCase):
 
         self.assertNotIn("error", resp)
         pool.resolve_session_instance.assert_called_once_with("s2")
+
+    def test_http_pool_caches_complete_backend_output_and_rewrites_url(self):
+        mcp, pool = self._make_mcp_and_pool()
+        mcp.auth_token = "secret"
+        pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
+        pool.sr.bind_context("http:agent-a", "s1")
+        mock_inst = MagicMock(spec=InstanceInfo)
+        pool.resolve_session_instance.return_value = (pool.sr.get("s1"), mock_inst)
+
+        output_id = "47cb1836-8b32-4e27-b1a3-82d8dc1ea6b6"
+        complete = {"instructions": ["mov eax, 1", "ret"]}
+        preview = {
+            "instructions": ["mov eax, 1"],
+            "_output_truncated": True,
+            "_total_chars": len(json.dumps(complete)),
+            "_output_id": output_id,
+            "_download_url": f"http://127.0.0.1:13337/output/{output_id}.json",
+            "_download_hint": "broken backend URL",
+        }
+        pool.forward_raw.return_value = {
+            "jsonrpc": "2.0",
+            "result": {
+                "structuredContent": preview,
+                "content": [{"type": "text", "text": json.dumps(complete)}],
+                "isError": False,
+            },
+            "id": 1,
+        }
+        output_cache = self.PoolOutputCache(base_url="http://pool.example:8750")
+        self.build_dispatch(mcp, pool, output_cache=output_cache)
+
+        response = self._dispatch(
+            mcp,
+            {
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "get_functions", "arguments": {}},
+                "id": 1,
+            },
+            transport_session_id="http:agent-a",
+        )
+
+        result = response["result"]
+        structured = result["structuredContent"]
+        self.assertEqual(output_cache.get(output_id), complete)
+        self.assertEqual(
+            structured["_download_url"],
+            f"http://pool.example:8750/output/{output_id}.json",
+        )
+        self.assertIn("mkdir -p .ida-mcp", structured["_download_hint"])
+        self.assertIn("$IDA_MCP_AUTH_TOKEN", structured["_download_hint"])
+        self.assertEqual(json.loads(result["content"][0]["text"]), structured)
+
+    def test_stdio_pool_restores_complete_output_instead_of_broken_url(self):
+        mcp, pool = self._make_mcp_and_pool()
+        pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
+        pool.sr.bind_context("stdio:default", "s1")
+        mock_inst = MagicMock(spec=InstanceInfo)
+        pool.resolve_session_instance.return_value = (pool.sr.get("s1"), mock_inst)
+
+        output_id = "47cb1836-8b32-4e27-b1a3-82d8dc1ea6b6"
+        complete = {"instructions": ["mov eax, 1", "ret"]}
+        pool.forward_raw.return_value = {
+            "jsonrpc": "2.0",
+            "result": {
+                "structuredContent": {
+                    "instructions": ["mov eax, 1"],
+                    "_output_truncated": True,
+                    "_total_chars": len(json.dumps(complete)),
+                    "_output_id": output_id,
+                    "_download_url": (
+                        f"http://127.0.0.1:13337/output/{output_id}.json"
+                    ),
+                },
+                "content": [{"type": "text", "text": json.dumps(complete)}],
+                "isError": False,
+            },
+            "id": 1,
+        }
+        self.build_dispatch(mcp, pool)
+
+        response = self._dispatch(
+            mcp,
+            {
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "get_functions", "arguments": {}},
+                "id": 1,
+            },
+            transport_session_id="stdio:default",
+        )
+
+        self.assertEqual(response["result"]["structuredContent"], complete)
 
     def test_cancel_notification_targets_active_backend_request(self):
         mcp, pool = self._make_mcp_and_pool()

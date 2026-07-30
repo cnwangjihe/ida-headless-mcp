@@ -23,6 +23,7 @@ import copy
 import json
 import logging
 import os
+import re
 import secrets
 import signal
 import sys
@@ -66,6 +67,146 @@ from ida_pro_mcp.pool_websocket import ExternalInstanceBridge  # noqa: E402
 logger = logging.getLogger(__name__)
 
 POOL_WEBSOCKET_MAX_SIZE = 64 * 1024 * 1024
+POOL_OUTPUT_CACHE_MAX_SIZE = 100
+
+
+class PoolOutputCache:
+    """Pool-owned cache for complete tool results received from backends."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str | None = None,
+        max_size: int = POOL_OUTPUT_CACHE_MAX_SIZE,
+    ):
+        self.base_url = base_url.rstrip("/") if base_url else None
+        self.max_size = max(1, max_size)
+        self._items: dict[str, Any] = {}
+        self._lock = threading.Lock()
+        self._request_context = threading.local()
+
+    def put(self, output_id: str, data: Any) -> None:
+        with self._lock:
+            self._items.pop(output_id, None)
+            while len(self._items) >= self.max_size:
+                oldest = next(iter(self._items))
+                self._items.pop(oldest, None)
+            self._items[output_id] = data
+
+    def get(self, output_id: str) -> Any | None:
+        with self._lock:
+            return self._items.get(output_id)
+
+    def set_request_base_url(self, base_url: str | None) -> None:
+        self._request_context.base_url = (
+            base_url.rstrip("/") if base_url else None
+        )
+
+    def clear_request_base_url(self) -> None:
+        self._request_context.base_url = None
+
+    def download_url(self, output_id: str) -> str | None:
+        base_url = self.base_url or getattr(
+            self._request_context, "base_url", None
+        )
+        if base_url is None:
+            return None
+        return f"{base_url}/output/{output_id}.json"
+
+
+def _complete_forwarded_output(
+    response: JsonRpcResponse | None,
+) -> tuple[dict, dict, Any, dict] | None:
+    """Recover a backend's complete structured result from its text block.
+
+    The IDA-side size limiter truncates ``structuredContent`` but retains the
+    original JSON in the first text content block. Pool transports use that
+    internal copy to take ownership of the downloadable result.
+    """
+    if not isinstance(response, dict):
+        return None
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return None
+    structured = result.get("structuredContent")
+    if not isinstance(structured, dict):
+        return None
+    if structured.get("_output_truncated") is not True:
+        return None
+
+    output_id = structured.get("_output_id")
+    if (
+        not isinstance(output_id, str)
+        or re.fullmatch(r"[a-f0-9-]+", output_id) is None
+    ):
+        return None
+
+    content = result.get("content")
+    if not isinstance(content, list):
+        return None
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "text":
+            continue
+        text = block.get("text")
+        if not isinstance(text, str):
+            continue
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+
+        complete = parsed if isinstance(parsed, dict) else {"result": parsed}
+        total_chars = structured.get("_total_chars")
+        if (
+            isinstance(total_chars, int)
+            and len(json.dumps(complete)) != total_chars
+        ):
+            continue
+        return result, structured, complete, block
+    return None
+
+
+def _prepare_forwarded_large_output(
+    response: JsonRpcResponse | None,
+    output_cache: PoolOutputCache | None,
+    *,
+    auth_required: bool,
+) -> JsonRpcResponse | None:
+    recovered = _complete_forwarded_output(response)
+    if recovered is None:
+        return response
+
+    result, preview, complete, text_block = recovered
+    output_id = preview["_output_id"]
+    download_url = output_cache.download_url(output_id) if output_cache else None
+
+    if output_cache is None or download_url is None:
+        # stdio has no HTTP endpoint. Return the complete structured result
+        # instead of exposing a URL that cannot exist.
+        result["structuredContent"] = complete
+        return response
+
+    output_cache.put(output_id, complete)
+    preview["_download_url"] = download_url
+    auth_option = (
+        ' -H "Authorization: Bearer $IDA_MCP_AUTH_TOKEN"'
+        if auth_required
+        else ""
+    )
+    hint_prefix = (
+        "Output truncated. Set IDA_MCP_AUTH_TOKEN to the pool token, then run: "
+        if auth_required
+        else "Output truncated. Run: "
+    )
+    preview["_download_hint"] = (
+        f"{hint_prefix}mkdir -p .ida-mcp && "
+        f"curl{auth_option} -o .ida-mcp/{output_id}.json {download_url}"
+    )
+
+    # Do not leak the complete payload through the public MCP text block after
+    # the pool has cached it. The backend-to-pool copy is an internal detail.
+    text_block["text"] = json.dumps(preview, indent=2)
+    return response
 
 
 def _accept_pool_websocket(handler) -> WebSocketConnection | None:
@@ -331,7 +472,12 @@ def _prepare_tools(tools: list[dict]) -> list[dict]:
 # Proxy dispatch
 # --------------------------------------------------------------------------
 
-def build_dispatch(mcp: McpServer, pool: PoolManager):
+def build_dispatch(
+    mcp: McpServer,
+    pool: PoolManager,
+    *,
+    output_cache: PoolOutputCache | None = None,
+):
     """Patch ``mcp.registry.dispatch`` with pool-aware routing."""
 
     dispatch_original = mcp.registry.dispatch
@@ -627,7 +773,12 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
         fwd_args = forwarded.get("params", {}).get("arguments", {})
         fwd_args.pop("session_id", None)
 
-        return _forward_request(inst, forwarded)
+        response = _forward_request(inst, forwarded)
+        return _prepare_forwarded_large_output(
+            response,
+            output_cache,
+            auth_required=bool(mcp.auth_token),
+        )
 
     # --- tools/list handler ---
 
@@ -708,20 +859,61 @@ def build_dispatch(mcp: McpServer, pool: PoolManager):
 # WebSocket handler for external plugin registration
 # --------------------------------------------------------------------------
 
-def build_pool_handler_class(pool: PoolManager):
+def build_pool_handler_class(
+    pool: PoolManager,
+    output_cache: PoolOutputCache | None = None,
+):
     """Create a request handler class with WebSocket support for /pool/ws."""
 
     class PoolHttpRequestHandler(McpHttpRequestHandler):
 
+        def do_POST(self):
+            if output_cache is None:
+                super().do_POST()
+                return
+
+            host = self.headers.get("Host")
+            request_base_url = None
+            if host and re.fullmatch(r"[A-Za-z0-9._:\[\]-]+", host):
+                request_base_url = f"http://{host}"
+            output_cache.set_request_base_url(request_base_url)
+            try:
+                super().do_POST()
+            finally:
+                output_cache.clear_request_base_url()
+
         def do_GET(self):
             from urllib.parse import urlparse
             path = urlparse(self.path).path
-            if path == "/pool/ws":
+            output_match = re.fullmatch(r"/output/([a-f0-9-]+)\.json", path)
+            if output_match and output_cache is not None:
+                if not self._check_auth():
+                    return
+                self._handle_output_download(output_match.group(1))
+            elif path == "/pool/ws":
                 if not self._check_auth():
                     return
                 self._handle_pool_ws()
             else:
                 super().do_GET()
+
+        def _handle_output_download(self, output_id: str):
+            data = output_cache.get(output_id) if output_cache else None
+            if data is None:
+                self.send_error(404, "Output not found or expired")
+                return
+
+            body = json.dumps(data, indent=2).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header(
+                "Content-Disposition",
+                f'attachment; filename="{output_id}.json"',
+            )
+            self.send_cors_headers()
+            self.end_headers()
+            self.wfile.write(body)
 
         def _handle_pool_ws(self):
             ws = _accept_pool_websocket(self)
@@ -838,6 +1030,11 @@ def main():
     mcp.require_streamable_http_session = True
     if args.auth_token:
         mcp.auth_token = args.auth_token
+    output_cache = (
+        None
+        if args.transport == "stdio"
+        else PoolOutputCache(base_url=os.environ.get("IDA_MCP_URL"))
+    )
 
     def request_shutdown(signum, frame):
         logger.info("Shutdown requested")
@@ -850,7 +1047,7 @@ def main():
         logger.info("Spawning initial instance for tool discovery...")
         pool.spawn_instance()
 
-        build_dispatch(mcp, pool)
+        build_dispatch(mcp, pool, output_cache=output_cache)
 
         if args.input_path is not None:
             if not args.input_path.exists():
@@ -877,7 +1074,7 @@ def main():
             if not url.hostname or not url.port:
                 print(f"Error: invalid transport URL: {transport}", file=sys.stderr)
                 sys.exit(1)
-            handler_cls = build_pool_handler_class(pool)
+            handler_cls = build_pool_handler_class(pool, output_cache)
             mcp.serve(host=url.hostname, port=url.port, background=False,
                       request_handler=handler_cls)
     finally:

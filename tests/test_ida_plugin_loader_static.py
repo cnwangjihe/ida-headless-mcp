@@ -37,6 +37,23 @@ class TestIdaPluginLoaderStatic(unittest.TestCase):
         self.assertIn("_check_auth", call_names)
         self.assertIn("_check_host", call_names)
 
+    def test_local_server_updates_output_download_base_url(self):
+        tree = ast.parse(PLUGIN_LOADER.read_text(), filename=str(PLUGIN_LOADER))
+        start_local_server = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "start_local_server"
+        )
+        call_names = {
+            node.func.id
+            for node in ast.walk(start_local_server)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+        }
+
+        self.assertIn("set_download_base_url", call_names)
+
     def test_gui_web_config_routes_are_removed(self):
         source = HTTP_MODULE.read_text()
         tree = ast.parse(source, filename=str(HTTP_MODULE))

@@ -130,6 +130,18 @@ Startup opening creates the session before an MCP transport context exists.
 The client should still call `idalib_open` for that path, or use
 `idalib_list` followed by `idalib_switch`, to establish its own binding.
 
+### Large tool results
+
+In HTTP/SSE pool mode, oversized results contain a preview plus an
+`_download_url` served by the pool itself. The URL returns the complete JSON
+result and requires the same bearer token when authentication is enabled.
+In stdio mode there is no HTTP download endpoint, so the pool returns the
+complete structured result inline instead of emitting an unusable URL.
+
+Download entries are memory-backed and bounded to the latest 100 results;
+they are lost when the serving process restarts. Download important output
+before opening enough newer large results to evict it.
+
 ### MCP client configuration
 
 Local stdio configuration:

@@ -128,6 +128,16 @@ uv run idalib-pool /path/to/binary
 Client 仍应对相同路径调用一次 `idalib_open`，或者先 `idalib_list` 再
 `idalib_switch`，建立自己的 context 绑定。
 
+### 大结果下载
+
+在 HTTP/SSE Pool 模式中，超大结果会返回预览和由 Pool 自身提供的
+`_download_url`。该 URL 返回完整 JSON；启用认证时，下载请求需要携带同一个
+Bearer Token。stdio 没有 HTTP 下载端点，因此 Pool 会直接内联返回完整的
+structured result，而不会生成不可用的 URL。
+
+下载缓存位于内存中，最多保留最近 100 个结果；Server 重启后缓存会丢失。
+重要结果应在被后续大结果淘汰前及时下载。
+
 ### MCP Client 配置
 
 本地 stdio：

@@ -73,7 +73,10 @@ def _add_download_info(result: Any, output_id: str, total_chars: int) -> Any:
         "_total_chars": total_chars,
         "_output_id": output_id,
         "_download_url": download_url,
-        "_download_hint": f"Output truncated. Run: curl -o .ida-mcp/{output_id}.json {download_url}",
+        "_download_hint": (
+            "Output truncated. Run: mkdir -p .ida-mcp && "
+            f"curl -o .ida-mcp/{output_id}.json {download_url}"
+        ),
     }
 
     if isinstance(result, dict):

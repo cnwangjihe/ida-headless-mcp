@@ -1,3 +1,4 @@
+import http.client
 import json
 import os
 import socket
@@ -5,10 +6,17 @@ import threading
 import time
 import unittest
 from http.server import ThreadingHTTPServer
+from unittest.mock import MagicMock
 
 from websockets.sync.client import connect
 
-from ida_pro_mcp.idalib_pool_server import build_pool_handler_class
+from ida_pro_mcp.idalib_pool_manager import InstanceInfo, PoolManager, SessionRegistry
+from ida_pro_mcp.idalib_pool_server import (
+    McpServer,
+    PoolOutputCache,
+    build_dispatch,
+    build_pool_handler_class,
+)
 
 
 class _DummyMcp:
@@ -62,6 +70,162 @@ def _find_free_port():
 
 
 class TestPoolWebSocketServer(unittest.TestCase):
+    def test_output_cache_evicts_oldest_entry(self):
+        output_cache = PoolOutputCache(max_size=2)
+        output_cache.put("first", {"value": 1})
+        output_cache.put("second", {"value": 2})
+        output_cache.put("third", {"value": 3})
+
+        self.assertIsNone(output_cache.get("first"))
+        self.assertEqual(output_cache.get("second"), {"value": 2})
+        self.assertEqual(output_cache.get("third"), {"value": 3})
+
+    def test_tool_response_download_url_round_trips_through_pool(self):
+        output_id = "47cb1836-8b32-4e27-b1a3-82d8dc1ea6b6"
+        complete = {"instructions": ["mov eax, 1", "ret"]}
+        preview = {
+            "instructions": ["mov eax, 1"],
+            "_output_truncated": True,
+            "_total_chars": len(json.dumps(complete)),
+            "_output_id": output_id,
+            "_download_url": f"http://127.0.0.1:13337/output/{output_id}.json",
+            "_download_hint": "broken backend URL",
+        }
+
+        pool = MagicMock(spec=PoolManager)
+        pool._lock = threading.Lock()
+        pool.sr = SessionRegistry()
+        session = pool.sr.create(
+            "s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0
+        )
+        instance = MagicMock(spec=InstanceInfo)
+        pool.resolve_session_instance.return_value = (session, instance)
+        pool.forward_raw.return_value = {
+            "jsonrpc": "2.0",
+            "result": {
+                "structuredContent": preview,
+                "content": [{"type": "text", "text": json.dumps(complete)}],
+                "isError": False,
+            },
+            "id": 1,
+        }
+
+        mcp = McpServer("test")
+        output_cache = PoolOutputCache()
+        build_dispatch(mcp, pool, output_cache=output_cache)
+        handler_cls = build_pool_handler_class(pool, output_cache)
+        port = _find_free_port()
+        server = ThreadingHTTPServer(("127.0.0.1", port), handler_cls)
+        server.daemon_threads = True
+        server.mcp_server = mcp
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        request = {
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {
+                "name": "get_functions",
+                "arguments": {"session_id": "s1"},
+            },
+            "id": 1,
+        }
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        self.addCleanup(conn.close)
+        conn.request(
+            "POST",
+            "/mcp",
+            body=json.dumps(request),
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+                "MCP-Protocol-Version": "2025-11-25",
+            },
+        )
+        response = conn.getresponse()
+        response_body = json.loads(response.read())
+        self.assertEqual(response.status, 200)
+
+        download_url = response_body["result"]["structuredContent"][
+            "_download_url"
+        ]
+        self.assertEqual(
+            download_url,
+            f"http://127.0.0.1:{port}/output/{output_id}.json",
+        )
+
+        conn.request("GET", f"/output/{output_id}.json")
+        download_response = conn.getresponse()
+        downloaded = json.loads(download_response.read())
+        self.assertEqual(download_response.status, 200)
+        self.assertEqual(downloaded, complete)
+
+    def test_output_download_returns_complete_pool_cached_result(self):
+        pool = _DummyPool()
+        output_id = "47cb1836-8b32-4e27-b1a3-82d8dc1ea6b6"
+        complete = {"instructions": ["mov eax, 1", "ret"]}
+        output_cache = PoolOutputCache()
+        output_cache.put(output_id, complete)
+        handler_cls = build_pool_handler_class(pool, output_cache)
+        port = _find_free_port()
+        server = ThreadingHTTPServer(("127.0.0.1", port), handler_cls)
+        server.daemon_threads = True
+        server.mcp_server = _DummyMcp()
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        self.addCleanup(conn.close)
+        conn.request("GET", f"/output/{output_id}.json")
+        response = conn.getresponse()
+        body = response.read()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(json.loads(body), complete)
+        self.assertEqual(
+            response.getheader("Content-Disposition"),
+            f'attachment; filename="{output_id}.json"',
+        )
+
+    def test_output_download_requires_pool_bearer_token(self):
+        pool = _DummyPool()
+        output_id = "47cb1836-8b32-4e27-b1a3-82d8dc1ea6b6"
+        output_cache = PoolOutputCache()
+        output_cache.put(output_id, {"complete": True})
+        handler_cls = build_pool_handler_class(pool, output_cache)
+        port = _find_free_port()
+        server = ThreadingHTTPServer(("127.0.0.1", port), handler_cls)
+        server.daemon_threads = True
+        server.mcp_server = _DummyMcp()
+        server.mcp_server.auth_token = "secret"
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        unauthorized = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        self.addCleanup(unauthorized.close)
+        unauthorized.request("GET", f"/output/{output_id}.json")
+        unauthorized_response = unauthorized.getresponse()
+        unauthorized_response.read()
+        self.assertEqual(unauthorized_response.status, 401)
+
+        authorized = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        self.addCleanup(authorized.close)
+        authorized.request(
+            "GET",
+            f"/output/{output_id}.json",
+            headers={"Authorization": "Bearer secret"},
+        )
+        authorized_response = authorized.getresponse()
+        body = authorized_response.read()
+        self.assertEqual(authorized_response.status, 200)
+        self.assertEqual(json.loads(body), {"complete": True})
+
     def test_pool_ws_accepts_external_registration(self):
         pool = _DummyPool()
         handler_cls = build_pool_handler_class(pool)
