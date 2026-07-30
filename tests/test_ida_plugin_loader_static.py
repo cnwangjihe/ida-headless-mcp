@@ -14,7 +14,7 @@ HTTP_MODULE = (
 
 
 class TestIdaPluginLoaderStatic(unittest.TestCase):
-    def test_custom_http_routes_enforce_configured_authentication(self):
+    def test_output_download_route_enforces_authentication_and_host(self):
         tree = ast.parse(HTTP_MODULE.read_text(), filename=str(HTTP_MODULE))
         handler = next(
             node
@@ -23,57 +23,36 @@ class TestIdaPluginLoaderStatic(unittest.TestCase):
             and node.name == "IdaMcpHttpRequestHandler"
         )
 
-        def auth_call_count(method_name: str) -> int:
-            method = next(
-                node
-                for node in handler.body
-                if isinstance(node, ast.FunctionDef) and node.name == method_name
-            )
-            return sum(
-                1
-                for node in ast.walk(method)
-                if isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "_check_auth"
-            )
-
-        self.assertGreaterEqual(auth_call_count("do_POST"), 1)
-        self.assertGreaterEqual(auth_call_count("do_GET"), 2)
-
-    def test_config_post_uses_shared_bounded_body_reader(self):
-        tree = ast.parse(HTTP_MODULE.read_text(), filename=str(HTTP_MODULE))
-        handler = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.ClassDef)
-            and node.name == "IdaMcpHttpRequestHandler"
-        )
         method = next(
             node
             for node in handler.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "_handle_config_post"
+            if isinstance(node, ast.FunctionDef) and node.name == "do_GET"
         )
-
-        calls = [
-            node
+        call_names = {
+            node.func.attr
             for node in ast.walk(method)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
-        ]
-        self.assertTrue(
-            any(node.func.attr == "_read_body" for node in calls),
-            "custom config POSTs must use the shared payload-limited reader",
+        }
+        self.assertIn("_check_auth", call_names)
+        self.assertIn("_check_host", call_names)
+
+    def test_gui_web_config_routes_are_removed(self):
+        source = HTTP_MODULE.read_text()
+        tree = ast.parse(source, filename=str(HTTP_MODULE))
+        handler = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "IdaMcpHttpRequestHandler"
         )
-        self.assertFalse(
-            any(
-                node.func.attr == "read"
-                and isinstance(node.func.value, ast.Attribute)
-                and node.func.value.attr == "rfile"
-                for node in calls
-            ),
-            "config POSTs must not bypass body limits with direct rfile reads",
-        )
+
+        method_names = {
+            node.name for node in handler.body if isinstance(node, ast.FunctionDef)
+        }
+        self.assertNotIn("do_POST", method_names)
+        self.assertNotIn('"/config"', source)
+        self.assertNotIn('"/config.html"', source)
 
     def test_plugin_loader_uses_side_effect_free_config_module(self):
         """Pool mode must not import ida_mcp.http just to read config.
@@ -332,24 +311,21 @@ class TestIdaPluginLoaderStatic(unittest.TestCase):
             )
         )
 
-    def test_http_module_does_not_filter_tools_at_import_time(self):
+    def test_http_module_does_not_filter_tools(self):
         tree = ast.parse(HTTP_MODULE.read_text(), filename=str(HTTP_MODULE))
-        for node in tree.body:
-            if not isinstance(node, ast.Assign):
-                continue
-            target_names = [
-                target.id
-                for target in node.targets
-                if isinstance(target, ast.Name)
-            ]
-            if "ORIGINAL_TOOLS" not in target_names:
-                continue
-            self.assertFalse(
-                isinstance(node.value, ast.Call)
-                and isinstance(node.value.func, ast.Name)
-                and node.value.func.id == "handle_enabled_tools",
-                "http.py must not apply enabled_tools filtering during import",
-            )
+        function_names = {
+            node.name for node in tree.body if isinstance(node, ast.FunctionDef)
+        }
+        assigned_names = {
+            target.id
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+        self.assertNotIn("handle_enabled_tools", function_names)
+        self.assertNotIn("ensure_enabled_tools_initialized", function_names)
+        self.assertNotIn("ORIGINAL_TOOLS", assigned_names)
 
 
 if __name__ == "__main__":

@@ -595,7 +595,6 @@ class MCP(idaapi.plugin_t):
             MCP_SERVER.serve(
                 self.host, self.port, request_handler=IdaMcpHttpRequestHandler
             )
-            print(f"  Config: http://{self.host}:{self.port}/config.html")
             self.mcp = MCP_SERVER
             self.update_menu_state()
             return 1
