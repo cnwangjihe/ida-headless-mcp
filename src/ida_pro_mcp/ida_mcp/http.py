@@ -82,6 +82,8 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
     def do_POST(self):
         """Handles POST requests."""
         if urlparse(self.path).path == "/config":
+            if not self._check_auth():
+                return
             if not self._check_origin():
                 return
             self._handle_config_post()
@@ -94,6 +96,8 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
         path = parsed.path
 
         if path == "/config.html":
+            if not self._check_auth():
+                return
             if not self._check_host():
                 return
             self._handle_config_get()
@@ -102,6 +106,10 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
         # Handle output download requests
         output_match = re.match(r"^/output/([a-f0-9-]+)\.(\w+)$", path)
         if output_match:
+            if not self._check_auth():
+                return
+            if not self._check_host():
+                return
             self._handle_output_download(output_match.group(1), output_match.group(2))
             return
 
@@ -352,9 +360,16 @@ input[type="submit"]:hover {
             self.send_error(400, f"Unsupported Content-Type: {content_type}")
             return
 
-        # Parse the form data
-        length = int(self.headers.get("content-length", "0"))
-        postvars = parse_qs(self.rfile.read(length).decode("utf-8"))
+        # Use the shared bounded reader so this custom route gets the same
+        # framing, compression, and payload-size protections as MCP POSTs.
+        body = self._read_body()
+        if body is None:
+            return
+        try:
+            postvars = parse_qs(body.decode("utf-8"))
+        except UnicodeDecodeError:
+            self.send_error(400, "Invalid UTF-8 form body")
+            return
 
         # Update CORS policy
         cors_policy = postvars.get("cors_policy", [DEFAULT_CORS_POLICY])[0]

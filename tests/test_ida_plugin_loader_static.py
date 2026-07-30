@@ -14,6 +14,67 @@ HTTP_MODULE = (
 
 
 class TestIdaPluginLoaderStatic(unittest.TestCase):
+    def test_custom_http_routes_enforce_configured_authentication(self):
+        tree = ast.parse(HTTP_MODULE.read_text(), filename=str(HTTP_MODULE))
+        handler = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "IdaMcpHttpRequestHandler"
+        )
+
+        def auth_call_count(method_name: str) -> int:
+            method = next(
+                node
+                for node in handler.body
+                if isinstance(node, ast.FunctionDef) and node.name == method_name
+            )
+            return sum(
+                1
+                for node in ast.walk(method)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_check_auth"
+            )
+
+        self.assertGreaterEqual(auth_call_count("do_POST"), 1)
+        self.assertGreaterEqual(auth_call_count("do_GET"), 2)
+
+    def test_config_post_uses_shared_bounded_body_reader(self):
+        tree = ast.parse(HTTP_MODULE.read_text(), filename=str(HTTP_MODULE))
+        handler = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "IdaMcpHttpRequestHandler"
+        )
+        method = next(
+            node
+            for node in handler.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_handle_config_post"
+        )
+
+        calls = [
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+        ]
+        self.assertTrue(
+            any(node.func.attr == "_read_body" for node in calls),
+            "custom config POSTs must use the shared payload-limited reader",
+        )
+        self.assertFalse(
+            any(
+                node.func.attr == "read"
+                and isinstance(node.func.value, ast.Attribute)
+                and node.func.value.attr == "rfile"
+                for node in calls
+            ),
+            "config POSTs must not bypass body limits with direct rfile reads",
+        )
+
     def test_plugin_loader_uses_side_effect_free_config_module(self):
         """Pool mode must not import ida_mcp.http just to read config.
 

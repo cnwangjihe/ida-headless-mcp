@@ -1,5 +1,7 @@
+import gzip
 import http.client
 import json
+import time
 import unittest
 
 from ida_pro_mcp import idalib_pool_server
@@ -174,6 +176,117 @@ class StreamableHttpTransportSpecTests(unittest.TestCase):
 
         self.assertEqual(get_status, 405)
         self.assertEqual(delete_status, 405)
+
+    def test_gzip_body_is_limited_after_decompression(self):
+        self.server.post_body_limit = 512
+        payload = json.dumps({
+            "jsonrpc": "2.0",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "x" * 2000, "version": "1"},
+            },
+            "id": 1,
+        }).encode("utf-8")
+        compressed = gzip.compress(payload)
+        self.assertLess(len(compressed), self.server.post_body_limit)
+
+        status, _headers, _data = self._post(
+            compressed, headers={"Content-Encoding": "gzip"}
+        )
+
+        self.assertEqual(status, 413)
+
+    def test_valid_gzip_request_is_accepted(self):
+        payload = json.dumps({
+            "jsonrpc": "2.0",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "1"},
+            },
+            "id": 1,
+        }).encode("utf-8")
+
+        status, _headers, data = self._post(
+            gzip.compress(payload), headers={"Content-Encoding": "gzip"}
+        )
+
+        self.assertEqual(status, 200, data)
+
+    def test_invalid_compressed_body_returns_bad_request(self):
+        status, _headers, _data = self._post(
+            b"not-gzip", headers={"Content-Encoding": "gzip"}
+        )
+
+        self.assertEqual(status, 400)
+
+    def test_unknown_content_encoding_is_rejected(self):
+        status, _headers, _data = self._post(
+            b"{}", headers={"Content-Encoding": "br"}
+        )
+
+        self.assertEqual(status, 415)
+
+    def test_chunked_body_is_rejected_when_cumulative_size_exceeds_limit(self):
+        self.server.post_body_limit = 16
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request(
+            "POST",
+            "/mcp",
+            body=iter([b"a" * 10, b"b" * 10]),
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+            },
+            encode_chunked=True,
+        )
+        response = conn.getresponse()
+        response.read()
+        status = response.status
+        conn.close()
+
+        self.assertEqual(status, 413)
+
+    def test_expired_http_session_is_pruned(self):
+        session_id, _payload = self._initialize()
+        self.server.http_session_ttl_seconds = 1
+        with self.server._http_sessions_lock:
+            version, _last_accessed = self.server._http_sessions[session_id]
+            self.server._http_sessions[session_id] = (
+                version,
+                time.monotonic() - 2,
+            )
+
+        status, _headers, _data = self._post(
+            {
+                "jsonrpc": "2.0",
+                "method": "tools/list",
+                "params": {},
+                "id": 2,
+            },
+            headers={
+                "MCP-Session-Id": session_id,
+                "MCP-Protocol-Version": "2025-11-25",
+            },
+        )
+
+        self.assertEqual(status, 404)
+        with self.server._http_sessions_lock:
+            self.assertNotIn(session_id, self.server._http_sessions)
+
+    def test_http_session_registry_evicts_oldest_entry_at_capacity(self):
+        self.server.http_session_max_entries = 2
+        self.server.register_http_session("first")
+        self.server.register_http_session("second")
+        self.server.register_http_session("third")
+
+        with self.server._http_sessions_lock:
+            self.assertNotIn("first", self.server._http_sessions)
+            self.assertIn("second", self.server._http_sessions)
+            self.assertIn("third", self.server._http_sessions)
 
 
 if __name__ == "__main__":

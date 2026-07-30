@@ -7,7 +7,6 @@ import sys
 import time
 import uuid
 import json
-import gzip
 import zlib
 import inspect
 import threading
@@ -106,6 +105,13 @@ class UnixHTTPServer(_UnixHTTPServerMixin, HTTPServer):
 class UnixThreadingHTTPServer(_UnixHTTPServerMixin, ThreadingHTTPServer):
     """Multi-threaded HTTPServer on a Unix domain socket."""
     pass
+
+
+class _HttpBodyError(Exception):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
 
 
 class McpHttpRequestHandler(BaseHTTPRequestHandler):
@@ -284,48 +290,107 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         return True
 
     def _read_body(self) -> bytes | None:
-        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
-            raw = self._read_chunked()
-        else:
-            content_length = int(self.headers.get("Content-Length", 0))
-            if content_length > self.mcp_server.post_body_limit:
-                self.send_error(413, f"Payload Too Large: exceeds {self.mcp_server.post_body_limit} bytes")
-                return None
-            raw = self.rfile.read(content_length) if content_length > 0 else b""
+        try:
+            if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+                raw = self._read_chunked()
+            else:
+                raw_content_length = self.headers.get("Content-Length", "0")
+                try:
+                    content_length = int(raw_content_length)
+                except (TypeError, ValueError) as e:
+                    raise _HttpBodyError(400, "Invalid Content-Length") from e
+                if content_length < 0:
+                    raise _HttpBodyError(400, "Invalid Content-Length")
+                if content_length > self.mcp_server.post_body_limit:
+                    raise _HttpBodyError(
+                        413,
+                        "Payload Too Large: exceeds "
+                        f"{self.mcp_server.post_body_limit} bytes",
+                    )
+                raw = self.rfile.read(content_length) if content_length > 0 else b""
+                if len(raw) != content_length:
+                    raise _HttpBodyError(400, "Incomplete request body")
 
-        if len(raw) > self.mcp_server.post_body_limit:
-            self.send_error(413, f"Payload Too Large: exceeds {self.mcp_server.post_body_limit} bytes")
+            if len(raw) > self.mcp_server.post_body_limit:
+                raise _HttpBodyError(
+                    413,
+                    "Payload Too Large: exceeds "
+                    f"{self.mcp_server.post_body_limit} bytes",
+                )
+            return self._decompress_body(raw)
+        except _HttpBodyError as e:
+            self.close_connection = True
+            self.send_error(e.status, e.message)
             return None
 
-        return self._decompress_body(raw)
-
     def _read_chunked(self) -> bytes:
-        body = b""
+        body = bytearray()
         limit = self.mcp_server.post_body_limit
         while True:
-            line = self.rfile.readline().split(b";")[0].strip()
-            chunk_size = int(line, 16)
+            line = self.rfile.readline(8193)
+            if not line or len(line) > 8192:
+                raise _HttpBodyError(400, "Invalid chunk header")
+            raw_size = line.split(b";", 1)[0].strip()
+            try:
+                chunk_size = int(raw_size, 16)
+            except ValueError as e:
+                raise _HttpBodyError(400, "Invalid chunk size") from e
             if chunk_size == 0:
                 # Consume trailer fields until blank line
-                while self.rfile.readline().strip():
-                    pass
+                while True:
+                    trailer = self.rfile.readline(8193)
+                    if not trailer or trailer in (b"\r\n", b"\n"):
+                        break
+                    if len(trailer) > 8192:
+                        raise _HttpBodyError(400, "Invalid chunk trailer")
                 break
-            body += self.rfile.read(min(chunk_size, limit + 1 - len(body)))
-            if len(body) > limit:
-                return body
-            self.rfile.readline()
-        return body
+            if chunk_size < 0 or len(body) + chunk_size > limit:
+                raise _HttpBodyError(
+                    413, f"Payload Too Large: exceeds {limit} bytes"
+                )
+            chunk = self.rfile.read(chunk_size)
+            if len(chunk) != chunk_size:
+                raise _HttpBodyError(400, "Incomplete chunk data")
+            body.extend(chunk)
+            if self.rfile.read(2) != b"\r\n":
+                raise _HttpBodyError(400, "Invalid chunk terminator")
+        return bytes(body)
 
     def _decompress_body(self, data: bytes) -> bytes:
         encoding = self.headers.get("Content-Encoding", "").lower().strip()
-        if encoding in ("gzip", "x-gzip"):
-            return gzip.decompress(data)
-        elif encoding == "deflate":
-            if data[:1] == b'\x78':
-                return zlib.decompress(data)
-            else:
-                return zlib.decompress(data, -15)
-        return data
+        if encoding in ("", "identity"):
+            return data
+        try:
+            if encoding in ("gzip", "x-gzip"):
+                return self._decompress_limited(data, 16 + zlib.MAX_WBITS)
+            if encoding == "deflate":
+                try:
+                    return self._decompress_limited(data, zlib.MAX_WBITS)
+                except zlib.error:
+                    return self._decompress_limited(data, -zlib.MAX_WBITS)
+        except zlib.error as e:
+            raise _HttpBodyError(400, "Invalid compressed request body") from e
+        raise _HttpBodyError(
+            415, f"Unsupported Content-Encoding: {encoding}"
+        )
+
+    def _decompress_limited(self, data: bytes, wbits: int) -> bytes:
+        limit = self.mcp_server.post_body_limit
+        decompressor = zlib.decompressobj(wbits)
+        output = bytearray(decompressor.decompress(data, limit + 1))
+        if len(output) > limit or decompressor.unconsumed_tail:
+            raise _HttpBodyError(
+                413, f"Payload Too Large: exceeds {limit} bytes"
+            )
+        remaining = limit + 1 - len(output)
+        output.extend(decompressor.flush(remaining))
+        if len(output) > limit:
+            raise _HttpBodyError(
+                413, f"Payload Too Large: exceeds {limit} bytes"
+            )
+        if not decompressor.eof or decompressor.unused_data:
+            raise _HttpBodyError(400, "Invalid compressed request body")
+        return bytes(output)
 
     def _handle_sse_get(self):
         # Create SSE connection wrapper
@@ -603,6 +668,8 @@ class McpServer:
         self.version = version
         self.cors_allowed_origins: Callable[[str], bool] | list[str] | str | None = self.cors_localhost
         self.post_body_limit = 10 * 1024 * 1024  # 10MB
+        self.http_session_ttl_seconds = 60 * 60
+        self.http_session_max_entries = 1024
         self.auth_token: str | None = None  # Bearer token; None = no auth
         self.tools = McpRpcRegistry()
         self.disabled_tools: set[str] = set()
@@ -613,7 +680,7 @@ class McpServer:
         self._server_thread: threading.Thread | None = None
         self._running = False
         self._sse_connections: dict[str, _McpSseConnection] = {}
-        self._http_sessions: dict[str, str] = {}
+        self._http_sessions: dict[str, tuple[str, float]] = {}
         self._http_sessions_lock = threading.Lock()
         self._protocol_version = threading.local()
         self._transport_session_id = threading.local()
@@ -801,17 +868,52 @@ class McpServer:
         protocol_version: str = LATEST_MCP_PROTOCOL_VERSION,
     ) -> None:
         with self._http_sessions_lock:
-            self._http_sessions[session_id] = protocol_version
+            self._prune_http_sessions_locked()
+            if session_id not in self._http_sessions:
+                max_entries = max(1, self.http_session_max_entries)
+                while len(self._http_sessions) >= max_entries:
+                    oldest = min(
+                        self._http_sessions,
+                        key=lambda key: self._http_sessions[key][1],
+                    )
+                    self._http_sessions.pop(oldest, None)
+            self._http_sessions[session_id] = (
+                protocol_version,
+                time.monotonic(),
+            )
 
     def has_http_session(self, session_id: str) -> bool:
         with self._http_sessions_lock:
-            return session_id in self._http_sessions
+            self._prune_http_sessions_locked()
+            session = self._http_sessions.get(session_id)
+            if session is None:
+                return False
+            self._http_sessions[session_id] = (session[0], time.monotonic())
+            return True
 
     def get_http_session_protocol_version(self, session_id: str | None) -> str | None:
         if session_id is None:
             return None
         with self._http_sessions_lock:
-            return self._http_sessions.get(session_id)
+            self._prune_http_sessions_locked()
+            session = self._http_sessions.get(session_id)
+            if session is None:
+                return None
+            self._http_sessions[session_id] = (session[0], time.monotonic())
+            return session[0]
+
+    def _prune_http_sessions_locked(self) -> None:
+        ttl = self.http_session_ttl_seconds
+        if ttl <= 0:
+            return
+        cutoff = time.monotonic() - ttl
+        expired = [
+            session_id
+            for session_id, (_version, last_accessed) in self._http_sessions.items()
+            if last_accessed < cutoff
+        ]
+        for session_id in expired:
+            self._http_sessions.pop(session_id, None)
 
     def cors_localhost(self, origin: str) -> bool:
         """Allow CORS requests from localhost on ANY port."""
