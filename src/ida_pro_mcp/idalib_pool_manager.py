@@ -6,8 +6,8 @@ instance holds at most one active IDB at a time.
 
 Key invariants
 --------------
-* ``SessionRegistry._open_paths`` prevents the same binary from being opened
-  by two instances concurrently (IDA creates working files alongside the IDB).
+* Session path indexes share an already-open binary/IDB unless the caller
+  explicitly confirms a duplicate input.
 * Sessions are always "hot" (backed by a running instance).  Closing a session
   kills its instance.
 * Each session has a reference count tracking how many agents have it open.
@@ -15,6 +15,8 @@ Key invariants
 * ``_context_bindings`` maps MCP transport session IDs to IDA session IDs,
   providing per-agent routing so multiple agents sharing one MCP endpoint
   can work on different IDBs without interfering.
+* Backend allocation is demand-driven and currently has no enforced cap;
+  ``max_instances`` is retained as a compatibility argument.
 """
 
 from __future__ import annotations

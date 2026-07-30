@@ -5,10 +5,11 @@ enabling AI assistants to interact with IDA's disassembler and decompiler.
 
 Architecture:
 - rpc.py: JSON-RPC infrastructure and registry
-- mcp.py: MCP protocol server (HTTP/SSE)
+- zeromcp/: MCP protocol and stdio/HTTP/SSE transports
+- http.py: GUI-local cached-output download handler
 - sync.py: IDA synchronization decorator (@idasync)
 - utils.py: Shared helpers and TypedDict definitions
-- api_*.py: Modular API implementations (71 tools + 24 resources)
+- api_*.py: Modular tool and resource implementations
 """
 
 # Ignore SIGPIPE to prevent IDA from being killed when an MCP client

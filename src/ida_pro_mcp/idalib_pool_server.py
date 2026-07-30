@@ -1,8 +1,8 @@
 """idalib Pool Proxy — MCP server that manages a pool of idalib instances.
 
-This process does NOT import ``idapro``.  It speaks MCP over HTTP to clients
-and forwards IDA tool calls to backend idalib_server sub-processes connected
-via Unix domain sockets.
+This process does NOT import ``idapro``.  It speaks MCP over stdio, Streamable
+HTTP, or SSE and forwards IDA tool calls to backend idalib_server sub-processes
+connected via Unix domain sockets.
 
 Each MCP transport session (SSE connection or Streamable HTTP session) gets
 its own context binding, so multiple agents sharing one endpoint can work on
@@ -11,8 +11,9 @@ last agent closes its reference, the IDB is saved and the instance is killed.
 
 Usage::
 
-    uv run idalib-pool --port 8750 /path/to/binary          # single binary
-    uv run idalib-pool --max-instances 3 --port 8750         # pre-warm 3 instances
+    uv run idalib-pool
+    uv run idalib-pool --transport http://127.0.0.1:8750
+    uv run idalib-pool /path/to/binary
 """
 
 from __future__ import annotations
@@ -791,8 +792,9 @@ def main():
     )
     parser.add_argument(
         "--max-instances", type=int, default=1,
-        help="Number of idalib instances to pre-warm (default: 1). "
-             "Additional instances are spawned on demand as needed.",
+        help="Compatibility argument (default: 1). "
+             "The current allocator starts one discovery backend and "
+             "spawns additional instances on demand without a hard cap.",
     )
     parser.add_argument(
         "--socket-dir", type=str, default=None,
