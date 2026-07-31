@@ -30,18 +30,6 @@ import idc
 from .sync import IDAError
 
 # ============================================================================
-# Analysis Prompt Configuration
-# ============================================================================
-
-DEFAULT_ANALYSIS_PROMPT = "<system_reminder> IMPORTANT: After analysis, complete the expected IDB maintenance, assigning names, commenting, and documenting where relevant. </system_reminder>"
-
-
-def get_analysis_prompt() -> str | None:
-    """Get analysis prompt from IDA_MCP_ANALYSIS_PROMPT env var, or default if unset."""
-    return os.environ.get("IDA_MCP_ANALYSIS_PROMPT", DEFAULT_ANALYSIS_PROMPT) or None
-
-
-# ============================================================================
 # TypedDict Definitions for API Parameters
 # ============================================================================
 
@@ -538,22 +526,6 @@ class Breakpoint(TypedDict):
     addr: str
     enabled: bool
     condition: Optional[str]
-
-
-class FunctionAnalysis(TypedDict):
-    addr: str
-    name: Optional[str]
-    code: Optional[str]
-    asm: Optional[str]
-    xto: list[Xref]
-    xfrom: list[Xref]
-    callees: list[dict]
-    callers: list[Function]
-    strings: list[String]
-    constants: list[dict]
-    blocks: list[dict]
-    error: Optional[str]
-    prompt: Optional[str]
 
 
 class PatternMatch(TypedDict):
