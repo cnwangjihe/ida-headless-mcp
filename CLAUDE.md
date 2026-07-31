@@ -33,9 +33,11 @@ Main components:
   the vendored MCP transport.
 
 Pool routing is explicit `session_id` first, then the caller's MCP transport
-context binding. There is no global default session, LRU eviction, or enforced
-`max_instances` cap. Local sessions are reference-counted; the last close
-saves the IDB and stops its backend. GUI sessions are externally managed.
+context binding. There is no global default session or LRU eviction. Every new
+local session starts a dedicated backend; the last close saves the IDB and
+stops that backend. Tool discovery uses a short-lived backend that is stopped
+immediately, and no idle backends are retained for reuse. GUI sessions are
+externally managed.
 
 Important API modules:
 
@@ -102,9 +104,9 @@ uv run idalib-pool --transport http://127.0.0.1:8750
 uv run idalib-pool --safe
 ```
 
-The first backend is created for tool discovery; further backends are spawned
-on demand. `--max-instances` is currently a compatibility argument, not a
-hard limit or pre-warm count.
+Tool discovery starts a short-lived backend and stops it immediately. Every new
+local session starts a dedicated backend, and no idle backend is retained or
+reused.
 
 ### GUI Plugin
 

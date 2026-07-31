@@ -38,14 +38,17 @@ MCP client ── stdio/HTTP/SSE ───────────┐
                               └─────────┘ └─────────────────┘
 ```
 
-The pool process does not import `idapro`. It discovers the tool schemas from
-one internal backend, then starts a dedicated backend process on demand for
-each locally managed session. An IDA GUI plugin can instead register its
-currently open IDB as an externally managed session.
+The pool process does not import `idapro`. It discovers tool schemas with a
+short-lived internal backend that is stopped immediately after discovery.
+Every newly created local session starts its own dedicated backend process; the
+pool does not keep idle backends for reuse. An IDA GUI plugin can instead
+register its currently open IDB as an externally managed session.
 
 ### Session behavior
 
 - One local session owns one idalib backend process and one active IDB.
+- Creating a local session always starts a new backend. Closing its last
+  reference saves the IDB and terminates that backend.
 - `idalib_open` binds the returned session to the caller's MCP transport
   context. Streamable HTTP sessions and SSE connections therefore keep
   independent default routing; stdio has one context.
@@ -59,10 +62,6 @@ currently open IDB as an externally managed session.
 - Pool-owned session IDs are derived from the file name plus a stable path
   digest; callers must use the ID returned by `idalib_open`.
 - There is no LRU eviction and no global default session.
-
-`--max-instances` remains accepted for CLI and Docker compatibility, but the
-current allocator starts one discovery backend and grows on demand without a
-hard cap. Do not rely on this option as a concurrency limit.
 
 ## Prerequisites
 
@@ -297,7 +296,6 @@ docker run --rm \
 | Variable | Default | Description |
 |---|---|---|
 | `TRANSPORT` | `http://0.0.0.0:8745` | Pool listener URL. |
-| `MAX_INSTANCES` | `10` | Compatibility value passed to `--max-instances`; it is not currently a hard cap. |
 | `IDA_MCP_AUTH_TOKEN` | unset | Bearer token read by `idalib-pool`; strongly recommended for Docker. |
 
 Connect to `http://<host>:8745/mcp`. Ensure the mounted directory is writable

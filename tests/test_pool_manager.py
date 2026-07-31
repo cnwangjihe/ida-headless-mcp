@@ -361,7 +361,7 @@ class TestPoolServerDispatch(unittest.TestCase):
         pool = MagicMock(spec=PoolManager)
         pool._lock = threading.Lock()
         pool.sr = SessionRegistry()
-        pool.forward_tools_list.return_value = [
+        pool.discover_tools.return_value = [
             {"name": "get_functions", "inputSchema": {"type": "object", "properties": {}}},
         ]
         pool.get_context_session_id.side_effect = lambda ctx: pool.sr.get_context_session_id(ctx)
@@ -1255,7 +1255,7 @@ class TestPoolServerDispatch(unittest.TestCase):
     def test_tools_list_overrides_management_schemas(self):
         """Management tools should have pool-specific descriptions."""
         mcp, pool = self._make_mcp_and_pool()
-        pool.forward_tools_list.return_value = [
+        pool.discover_tools.return_value = [
             {"name": "idalib_open", "description": "old backend desc",
              "inputSchema": {"type": "object", "properties": {}}},
             {"name": "idalib_close", "description": "old backend desc",
@@ -1282,7 +1282,7 @@ class TestPoolServerDispatch(unittest.TestCase):
     def test_tools_list_always_exposes_management_tools(self):
         """GUI plugin tool lists do not contain idalib_*; pool must still expose them."""
         mcp, pool = self._make_mcp_and_pool()
-        pool.forward_tools_list.return_value = [
+        pool.discover_tools.return_value = [
             {"name": "server_health", "inputSchema": {"type": "object", "properties": {}}},
             {"name": "list_funcs", "inputSchema": {"type": "object", "properties": {}}},
         ]
@@ -1296,6 +1296,16 @@ class TestPoolServerDispatch(unittest.TestCase):
         self.assertIn("idalib_warmup", tool_names)
         self.assertIn("idalib_current", tool_names)
         self.assertIn("server_health", tool_names)
+
+    def test_tools_list_discovers_backend_schemas_once(self):
+        mcp, pool = self._make_mcp_and_pool()
+        self.build_dispatch(mcp, pool)
+        request = {"jsonrpc": "2.0", "method": "tools/list", "id": 1}
+
+        mcp.registry.dispatch(request)
+        mcp.registry.dispatch(request)
+
+        pool.discover_tools.assert_called_once_with()
 
     # --- dispatch protocol pass-through ---
 
@@ -1397,7 +1407,7 @@ class TestPoolServerDispatch(unittest.TestCase):
 
     def test_removed_unbind_tool_is_absent_from_list(self):
         mcp, pool = self._make_mcp_and_pool()
-        pool.forward_tools_list.return_value = [
+        pool.discover_tools.return_value = [
             {"name": "get_functions", "inputSchema": {"type": "object", "properties": {}}},
         ]
         self.build_dispatch(mcp, pool)
@@ -1421,12 +1431,42 @@ class TestPoolServerDispatch(unittest.TestCase):
 class TestPoolManager(unittest.TestCase):
 
     def _make_pool(self):
-        pool = PoolManager(max_instances=2, socket_dir="/tmp/fake-pool")
+        pool = PoolManager(socket_dir="/tmp/fake-pool")
         pool.im = MagicMock(spec=InstanceManager)
         pool.im.instances = []
         pool.im.snapshot.side_effect = lambda: list(pool.im.instances)
         pool.im.contains.side_effect = lambda inst: inst in pool.im.instances
         return pool
+
+    def test_discover_tools_uses_short_lived_instance(self):
+        pool = self._make_pool()
+        process = MagicMock()
+        process.poll.return_value = None
+        inst = InstanceInfo(0, "/tmp/0.sock", process)
+        tools = [{"name": "list_funcs", "inputSchema": {"type": "object"}}]
+        pool.im.spawn.return_value = inst
+        pool.im.forward_tools_list.return_value = tools
+
+        self.assertEqual(pool.discover_tools(), tools)
+
+        pool.im.spawn.assert_called_once_with()
+        pool.im.forward_tools_list.assert_called_once_with(inst)
+        pool.im.kill.assert_called_once_with(inst)
+        self.assertTrue(inst.closing)
+
+    def test_discover_tools_stops_instance_on_error(self):
+        pool = self._make_pool()
+        process = MagicMock()
+        process.poll.return_value = None
+        inst = InstanceInfo(0, "/tmp/0.sock", process)
+        pool.im.spawn.return_value = inst
+        pool.im.forward_tools_list.side_effect = RuntimeError("discovery failed")
+
+        with self.assertRaisesRegex(RuntimeError, "discovery failed"):
+            pool.discover_tools()
+
+        pool.im.kill.assert_called_once_with(inst)
+        self.assertTrue(inst.closing)
 
     def test_close_session_not_found(self):
         pool = self._make_pool()
@@ -1597,7 +1637,7 @@ class TestPoolManager(unittest.TestCase):
         mock_inst = MagicMock()
         mock_inst.index = 0
         mock_inst.session_id = None
-        pool.im.find_idle.return_value = mock_inst
+        pool.im.spawn.return_value = mock_inst
         pool.im.forward_tool_call.return_value = {"success": True}
 
         r1 = pool.open_session("/tmp/a.elf")
@@ -1610,6 +1650,7 @@ class TestPoolManager(unittest.TestCase):
         self.assertTrue(r2["success"])
         self.assertTrue(r2["existing"])
         self.assertEqual(r2["session"]["session_id"], sid)
+        pool.im.spawn.assert_called_once_with()
 
     def test_open_session_generates_new_id_for_different_path(self):
         pool = self._make_pool()
@@ -1620,7 +1661,7 @@ class TestPoolManager(unittest.TestCase):
         inst2 = MagicMock()
         inst2.index = 1
         inst2.session_id = None
-        pool.im.find_idle.side_effect = [inst1, inst2]
+        pool.im.spawn.side_effect = [inst1, inst2]
         pool.im.forward_tool_call.return_value = {"success": True}
 
         r1 = pool.open_session("/tmp/dp.i64")
@@ -1631,6 +1672,7 @@ class TestPoolManager(unittest.TestCase):
         self.assertNotEqual(r1["session"]["session_id"], r2["session"]["session_id"])
         self.assertRegex(r1["session"]["session_id"], r"^dp_[0-9a-f]{6}$")
         self.assertRegex(r2["session"]["session_id"], r"^dp_[0-9a-f]{6}$")
+        self.assertEqual(pool.im.spawn.call_count, 2)
 
     def test_open_session_retries_after_backend_connection_refused(self):
         pool = self._make_pool()
@@ -1641,7 +1683,7 @@ class TestPoolManager(unittest.TestCase):
         inst2 = MagicMock()
         inst2.index = 1
         inst2.session_id = None
-        pool.im.find_idle.side_effect = [inst1, inst2]
+        pool.im.spawn.side_effect = [inst1, inst2]
         pool.im.forward_tool_call.side_effect = [
             ConnectionRefusedError("refused"),
             {"success": True},
@@ -1653,6 +1695,38 @@ class TestPoolManager(unittest.TestCase):
         pool.im.discard.assert_called_once_with(inst1)
         pool.im.kill.assert_not_called()
         self.assertEqual(pool.im.forward_tool_call.call_count, 2)
+
+    def test_open_session_error_terminates_new_instance(self):
+        pool = self._make_pool()
+        process = MagicMock()
+        process.poll.return_value = None
+        inst = InstanceInfo(0, "/tmp/0.sock", process)
+        pool.im.spawn.return_value = inst
+        pool.im.forward_tool_call.return_value = {"error": "open failed"}
+
+        result = pool.open_session("/tmp/a.elf")
+
+        self.assertEqual(result, {"error": "open failed"})
+        pool.im.kill.assert_called_once_with(inst)
+        self.assertTrue(inst.closing)
+
+    def test_open_registration_error_terminates_new_instance(self):
+        pool = self._make_pool()
+        process = MagicMock()
+        process.poll.return_value = None
+        inst = InstanceInfo(0, "/tmp/0.sock", process)
+        pool.im.instances = [inst]
+        pool.im.spawn.return_value = inst
+        pool.im.forward_tool_call.return_value = {"success": True}
+
+        with patch.object(
+            pool.sr, "create", side_effect=RuntimeError("registration failed")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "registration failed"):
+                pool.open_session("/tmp/a.elf")
+
+        pool.im.kill.assert_called_once_with(inst)
+        self.assertTrue(inst.closing)
 
 
 class TestPoolManagerConcurrency(unittest.TestCase):
@@ -1666,20 +1740,20 @@ class TestPoolManagerConcurrency(unittest.TestCase):
             session_id=session_id,
         )
 
-    def test_concurrent_opens_reserve_different_instances(self):
-        pool = PoolManager(max_instances=2, socket_dir="/tmp/fake-pool")
+    def test_concurrent_opens_spawn_dedicated_instances(self):
+        pool = PoolManager(socket_dir="/tmp/fake-pool")
         first = self._live_instance(0)
         second = self._live_instance(1)
-        pool.im.instances = [first]
 
         first_started = threading.Event()
         release_first = threading.Event()
         calls = []
+        instances = iter((first, second))
 
-        def spawn(*, reserved=False):
-            second.reserved = reserved
-            pool.im.instances.append(second)
-            return second
+        def spawn():
+            inst = next(instances)
+            pool.im.instances.append(inst)
+            return inst
 
         def forward(inst, tool_name, arguments):
             calls.append((inst.index, arguments["input_path"]))
@@ -1716,11 +1790,14 @@ class TestPoolManagerConcurrency(unittest.TestCase):
         self.assertTrue(results["a"]["success"])
         self.assertTrue(results["b"]["success"])
         self.assertEqual(set(calls), {(0, "/tmp/a.elf"), (1, "/tmp/b.elf")})
+        self.assertEqual(pool.im.spawn.call_count, 2)
 
     def test_concurrent_open_of_same_path_reuses_completed_session(self):
-        pool = PoolManager(max_instances=1, socket_dir="/tmp/fake-pool")
+        pool = PoolManager(socket_dir="/tmp/fake-pool")
         inst = self._live_instance(0)
-        pool.im.instances = [inst]
+        pool.im.spawn = MagicMock(side_effect=lambda: (
+            pool.im.instances.append(inst) or inst
+        ))
         first_started = threading.Event()
         release_first = threading.Event()
 
@@ -1759,9 +1836,10 @@ class TestPoolManagerConcurrency(unittest.TestCase):
             results["second"]["session"]["session_id"],
         )
         pool.im.forward_tool_call.assert_called_once()
+        pool.im.spawn.assert_called_once_with()
 
     def test_concurrent_close_only_closes_instance_once(self):
-        pool = PoolManager(max_instances=1, socket_dir="/tmp/fake-pool")
+        pool = PoolManager(socket_dir="/tmp/fake-pool")
         inst = self._live_instance(0, "s1")
         pool.im.instances = [inst]
         pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", 0)
@@ -1795,7 +1873,7 @@ class TestPoolManagerConcurrency(unittest.TestCase):
         pool.im.kill.assert_called_once_with(inst)
 
     def test_shutdown_rejects_new_operations_and_waits_for_inflight(self):
-        pool = PoolManager(max_instances=1, socket_dir="/tmp/fake-pool")
+        pool = PoolManager(socket_dir="/tmp/fake-pool")
         inst = self._live_instance(0)
         pool.im.instances = [inst]
 
@@ -1837,12 +1915,13 @@ class TestPoolManagerConcurrency(unittest.TestCase):
         self.assertEqual(pool._state, pool._STOPPED)
 
     def test_conflict_rollback_does_not_hold_pool_lock(self):
-        pool = PoolManager(max_instances=1, socket_dir="/tmp/fake-pool")
+        pool = PoolManager(socket_dir="/tmp/fake-pool")
         pool.sr.create(
             "existing", "/tmp/canonical.elf", "/tmp/canonical.elf.i64", 99
         )
         inst = self._live_instance(0)
         pool.im.instances = [inst]
+        pool.im.spawn = MagicMock(return_value=inst)
 
         rollback_started = threading.Event()
         release_rollback = threading.Event()
@@ -1924,7 +2003,7 @@ class TestMultiAgentScenario(unittest.TestCase):
         pool = MagicMock(spec=PoolManager)
         pool._lock = threading.Lock()
         pool.sr = SessionRegistry()
-        pool.forward_tools_list.return_value = [
+        pool.discover_tools.return_value = [
             {"name": "get_functions", "inputSchema": {"type": "object", "properties": {}}},
         ]
         pool.get_context_session_id.side_effect = lambda ctx: pool.sr.get_context_session_id(ctx)
@@ -2013,7 +2092,7 @@ class TestExternalRegistration(unittest.TestCase):
     """Tests for external IDA plugin registration via WebSocket bridge."""
 
     def _make_pool(self):
-        return PoolManager(max_instances=2, socket_dir="/tmp/fake-pool")
+        return PoolManager(socket_dir="/tmp/fake-pool")
 
     def test_register_external_creates_session(self):
         pool = self._make_pool()
@@ -2173,6 +2252,27 @@ class TestInstanceManager(unittest.TestCase):
 
         self.assertIs(inst.process, proc)
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+    def test_spawn_readiness_failure_stops_backend(self):
+        with tempfile.TemporaryDirectory() as socket_dir:
+            im = InstanceManager(socket_dir)
+            proc = MagicMock()
+            proc.poll.return_value = None
+            with patch(
+                "ida_pro_mcp.idalib_pool_manager.subprocess.Popen",
+                return_value=proc,
+            ):
+                with patch.object(
+                    InstanceManager,
+                    "_wait_for_ready",
+                    side_effect=RuntimeError("not ready"),
+                ):
+                    with patch.object(im, "kill", wraps=im.kill) as kill:
+                        with self.assertRaisesRegex(RuntimeError, "not ready"):
+                            im.spawn()
+
+        kill.assert_called_once()
+        self.assertEqual(im.instances, [])
 
 
 if __name__ == "__main__":

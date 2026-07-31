@@ -38,13 +38,16 @@ MCP Client ── stdio/HTTP/SSE ───────────┐
                               └─────────┘ └─────────────────┘
 ```
 
-Pool 主进程不会导入 `idapro`。它先从一个内部 backend 发现工具 schema，
-之后为每个本地会话按需启动独立 backend。IDA GUI Plugin 也可以把当前打开的
-IDB 注册成由 GUI 外部管理的会话。
+Pool 主进程不会导入 `idapro`。它使用一次性内部 backend 发现工具 schema，
+发现完成后立即终止该 backend。每个新建的本地会话都会启动自己的独立
+backend，Pool 不会保留空闲 backend 供后续复用。IDA GUI Plugin 也可以把当前
+打开的 IDB 注册成由 GUI 外部管理的会话。
 
 ### 会话行为
 
 - 一个本地会话独占一个 idalib backend 进程和一个活动 IDB。
+- 创建本地会话时总会启动新的 backend；最后一个引用关闭时先保存 IDB，再终止
+  对应 backend。
 - `idalib_open` 会把返回的会话绑定到调用方的 MCP transport context。
   Streamable HTTP session 和 SSE connection 因此拥有独立的默认路由；stdio
   只有一个 context。
@@ -58,10 +61,6 @@ IDB 注册成由 GUI 外部管理的会话。
 - Pool 根据文件名和路径摘要生成 session ID；后续调用必须使用
   `idalib_open` 实际返回的 ID。
 - 当前没有 LRU 淘汰，也没有全局默认会话。
-
-CLI 和 Docker 为兼容旧部署仍接受 `--max-instances`，但当前 allocator 只在
-启动时创建一个工具发现 backend，其他 backend 均按需创建且没有硬上限。
-不要把该参数当作并发限制。
 
 ## 前置条件
 
@@ -289,7 +288,6 @@ docker run --rm \
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
 | `TRANSPORT` | `http://0.0.0.0:8745` | Pool listener URL。 |
-| `MAX_INSTANCES` | `10` | 传给 `--max-instances` 的兼容值；当前不是硬上限。 |
 | `IDA_MCP_AUTH_TOKEN` | 未设置 | `idalib-pool` 读取的 Bearer Token；Docker 部署强烈建议设置。 |
 
 Client 连接 `http://<host>:8745/mcp`。如果 IDA 需要在输入文件旁创建或更新

@@ -108,7 +108,6 @@ class TestPoolIntegration(unittest.TestCase):
         cmd = [
             sys.executable, "-m", "ida_pro_mcp.idalib_pool_server",
             "--transport", f"http://127.0.0.1:{cls.port}",
-            "--max-instances", "1",
             "--socket-dir", cls.socket_dir,
         ]
         env = {**os.environ, "IDADIR": IDADIR}

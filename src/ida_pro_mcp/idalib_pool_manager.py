@@ -8,15 +8,15 @@ Key invariants
 --------------
 * Session path indexes share an already-open binary/IDB unless the caller
   explicitly confirms a duplicate input.
-* Sessions are always "hot" (backed by a running instance).  Closing a session
-  kills its instance.
+* Sessions are always "hot" (backed by a dedicated running instance). Opening
+  a new session starts a new instance; closing the session kills it.
 * Each session has a reference count tracking how many agents have it open.
   When the refcount reaches zero the session is closed automatically.
 * ``_context_bindings`` maps MCP transport session IDs to IDA session IDs,
   providing per-agent routing so multiple agents sharing one MCP endpoint
   can work on different IDBs without interfering.
-* Backend allocation is demand-driven and currently has no enforced cap;
-  ``max_instances`` is retained as a compatibility argument.
+* Tool discovery uses a short-lived instance that is terminated immediately
+  after its schemas have been read.
 """
 
 from __future__ import annotations
@@ -112,9 +112,8 @@ class InstanceInfo:
     index: int
     socket_path: str
     process: subprocess.Popen | None
-    session_id: str | None = None  # None = idle
+    session_id: str | None = None
     ws_bridge: Any | None = None  # ExternalInstanceBridge for external instances
-    reserved: bool = False
     closing: bool = False
     operation_lock: threading.RLock = field(
         default_factory=threading.RLock, repr=False
@@ -148,7 +147,7 @@ class InstanceManager:
         self._next_index = 0
         self._lock = threading.RLock()
 
-    def spawn(self, *, reserved: bool = False) -> InstanceInfo:
+    def spawn(self) -> InstanceInfo:
         with self._lock:
             idx = self._next_index
             self._next_index += 1
@@ -161,23 +160,33 @@ class InstanceManager:
         ]
         logger.info("Spawning instance %d: %s (log: %s)", idx, " ".join(cmd), log_path)
         log_file = open(log_path, "w")
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except Exception:
+            log_file.close()
+            raise
         inst = InstanceInfo(
             index=idx,
             socket_path=sock_path,
             process=proc,
-            reserved=reserved,
         )
         inst._log_file = log_file  # type: ignore[attr-defined]
         with self._lock:
             self.instances.append(inst)
-        self._wait_for_ready(inst)
+        try:
+            self._wait_for_ready(inst)
+        except Exception:
+            if inst.is_alive():
+                self.kill(inst)
+            else:
+                self.discard(inst)
+            raise
         return inst
 
     def register_external(self, ws_bridge) -> InstanceInfo:
@@ -258,18 +267,6 @@ class InstanceManager:
         with self._lock:
             return inst in self.instances
 
-    def find_idle(self) -> InstanceInfo | None:
-        with self._lock:
-            instances = list(self.instances)
-        for inst in instances:
-            if inst.session_id is None and not inst.reserved and not inst.closing:
-                if not inst.is_alive():
-                    logger.info("Discarding dead idle instance %d", inst.index)
-                    self.discard(inst)
-                    continue
-                return inst
-        return None
-
     def _wait_for_ready(self, inst: InstanceInfo, timeout: float = 120) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -336,11 +333,7 @@ class InstanceManager:
         finally:
             conn.close()
 
-    def forward_tools_list(self, inst: InstanceInfo | None = None) -> list[dict]:
-        candidates = [i for i in self.instances if i.is_alive()]
-        if not candidates:
-            return []
-        inst = inst or candidates[0]
+    def forward_tools_list(self, inst: InstanceInfo) -> list[dict]:
         request = {"jsonrpc": "2.0", "method": "tools/list", "id": 1}
         resp = self.forward_raw(inst, request)
         return resp.get("result", {}).get("tools", [])
@@ -516,11 +509,9 @@ class PoolManager:
 
     def __init__(
         self,
-        max_instances: int = 1,
         socket_dir: str | None = None,
         idalib_args: list[str] | None = None,
     ):
-        self.max_instances = max_instances
         socket_dir = socket_dir or tempfile.mkdtemp(prefix="idalib-pool-")
         os.makedirs(socket_dir, exist_ok=True)
 
@@ -558,9 +549,29 @@ class PoolManager:
     # High-level operations
     # ------------------------------------------------------------------
 
-    def spawn_instance(self) -> InstanceInfo:
+    def discover_tools(self) -> list[dict]:
+        """Discover tool schemas using a short-lived backend instance."""
         with self._operation():
-            return self.im.spawn()
+            inst = self.im.spawn()
+            try:
+                with inst.operation_lock:
+                    return self.im.forward_tools_list(inst)
+            finally:
+                inst.closing = True
+                if inst.is_alive():
+                    self.im.kill(inst)
+                else:
+                    self.im.discard(inst)
+
+    def _terminate_unattached_instance(self, inst: InstanceInfo) -> None:
+        """Stop a backend that failed before it became a registered session."""
+        if inst.session_id is not None:
+            return
+        inst.closing = True
+        if inst.is_alive():
+            self.im.kill(inst)
+        else:
+            self.im.discard(inst)
 
     def shutdown_all(self) -> None:
         with self._condition:
@@ -714,12 +725,11 @@ class PoolManager:
                 )
                 break
 
+        inst: InstanceInfo | None = None
         try:
             last_error: Exception | None = None
-            inst: InstanceInfo | None = None
             for attempt in range(2):
-                with self._lock:
-                    inst = self._allocate_instance_locked()
+                inst = self.im.spawn()
                 try:
                     with inst.operation_lock:
                         resp = self.im.forward_tool_call(inst, "idalib_open", {
@@ -734,19 +744,7 @@ class PoolManager:
                         "Backend instance %d unavailable while opening %s: %s",
                         inst.index, resolved, e,
                     )
-                    should_remove = False
-                    is_alive = False
-                    with self._lock:
-                        if inst.session_id is None:
-                            inst.reserved = False
-                            inst.closing = True
-                            should_remove = True
-                            is_alive = inst.is_alive()
-                    if should_remove:
-                        if is_alive:
-                            self.im.kill(inst)
-                        else:
-                            self.im.discard(inst)
+                    self._terminate_unattached_instance(inst)
                     if attempt == 0:
                         continue
                     return {
@@ -766,8 +764,7 @@ class PoolManager:
                 }
 
             if isinstance(resp, dict) and resp.get("error"):
-                with self._lock:
-                    inst.reserved = False
+                self._terminate_unattached_instance(inst)
                 return resp
 
             backend_session = (
@@ -787,14 +784,12 @@ class PoolManager:
                 existing_for_input = self.sr.find_by_input_path(canonical_input)
                 if existing_for_input and not allow_duplicate_input:
                     conflict_sid = existing_for_input[0]
-                    inst.reserved = False
                     inst.closing = True
                 else:
                     sess = self.sr.create(
                         session_id, canonical_input, idb_path, inst.index
                     )
                     inst.session_id = session_id
-                    inst.reserved = False
 
             if conflict_sid is not None:
                 try:
@@ -825,6 +820,12 @@ class PoolManager:
                 "message": f"Session created: {session_id}",
             }
         finally:
+            if (
+                inst is not None
+                and inst.session_id is None
+                and self.im.contains(inst)
+            ):
+                self._terminate_unattached_instance(inst)
             with self._condition:
                 self._reserved_session_ids.discard(session_id)
                 remaining = self._opening_inputs.get(resolved, 0) - 1
@@ -874,7 +875,6 @@ class PoolManager:
         with self._lock:
             self.sr.remove(session_id)
             inst.session_id = None
-            inst.reserved = False
 
         self.im.kill(inst)
 
@@ -1089,19 +1089,6 @@ class PoolManager:
                 self._ensure_instance_forwardable(inst)
                 return self.im.forward_raw(inst, request)
 
-    def forward_tools_list(self) -> list[dict]:
-        with self._operation():
-            candidates = [
-                inst for inst in self.im.snapshot()
-                if inst.is_alive() and not inst.closing
-            ]
-            if not candidates:
-                return []
-            inst = candidates[0]
-            with inst.operation_lock:
-                self._ensure_instance_forwardable(inst)
-                return self.im.forward_tools_list(inst)
-
     def _ensure_instance_forwardable(self, inst: InstanceInfo) -> None:
         with self._lock:
             if inst.closing:
@@ -1110,20 +1097,3 @@ class PoolManager:
                 raise RuntimeError(f"Instance {inst.index} is no longer registered")
         if not inst.is_alive():
             raise RuntimeError(f"Instance {inst.index} is not running")
-
-    # ------------------------------------------------------------------
-    # Instance allocation (internal, caller holds _lock)
-    # ------------------------------------------------------------------
-
-    def _allocate_instance_locked(self) -> InstanceInfo:
-        inst = self.im.find_idle()
-        if inst is not None:
-            inst.reserved = True
-            return inst
-        self._lock.release()
-        try:
-            inst = self.im.spawn(reserved=True)
-            inst.reserved = True
-            return inst
-        finally:
-            self._lock.acquire()

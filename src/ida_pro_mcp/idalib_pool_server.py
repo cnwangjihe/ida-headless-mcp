@@ -482,14 +482,17 @@ def build_dispatch(
 
     dispatch_original = mcp.registry.dispatch
     _tools_cache: list[dict] | None = None
+    _tools_cache_lock = threading.Lock()
     _active_forwards_lock = threading.Lock()
     _active_forwards: dict[tuple[str | None, int | str], tuple[Any, object]] = {}
 
     def _ensure_tools_cache() -> list[dict]:
         nonlocal _tools_cache
         if _tools_cache is None:
-            raw = pool.forward_tools_list()
-            _tools_cache = _prepare_tools(raw)
+            with _tools_cache_lock:
+                if _tools_cache is None:
+                    raw = pool.discover_tools()
+                    _tools_cache = _prepare_tools(raw)
         return _tools_cache
 
     def _get_transport_ctx() -> str | None:
@@ -983,12 +986,6 @@ def main():
         help="Transport: 'stdio' (default) or a URL (e.g. http://127.0.0.1:8750)",
     )
     parser.add_argument(
-        "--max-instances", type=int, default=1,
-        help="Compatibility argument (default: 1). "
-             "The current allocator starts one discovery backend and "
-             "spawns additional instances on demand without a hard cap.",
-    )
-    parser.add_argument(
         "--socket-dir", type=str, default=None,
         help="Directory for instance Unix sockets (default: auto temp dir)",
     )
@@ -1021,7 +1018,6 @@ def main():
         idalib_args.append("--safe")
 
     pool = PoolManager(
-        max_instances=args.max_instances,
         socket_dir=args.socket_dir,
         idalib_args=idalib_args,
     )
@@ -1044,9 +1040,6 @@ def main():
     signal.signal(signal.SIGTERM, request_shutdown)
 
     try:
-        logger.info("Spawning initial instance for tool discovery...")
-        pool.spawn_instance()
-
         build_dispatch(mcp, pool, output_cache=output_cache)
 
         if args.input_path is not None:

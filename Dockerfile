@@ -1,7 +1,6 @@
 FROM ida-pro:latest
 
 ENV TRANSPORT="http://0.0.0.0:8745"
-ENV MAX_INSTANCES=10
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install dependencies
@@ -25,4 +24,4 @@ RUN uv sync
 
 EXPOSE 8745
 
-ENTRYPOINT ["sh", "-c", "exec uv run idalib-pool --transport $TRANSPORT --max-instances $MAX_INSTANCES"]
+ENTRYPOINT ["sh", "-c", "exec uv run idalib-pool --transport $TRANSPORT"]
