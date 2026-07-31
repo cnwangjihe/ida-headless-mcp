@@ -430,12 +430,6 @@ class SessionRegistry:
         # Fall back to earliest by created_at
         return min(session_ids, key=lambda sid: self.sessions[sid].created_at)
 
-    def generate_id(self) -> str:
-        while True:
-            candidate = f"session_{secrets.token_hex(3)}"
-            if candidate not in self.sessions:
-                return candidate
-
     def generate_id_for_path(self, display_path: str, identity_path: str) -> str:
         base = _session_base_name(display_path)
         digest = hashlib.sha256(identity_path.encode("utf-8")).hexdigest()[:6]

@@ -178,10 +178,6 @@ class TestSessionRegistryEdgeCases(unittest.TestCase):
     def test_touch_nonexistent_is_noop(self):
         self.sr.touch("nope")
 
-    def test_generate_id_is_unique(self):
-        ids = {self.sr.generate_id() for _ in range(100)}
-        self.assertEqual(len(ids), 100)
-
     def test_generate_id_for_path_uses_name_and_hash(self):
         sid = self.sr.generate_id_for_path("/tmp/dp.i64", "/tmp/dp.i64")
         self.assertRegex(sid, r"^dp_[0-9a-f]{6}$")
