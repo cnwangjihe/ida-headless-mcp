@@ -94,28 +94,6 @@ def _insn_mnem(insn: ida_ua.insn_t) -> str:
         return ""
 
 
-def _value_to_le_bytes(value: int) -> tuple[bytes, int, int] | None:
-    if value < 0:
-        if value >= -0x80000000:
-            size = 4
-            value &= 0xFFFFFFFF
-        elif value >= -0x8000000000000000:
-            size = 8
-            value &= 0xFFFFFFFFFFFFFFFF
-        else:
-            return None
-    else:
-        if value <= 0xFFFFFFFF:
-            size = 4
-        elif value <= 0xFFFFFFFFFFFFFFFF:
-            size = 8
-        else:
-            return None
-
-    fmt = "<I" if size == 4 else "<Q"
-    return struct.pack(fmt, value), size, value
-
-
 def _value_candidates_for_immediate(value: int) -> list[tuple[int, int, bytes]]:
     candidates: list[tuple[int, int, bytes]] = []
 
