@@ -23,21 +23,6 @@ class PoolServerLifecycleTests(unittest.TestCase):
         mcp.stdio.assert_called_once_with()
         pool.shutdown_all.assert_called_once_with()
 
-    @patch.object(idalib_pool_server.signal, "signal")
-    @patch.object(idalib_pool_server, "McpServer")
-    @patch.object(idalib_pool_server, "PoolManager")
-    def test_startup_validation_failure_still_shuts_down_pool(
-        self, pool_cls, mcp_cls, signal_mock
-    ):
-        pool = pool_cls.return_value
-
-        with patch.object(sys, "argv", ["idalib-pool", "/missing/input.bin"]):
-            with self.assertRaises(SystemExit):
-                idalib_pool_server.main()
-
-        pool.shutdown_all.assert_called_once_with()
-
-
 class IdalibServerLifecycleTests(unittest.TestCase):
     def setUp(self):
         self.old_session_id = idalib_server._current_session_id

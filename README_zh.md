@@ -117,15 +117,8 @@ uv run idalib-pool --socket-dir /tmp/ida-mcp-sockets
 
 环境变量 `IDA_MCP_AUTH_TOKEN` 与 `--auth-token` 等效。
 
-也可以通过位置参数在启动时打开一个 binary：
-
-```sh
-uv run idalib-pool /path/to/binary
-```
-
-启动阶段还没有 MCP transport context，因此该会话不会自动绑定到后续 Client。
-Client 仍应对相同路径调用一次 `idalib_open`，或者先 `idalib_list` 再
-`idalib_switch`，建立自己的 context 绑定。
+请在 MCP Client 连接后通过 `idalib_open` 打开 binary 或 IDB。这样每个新建
+session 都会立即拥有对应的引用和 transport context。
 
 ### 大结果下载
 

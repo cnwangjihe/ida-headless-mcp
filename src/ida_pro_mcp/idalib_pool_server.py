@@ -13,7 +13,6 @@ Usage::
 
     uv run idalib-pool
     uv run idalib-pool --transport http://127.0.0.1:8750
-    uv run idalib-pool /path/to/binary
 """
 
 from __future__ import annotations
@@ -29,7 +28,6 @@ import signal
 import sys
 import threading
 import time
-from pathlib import Path
 from typing import Any
 
 # Import zeromcp directly from the vendored package path without triggering
@@ -1002,10 +1000,6 @@ def main():
         default=os.environ.get("IDA_MCP_AUTH_TOKEN"),
         help="Bearer token for HTTP authentication (or set IDA_MCP_AUTH_TOKEN)",
     )
-    parser.add_argument(
-        "input_path", type=Path, nargs="?",
-        help="Optional binary to open on startup.",
-    )
     args = parser.parse_args()
 
     log_level = logging.DEBUG if args.verbose else logging.INFO
@@ -1041,22 +1035,6 @@ def main():
 
     try:
         build_dispatch(mcp, pool, output_cache=output_cache)
-
-        if args.input_path is not None:
-            if not args.input_path.exists():
-                print(f"Error: Input file not found: {args.input_path}", file=sys.stderr)
-                sys.exit(1)
-            logger.info("Opening initial binary: %s", args.input_path)
-            result = pool.open_session(str(args.input_path))
-            if isinstance(result, dict) and result.get("error"):
-                print(f"Error opening binary: {result['error']}", file=sys.stderr)
-                sys.exit(1)
-            sid = result.get("session", {}).get("session_id")
-            logger.info(
-                "Initial session: %s "
-                "(no context binding — use idalib_open from a client)",
-                sid,
-            )
 
         transport = args.transport
         if transport == "stdio":

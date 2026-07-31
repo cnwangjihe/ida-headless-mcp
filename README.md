@@ -119,15 +119,9 @@ uv run idalib-pool --socket-dir /tmp/ida-mcp-sockets
 
 `IDA_MCP_AUTH_TOKEN` is equivalent to `--auth-token`.
 
-An optional positional binary may be opened during startup:
-
-```sh
-uv run idalib-pool /path/to/binary
-```
-
-Startup opening creates the session before an MCP transport context exists.
-The client should still call `idalib_open` for that path, or use
-`idalib_list` followed by `idalib_switch`, to establish its own binding.
+Open binaries and IDBs through `idalib_open` after the MCP client connects.
+This ensures every created session has an owning reference and transport
+context.
 
 ### Large tool results
 
