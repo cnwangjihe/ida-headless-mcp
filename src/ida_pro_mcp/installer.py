@@ -452,10 +452,6 @@ def _install_link_or_copy(source: str, destination: str) -> bool:
     return True
 
 
-def is_ida_plugin_installed() -> bool:
-    return os.path.lexists(os.path.join(_get_ida_user_dir(), "plugins", "ida_mcp.py"))
-
-
 def install_ida_plugin(
     *, uninstall: bool = False, quiet: bool = False, allow_ida_free: bool = False
 ):
