@@ -148,31 +148,6 @@ def idalib_warmup(
         return {"ready": False, "error": str(e)}
 
 
-# These tools exist so the pool can discover them via tools/list,
-# but the pool proxy intercepts them and never forwards them.
-
-@tool
-def idalib_switch(
-    session_id: Annotated[str, "Session ID"],
-) -> dict:
-    """Switch session (handled by pool proxy)."""
-    return {"error": "idalib_switch is handled by the pool proxy, not the backend."}
-
-
-@tool
-def idalib_list() -> dict:
-    """List sessions (handled by pool proxy)."""
-    return {"sessions": [_session_dict()] if _current_session_id else [], "count": 1 if _current_session_id else 0}
-
-
-@tool
-def idalib_current() -> dict:
-    """Return current session info."""
-    if _current_session_id is None:
-        return {"error": "No session open."}
-    return _session_dict()
-
-
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
