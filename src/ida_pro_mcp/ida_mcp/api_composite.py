@@ -68,16 +68,16 @@ def _basic_block_info(ea: int) -> dict:
 
 def _filter_constants(raw: list[dict], limit: int = _TOP_CONSTANTS) -> list[dict]:
     """Drop boring constants, return top N by absolute value."""
-    out = []
+    scored: list[tuple[int, dict]] = []
     for c in raw:
-        val = c.get("value", 0)
+        val = c.get("decimal", c.get("value"))
         if not isinstance(val, int):
             continue
         if abs(val) < 0x100 or val in _BORING_CONSTANTS:
             continue
-        out.append(c)
-    out.sort(key=lambda c: abs(c.get("value", 0)) if isinstance(c.get("value"), int) else 0, reverse=True)
-    return out[:limit]
+        scored.append((abs(val), c))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [c for _score, c in scored[:limit]]
 
 
 def _cap_decompile(code: str | None) -> tuple[str | None, int | None]:
