@@ -2101,7 +2101,7 @@ class TestExternalRegistration(unittest.TestCase):
         bridge.alive = True
 
         result = pool.register_external(
-            bridge, "/tmp/a.elf", "/tmp/a.elf.i64", session_id="ext1",
+            bridge, "/tmp/a.elf", "/tmp/a.elf.i64",
         )
         self.assertTrue(result["success"])
         self.assertRegex(result["session"]["session_id"], r"^a\.elf_[0-9a-f]{6}$")
@@ -2114,7 +2114,7 @@ class TestExternalRegistration(unittest.TestCase):
 
         bridge = MagicMock()
         result = pool.register_external(
-            bridge, "/tmp/a.elf", "/tmp/a.elf.i64", session_id="ext1",
+            bridge, "/tmp/a.elf", "/tmp/a.elf.i64",
         )
         self.assertFalse(result["success"])
         self.assertIn("already open", result["error"])
@@ -2125,7 +2125,7 @@ class TestExternalRegistration(unittest.TestCase):
 
         bridge = MagicMock()
         result = pool.register_external(
-            bridge, "/tmp/a.elf", "/tmp/other.i64", session_id="ext1",
+            bridge, "/tmp/a.elf", "/tmp/other.i64",
         )
         self.assertFalse(result["success"])
         self.assertTrue(result.get("needs_confirm"))
@@ -2137,7 +2137,7 @@ class TestExternalRegistration(unittest.TestCase):
         bridge = MagicMock()
         bridge.alive = True
         result = pool.register_external(
-            bridge, "/tmp/a.elf", "/tmp/other.i64", session_id="ext1",
+            bridge, "/tmp/a.elf", "/tmp/other.i64",
             allow_duplicate_input=True,
         )
         self.assertTrue(result["success"])
@@ -2148,7 +2148,7 @@ class TestExternalRegistration(unittest.TestCase):
 
         bridge = MagicMock()
         bridge.alive = True
-        reg = pool.register_external(bridge, "/tmp/a.elf", "/tmp/a.elf.i64", session_id="ext1")
+        reg = pool.register_external(bridge, "/tmp/a.elf", "/tmp/a.elf.i64")
         sid = reg["session"]["session_id"]
 
         # Simulate agent refcount
@@ -2165,7 +2165,7 @@ class TestExternalRegistration(unittest.TestCase):
 
         bridge = MagicMock()
         bridge.alive = True
-        reg = pool.register_external(bridge, "/tmp/a.elf", "/tmp/a.elf.i64", session_id="ext1")
+        reg = pool.register_external(bridge, "/tmp/a.elf", "/tmp/a.elf.i64")
         sid = reg["session"]["session_id"]
         self.assertEqual(pool.get_external_agent_count(sid), 0)
 

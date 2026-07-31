@@ -889,7 +889,6 @@ class PoolManager:
         ws_bridge,
         input_path: str,
         idb_path: str,
-        session_id: str | None = None,
         allow_duplicate_input: bool = False,
     ) -> dict:
         try:
@@ -898,7 +897,6 @@ class PoolManager:
                     ws_bridge,
                     input_path,
                     idb_path,
-                    session_id=session_id,
                     allow_duplicate_input=allow_duplicate_input,
                 )
         except PoolShuttingDownError as e:
@@ -909,14 +907,9 @@ class PoolManager:
         ws_bridge,
         input_path: str,
         idb_path: str,
-        session_id: str | None = None,
         allow_duplicate_input: bool = False,
     ) -> dict:
-        """Register an external IDA plugin instance via WebSocket.
-
-        ``session_id`` is accepted for legacy callers but ignored.  The pool
-        is the sole authority for new session IDs.
-        """
+        """Register an external IDA plugin instance via WebSocket."""
         input_path = _normalize_path(input_path)
         if idb_path:
             idb_path = _normalize_path(idb_path)
