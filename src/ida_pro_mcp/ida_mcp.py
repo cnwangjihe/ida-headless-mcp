@@ -401,7 +401,6 @@ class MCP(idaapi.plugin_t):
             print(f"[MCP] Failed to save local server configuration: {e}")
 
     def _prompt_local_server_config(self, title: str) -> bool:
-        self._load_local_server_config()
         form = MCPConfigForm(self.host, self.port, title)
         form.Compile()
         ok = form.Execute()
@@ -565,6 +564,7 @@ class MCP(idaapi.plugin_t):
         if self.mcp is not None:
             print("[MCP] Local MCP server is already running")
             return 0
+        self._load_local_server_config()
         if not self._prompt_local_server_config("Run Local MCP Server"):
             return 0
         return self.start_local_server()
