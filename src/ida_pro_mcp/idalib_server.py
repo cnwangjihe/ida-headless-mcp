@@ -1,7 +1,7 @@
 """idalib backend — single-IDB headless MCP server.
 
 This process is spawned by the pool manager.  It opens at most one IDB
-at a time and exposes IDA MCP tools over HTTP (TCP or Unix socket).
+at a time and exposes IDA MCP tools over an HTTP Unix socket.
 Multi-session orchestration lives in the pool layer; this backend is
 intentionally simple.
 """
@@ -10,8 +10,6 @@ import argparse
 import logging
 import os
 import signal
-import sys
-from pathlib import Path
 from typing import Annotated, Optional
 
 import idapro
@@ -186,14 +184,6 @@ def main():
     parser.add_argument(
         "--verbose", "-v", action="store_true", help="Show debug messages"
     )
-    parser.add_argument(
-        "--host", type=str, default="127.0.0.1",
-        help="Host to listen on (default: 127.0.0.1)",
-    )
-    parser.add_argument(
-        "--port", type=int, default=8745,
-        help="Port to listen on (default: 8745)",
-    )
     safety = parser.add_mutually_exclusive_group()
     safety.add_argument(
         "--safe", action="store_true",
@@ -203,17 +193,8 @@ def main():
         "--unsafe", dest="safe", action="store_false", help=argparse.SUPPRESS,
     )
     parser.add_argument(
-        "--unix-socket", type=str, default=None,
-        help="Listen on a Unix domain socket (overrides --host/--port)",
-    )
-    parser.add_argument(
-        "--auth-token", type=str,
-        default=os.environ.get("IDA_MCP_AUTH_TOKEN"),
-        help="Bearer token for HTTP authentication (or set IDA_MCP_AUTH_TOKEN)",
-    )
-    parser.add_argument(
-        "input_path", type=Path, nargs="?",
-        help="Binary to open on startup (optional).",
+        "--unix-socket", type=str, required=True,
+        help="Unix domain socket used by the pool manager",
     )
     args = parser.parse_args()
 
@@ -228,15 +209,6 @@ def main():
 
     if args.safe:
         MCP_SERVER.disabled_tools.update(MCP_UNSAFE)
-
-    if args.input_path is not None:
-        if not args.input_path.exists():
-            raise FileNotFoundError(f"Input file not found: {args.input_path}")
-        logger.info("Opening initial database: %s", args.input_path)
-        _open_database(str(args.input_path), run_auto_analysis=True)
-        global _current_session_id
-        _current_session_id = "initial"
-        logger.info("Initial database opened")
 
     def close_current_database() -> None:
         global _current_session_id, _current_input_path, _current_idb_path
@@ -265,14 +237,8 @@ def main():
 
         signal.signal(signal.SIGUSR1, request_cancel)
 
-    if args.auth_token:
-        MCP_SERVER.auth_token = args.auth_token
-
     try:
-        if args.unix_socket:
-            MCP_SERVER.serve(unix_socket=args.unix_socket, background=False)
-        else:
-            MCP_SERVER.serve(host=args.host, port=args.port, background=False)
+        MCP_SERVER.serve(unix_socket=args.unix_socket, background=False)
     finally:
         logger.info("Shutting down...")
         close_current_database()
