@@ -19,7 +19,6 @@ from typing import (
 
 import ida_funcs
 import ida_hexrays
-import ida_kernwin
 import ida_nalt
 import ida_typeinf
 import idaapi
@@ -864,16 +863,6 @@ def pattern_filter(data: list[T], pattern: str, key: str) -> list[T]:
         return pattern.lower() in text.lower()
 
     return [item for item in data if matches(item)]
-
-
-def refresh_decompiler_widget():
-    if not ida_hexrays.init_hexrays_plugin():
-        return
-    widget = ida_kernwin.get_current_widget()
-    if widget is not None:
-        vu = ida_hexrays.get_widget_vdui(widget)
-        if vu is not None:
-            vu.refresh_ctext()
 
 
 def refresh_decompiler_ctext(fn_addr: int):
