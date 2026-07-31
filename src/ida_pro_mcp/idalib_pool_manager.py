@@ -249,8 +249,6 @@ class InstanceManager:
             instances = list(self.instances)
         for inst in instances:
             self.kill(inst)
-        with self._lock:
-            self.instances.clear()
 
     def find(self, index: int) -> InstanceInfo | None:
         with self._lock:
