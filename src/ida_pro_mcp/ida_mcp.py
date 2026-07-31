@@ -162,7 +162,6 @@ class PoolConnector:
             self._alive = False
             return
 
-        self.session_id = self._reg_response["session"]["session_id"]
         self._thread = threading.Thread(target=self._listen, daemon=True)
         self._thread.start()
 
