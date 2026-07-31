@@ -1148,20 +1148,6 @@ def get_callers(addr: str, limit: int = 50) -> list[Function]:
         return []
 
 
-def get_xrefs_from_internal(ea: int) -> list[Xref]:
-    """Get all xrefs from an address"""
-    xrefs = []
-    for xref in idautils.XrefsFrom(ea, 0):
-        xrefs.append(
-            Xref(
-                addr=hex(xref.to),
-                type="code" if xref.iscode else "data",
-                fn=get_function(xref.to, raise_error=False),
-            )
-        )
-    return xrefs
-
-
 def extract_function_strings(ea: int) -> list[String]:
     """Extract string references from a function"""
     func = idaapi.get_func(ea)

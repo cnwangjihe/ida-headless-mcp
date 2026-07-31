@@ -19,7 +19,6 @@ from ..utils import (
     get_all_comments,
     get_callees,
     get_callers,
-    get_xrefs_from_internal,
     extract_function_strings,
     extract_function_constants,
 )
@@ -114,17 +113,14 @@ def test_utils_assembly_xrefs_and_comments_helpers():
 
 
 @test(binary="typed_fixture.elf")
-def test_utils_callees_callers_and_xrefs_from_helpers():
-    """Call graph related utility helpers resolve deterministic relationships."""
+def test_utils_callees_and_callers_helpers():
+    """Call graph utility helpers resolve deterministic relationships."""
     callees = get_callees("0x1013dc0")
     callee_names = {c["name"] for c in callees}
     assert "sum_point" in callee_names
 
     callers = get_callers("0x1013dc0")
     assert isinstance(callers, list)
-
-    xrefs_from = get_xrefs_from_internal(0x1013F1B)
-    assert any(x["addr"] == "0x1013dc0" for x in xrefs_from)
 
 
 @test(binary="crackme03.elf")
