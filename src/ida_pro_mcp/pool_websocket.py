@@ -16,7 +16,6 @@ import logging
 import queue
 import threading
 import time
-from typing import Any
 
 logger = logging.getLogger(__name__)
 

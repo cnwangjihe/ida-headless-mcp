@@ -9,7 +9,6 @@ from .rpc import tool, unsafe
 from .sync import idasync, tool_timeout, IDAError
 from .utils import (
     parse_address,
-    get_function,
     get_prototype,
     get_callees,
     get_callers,
@@ -17,7 +16,6 @@ from .utils import (
     get_all_comments,
     extract_function_strings,
     extract_function_constants,
-    get_stack_frame_variables_internal,
     decompile_function_safe,
     get_assembly_lines,
     normalize_list_input,

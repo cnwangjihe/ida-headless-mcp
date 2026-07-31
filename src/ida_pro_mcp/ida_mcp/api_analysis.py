@@ -28,7 +28,6 @@ from .utils import (
     get_assembly_lines,
     get_all_xrefs,
     get_all_comments,
-    Function,
     get_callers,
     get_callees,
     extract_function_strings,
