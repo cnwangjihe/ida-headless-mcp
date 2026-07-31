@@ -693,16 +693,6 @@ def get_prototype(fn: ida_funcs.func_t) -> Optional[str]:
     return None
 
 
-DEMANGLED_TO_EA = {}
-
-
-def create_demangled_to_ea_map():
-    for ea in idautils.Functions():
-        demangled = idaapi.demangle_name(idc.get_name(ea, 0), idaapi.MNG_NODEFINIT)
-        if demangled:
-            DEMANGLED_TO_EA[demangled] = ea
-
-
 def get_type_by_name(type_name: str) -> ida_typeinf.tinfo_t:
     # 8-bit integers
     if type_name in ("int8", "__int8", "int8_t", "char", "signed char"):
