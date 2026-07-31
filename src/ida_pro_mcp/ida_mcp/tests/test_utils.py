@@ -22,7 +22,6 @@ from ..utils import (
     get_xrefs_from_internal,
     extract_function_strings,
     extract_function_constants,
-    handle_large_output,
 )
 
 
@@ -137,15 +136,3 @@ def test_utils_extract_strings_and_constants():
     constants = extract_function_constants(0x11A9)
     values = {c["decimal"] for c in constants}
     assert any(v != 0 for v in values)
-
-
-@test(binary="crackme03.elf")
-def test_utils_handle_large_output():
-    """Large output helper leaves small payloads inline and spills large payloads to a file reference."""
-    small = handle_large_output({"x": 1}, line_threshold=100)
-    assert small == {"x": 1}
-
-    big = handle_large_output({"lines": [str(i) for i in range(100)]}, line_threshold=3)
-    assert big["type"] == "file_reference"
-    assert "path" in big
-    assert big["line_count"] > 3

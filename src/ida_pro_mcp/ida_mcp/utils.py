@@ -4,7 +4,6 @@ import os
 import re
 import struct
 import sys
-import tempfile
 from typing import (
     Annotated,
     Any,
@@ -1244,47 +1243,3 @@ def extract_function_constants(ea: int) -> list[dict]:
                         }
                     )
     return constants
-
-
-# ============================================================================
-# Large Output Handling
-# ============================================================================
-
-
-def handle_large_output(result: Any, line_threshold: int = 3000) -> Any:
-    """
-    Handle potentially large outputs by writing to temp file if needed.
-
-    Args:
-        result: The result object to check
-        line_threshold: Number of lines above which to write to file (default: 3000)
-
-    Returns:
-        Either the original result or a dict with file path if written to file
-    """
-    try:
-        serialized = json.dumps(result, indent=2)
-        line_count = serialized.count("\n") + 1
-
-        if line_count > line_threshold:
-            fd, temp_path = tempfile.mkstemp(
-                suffix=".json", prefix="ida_mcp_", text=True
-            )
-            try:
-                with os.fdopen(fd, "w") as f:
-                    f.write(serialized)
-
-                return {
-                    "type": "file_reference",
-                    "path": temp_path,
-                    "line_count": line_count,
-                    "message": f"Output too large ({line_count} lines), written to file",
-                }
-            except Exception:
-                os.close(fd)
-                raise
-
-        return result
-
-    except Exception:
-        return result
