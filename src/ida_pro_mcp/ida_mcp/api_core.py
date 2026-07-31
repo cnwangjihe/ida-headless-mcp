@@ -48,12 +48,6 @@ def _get_strings_cache() -> list[tuple[int, str]]:
     return _strings_cache
 
 
-def invalidate_strings_cache():
-    """Clear the strings cache (call after IDB changes)."""
-    global _strings_cache
-    _strings_cache = None
-
-
 def init_caches():
     """Build caches on plugin startup (called from Ctrl+M)."""
     t0 = time.perf_counter()
