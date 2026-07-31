@@ -30,14 +30,14 @@ _current_idb_path: str = ""
 
 
 def _open_database(input_path: str, run_auto_analysis: bool = True) -> None:
-    """Open a database, replacing the currently open one if any."""
-    global _current_input_path, _current_idb_path, _current_session_id
+    """Open the only database owned by this backend."""
+    global _current_input_path, _current_idb_path
 
     if _current_session_id is not None:
-        idapro.close_database()
-        _current_session_id = None
-        _current_input_path = ""
-        _current_idb_path = ""
+        raise RuntimeError(
+            f"Backend already owns session {_current_session_id}; "
+            "start a new backend for another database"
+        )
 
     if idapro.open_database(input_path, run_auto_analysis=run_auto_analysis):
         raise RuntimeError(f"Failed to open database: {input_path}")

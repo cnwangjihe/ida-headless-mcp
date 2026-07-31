@@ -34,6 +34,19 @@ class IdalibServerLifecycleTests(unittest.TestCase):
         idalib_server._current_input_path = self.old_input_path
         idalib_server._current_idb_path = self.old_idb_path
 
+    @patch.object(idalib_server.idapro, "close_database")
+    @patch.object(idalib_server.idapro, "open_database")
+    def test_open_database_rejects_replacing_an_active_session(
+        self, open_database, close_database
+    ):
+        idalib_server._current_session_id = "active-session"
+
+        with self.assertRaisesRegex(RuntimeError, "start a new backend"):
+            idalib_server._open_database("/tmp/other.bin")
+
+        open_database.assert_not_called()
+        close_database.assert_not_called()
+
     @patch.object(idalib_server.signal, "signal")
     @patch.object(idalib_server.idapro, "enable_console_messages")
     @patch.object(idalib_server.idapro, "close_database")
