@@ -14,7 +14,7 @@ from .zeromcp.jsonrpc import get_current_cancel_event, RequestCancelledError
 # IDA Synchronization & Error Handling
 # ============================================================================
 
-ida_major, ida_minor = map(int, idaapi.get_kernel_version().split("."))
+ida_major = int(idaapi.get_kernel_version().split(".", 1)[0])
 
 # Capture main thread ID at module load time.  In headless idalib mode the
 # main thread is the only thread that can call IDA APIs directly, and
@@ -215,19 +215,3 @@ def tool_timeout(seconds: float):
         return func
 
     return decorator
-
-
-def is_window_active():
-    """Returns whether IDA is currently active."""
-    # Source: https://github.com/OALabs/hexcopy-ida/blob/8b0b2a3021d7dc9010c01821b65a80c47d491b61/hexcopy.py#L30
-    using_pyside6 = (ida_major > 9) or (ida_major == 9 and ida_minor >= 2)
-
-    if using_pyside6:
-        from PySide6 import QtWidgets
-    else:
-        from PyQt5 import QtWidgets
-
-    app = QtWidgets.QApplication.instance()
-    if app is None:
-        return False
-    return app.activeWindow() is not None
