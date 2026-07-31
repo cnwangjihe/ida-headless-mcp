@@ -527,17 +527,6 @@ class Breakpoint(TypedDict):
     condition: Optional[str]
 
 
-class PatternMatch(TypedDict):
-    pattern: str
-    matches: list[str]
-    count: int
-
-
-class CodePattern(TypedDict):
-    mnemonic: str
-    operands: NotRequired[list[str]]
-
-
 class BasicBlock(TypedDict):
     start: str
     end: str
