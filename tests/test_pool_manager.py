@@ -1258,9 +1258,15 @@ class TestPoolServerDispatch(unittest.TestCase):
 
         tools_by_name = {t["name"]: t for t in resp["result"]["tools"]}
         # idalib_open should have pool-specific description (not the backend one)
-        self.assertIn("idalib_close", tools_by_name["idalib_open"]["description"])
+        open_description = tools_by_name["idalib_open"]["description"]
+        self.assertIn("binds it as the default", open_description)
+        self.assertIn("idalib_switch", open_description)
+        self.assertIn("idalib_close", open_description)
         open_props = tools_by_name["idalib_open"]["inputSchema"]["properties"]
         self.assertNotIn("session_id", open_props)
+        input_path_description = open_props["input_path"]["description"]
+        self.assertIn("Prefer the original binary path", input_path_description)
+        self.assertIn("Open a specific .idb/.i64", input_path_description)
         # idalib_close should expose force param
         close_props = tools_by_name["idalib_close"]["inputSchema"]["properties"]
         self.assertIn("force", close_props)

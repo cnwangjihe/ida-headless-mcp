@@ -279,10 +279,12 @@ _MGMT_TOOL_OVERRIDES: dict[str, dict] = {
         "name": "idalib_open",
         "description": (
             "Open a binary or IDB for analysis. If the same binary/IDB is "
-            "already open, shares the existing session. The pool generates "
-            "the returned session_id; always use it for subsequent calls. "
-            "Each idalib_open must be balanced by an idalib_close when you "
-            "are done."
+            "already open, reuse and share the existing session. On success, "
+            "the pool returns a session_id and binds it as the default for the "
+            "current context. Subsequent calls may omit session_id; use "
+            "idalib_switch to change the default session, or pass session_id "
+            "explicitly to target a specific session. Use idalib_close to "
+            "release the database reference when you no longer need it."
         ),
         "inputSchema": {
             "type": "object",
@@ -290,7 +292,12 @@ _MGMT_TOOL_OVERRIDES: dict[str, dict] = {
                 "input_path": {
                     "type": "string",
                     "description": (
-                        "Path to the binary file or IDB (.idb/.i64) to analyze"
+                        "Path to the binary or IDB to analyze. Prefer the "
+                        "original binary path so the pool can automatically "
+                        "route to an existing session for the same binary. "
+                        "Open a specific .idb/.i64 only when that exact "
+                        "database is required, such as when it is stored "
+                        "outside the binary's directory."
                     ),
                 },
                 "run_auto_analysis": {
