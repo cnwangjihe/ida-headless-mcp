@@ -99,7 +99,7 @@ class TestPoolWebSocketServer(unittest.TestCase):
             "s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0
         )
         instance = MagicMock(spec=InstanceInfo)
-        pool.resolve_session_instance.return_value = (session, instance)
+        pool.acquire_session.return_value = (session, instance)
         pool.forward_raw.return_value = {
             "jsonrpc": "2.0",
             "result": {

@@ -845,6 +845,31 @@ def build_dispatch(
     mcp.registry.dispatch = dispatch_proxy
 
 
+def wire_transport_session_cleanup(mcp: McpServer, pool: PoolManager) -> None:
+    """Release all IDA leases after a logical MCP transport session ends."""
+    def on_transport_session_closed(context_id: str, reason: str) -> None:
+        result = pool.release_context(context_id)
+        if not result.get("success"):
+            error = result.get("error") or result.get("close_errors")
+            logger.warning(
+                "Failed to release MCP context %s after %s: %s",
+                context_id,
+                reason,
+                error,
+            )
+            return
+        logger.info(
+            "Released MCP context %s after %s: released=%d closed=%d retained=%d",
+            context_id,
+            reason,
+            len(result["released_sessions"]),
+            len(result["closed_sessions"]),
+            len(result["retained_sessions"]),
+        )
+
+    mcp.transport_session_closed = on_transport_session_closed
+
+
 # --------------------------------------------------------------------------
 # WebSocket handler for external plugin registration
 # --------------------------------------------------------------------------
@@ -1025,6 +1050,7 @@ def main():
     mcp = McpServer("ida-pro-mcp", resources_enabled=False)
     mcp.require_streamable_http_session = True
     mcp.http_session_ttl_seconds = args.http_session_ttl
+    wire_transport_session_cleanup(mcp, pool)
     if args.auth_token:
         mcp.auth_token = args.auth_token
     output_cache = (

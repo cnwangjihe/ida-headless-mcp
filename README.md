@@ -53,18 +53,22 @@ pipe. The same lifecycle is used on Windows, Linux, and macOS.
 ### Session behavior
 
 - One local session owns one idalib backend process and one active IDB.
-- Creating a local session always starts a new backend. Closing its last
-  reference saves the IDB and terminates that backend.
+- Creating a local session always starts a new backend. Releasing its last
+  MCP-context lease saves the IDB and terminates that backend.
 - `idalib_open` binds the returned session to the caller's MCP transport
   context. Streamable HTTP sessions and SSE connections therefore keep
   independent default routing; stdio has one context.
-- An explicit `session_id` on an IDA tool overrides the context binding.
+- An explicit `session_id` on an IDA tool overrides the context binding and
+  idempotently leases that session to the caller without changing the binding.
 - Reopening the same binary or IDB shares the existing session by default and
-  increments its reference count for the new caller.
-- `idalib_switch` changes only the caller's context binding. It does not change
-  ownership or reference counts.
-- `idalib_close` releases one reference. When the count reaches zero, a local
-  IDB is saved and its backend process is stopped.
+  creates one lease for a new MCP context. Repeated opens from the same context
+  do not increase the reference count.
+- `idalib_switch` changes the caller's context binding and idempotently leases
+  the target. Leases on previously used sessions remain until close or
+  transport-session termination.
+- `idalib_close` releases the caller's lease and rejects sessions the caller
+  does not hold. When the count reaches zero, a local IDB is saved and its
+  backend process is stopped.
 - Pool-owned session IDs are derived from the file name plus a stable path
   digest; callers must use the ID returned by `idalib_open`.
 - There is no LRU eviction of IDA sessions and no global default IDA session.
@@ -155,11 +159,19 @@ capacity of 1024 entries. It removes the least-recently-used inactive MCP
 session when full. Active requests are never evicted; if every candidate is
 active, the registry temporarily exceeds the limit and converges after
 requests finish. The default idle TTL is 3600 seconds. Idle expiration and
-capacity eviction affect MCP client contexts, not the set of IDA sessions
-directly.
+capacity eviction terminate the affected MCP client context and release all
+of its IDA leases; a local IDA session closes only if that removed its final
+lease.
+
+Clients should terminate a Streamable HTTP logical session with
+`DELETE /mcp` and its `MCP-Session-Id` header. Closing one HTTP connection is
+not a reliable disconnect signal because later requests can reuse the same
+logical session. The idle TTL is the fallback for clients that disappear
+without sending `DELETE`. SSE stream disconnect and stdio EOF are definitive
+and release their contexts immediately after in-flight requests complete.
 
 Open binaries and IDBs through `idalib_open` after the MCP client connects.
-This ensures every created session has an owning reference and transport
+This ensures every created session has an owning lease and transport
 context.
 
 ### Large tool results
@@ -238,17 +250,20 @@ idalib_close(session_id="libcrypto_d4e5f6")
   -> release every session opened by this caller
 ```
 
-Balance every successful `idalib_open` with `idalib_close`. Use
-`idalib_close(force=true)` only for administrative recovery: it bypasses
-reference counts and disconnects all contexts from the session.
+Close every session held by a long-lived MCP context when it is no longer
+needed. Repeated opens and explicit tool calls from that same context are
+idempotent and need only one close. If the context disconnects first, the pool
+releases all of its leases automatically. Use `idalib_close(force=true)` only
+for administrative recovery: it bypasses lease ownership and disconnects all
+contexts from the session.
 
 ### Pool management tools
 
 | Tool | Behavior |
 |---|---|
 | `idalib_open(input_path, ...)` | Open or share a binary/IDB, bind it to the caller, and return the pool-owned session ID. |
-| `idalib_close(session_id?, force?)` | Release a reference; save and close a local session at refcount zero. |
-| `idalib_switch(session_id)` | Change the caller's context binding without changing refcounts. |
+| `idalib_close(session_id?, force?)` | Release the caller's lease; save and close a local session at refcount zero. |
+| `idalib_switch(session_id)` | Change the caller's binding and idempotently lease the target session. |
 | `idalib_list()` | List sessions, refcounts, ownership type, and the caller's current binding. |
 | `idalib_current()` | Return the session bound to the caller's context. |
 | `idalib_save(path?, session_id?)` | Save without closing. |

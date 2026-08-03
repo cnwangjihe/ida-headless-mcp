@@ -450,6 +450,21 @@ class TestPoolServerDispatch(unittest.TestCase):
         finally:
             setattr(mcp._transport_session_id, "data", None)
 
+    def test_transport_termination_releases_complete_context(self):
+        mcp, pool = self._make_mcp_and_pool()
+        pool.release_context.return_value = {
+            "success": True,
+            "released_sessions": ["s1", "s2"],
+            "closed_sessions": ["s2"],
+            "retained_sessions": ["s1"],
+        }
+        self.pool_server.wire_transport_session_cleanup(mcp, pool)
+
+        mcp.open_transport_session("http:agent-a")
+        mcp.terminate_transport_session("http:agent-a", "client_terminated")
+
+        pool.release_context.assert_called_once_with("http:agent-a")
+
     def test_open_binds_context_and_increments_refcount(self):
         mcp, pool = self._make_mcp_and_pool()
         pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
@@ -1667,6 +1682,62 @@ class TestPoolManager(unittest.TestCase):
         self.assertEqual(result["refcount"], 1)
         self.assertIsNotNone(pool.sr.get("ext1"))
         pool.im.kill.assert_not_called()
+
+    def test_release_context_closes_only_sessions_losing_last_lease(self):
+        pool = self._make_pool()
+        process1 = MagicMock()
+        process1.is_alive.return_value = True
+        process2 = MagicMock()
+        process2.is_alive.return_value = True
+        inst1 = InstanceInfo(0, process1, session_id="s1")
+        inst2 = InstanceInfo(1, process2, session_id="s2")
+        instances = {0: inst1, 1: inst2}
+        pool.im.find.side_effect = lambda index: instances.get(index)
+        pool.im.forward_tool_call.return_value = {"success": True}
+        pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
+        pool.sr.create("s2", "/tmp/b.elf", "/tmp/b.elf.i64", instance_index=1)
+        pool.sr.acquire_context_session("ctx-a", "s1")
+        pool.sr.acquire_context_session("ctx-a", "s2")
+        pool.sr.acquire_context_session("ctx-b", "s1")
+        pool.sr.bind_context("ctx-a", "s2")
+
+        result = pool.release_context("ctx-a")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["released_sessions"], ["s1", "s2"])
+        self.assertEqual(result["closed_sessions"], ["s2"])
+        self.assertEqual(result["retained_sessions"], ["s1"])
+        self.assertEqual(pool.get_refcount("s1"), 1)
+        self.assertIsNotNone(pool.sr.get("s1"))
+        self.assertIsNone(pool.sr.get("s2"))
+        self.assertIsNone(pool.get_context_session_id("ctx-a"))
+        pool.im.kill.assert_called_once_with(inst2)
+
+    def test_release_context_is_idempotent(self):
+        pool = self._make_pool()
+
+        first = pool.release_context("ctx-a")
+        second = pool.release_context("ctx-a")
+
+        self.assertTrue(first["success"])
+        self.assertTrue(second["success"])
+        self.assertEqual(first["released_sessions"], [])
+        self.assertEqual(second["released_sessions"], [])
+
+    def test_release_context_keeps_external_owner_session(self):
+        pool = self._make_pool()
+        pool.sr.create(
+            "ext1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0,
+            is_external=True,
+        )
+        pool.sr.acquire_context_session("ctx-a", "ext1")
+
+        result = pool.release_context("ctx-a")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["retained_sessions"], ["ext1"])
+        self.assertEqual(pool.get_refcount("ext1"), 1)
+        self.assertIsNotNone(pool.sr.get("ext1"))
 
     def test_list_sessions_with_context(self):
         pool = self._make_pool()

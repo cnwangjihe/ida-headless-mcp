@@ -3,8 +3,14 @@ import http.client
 import json
 import time
 import unittest
+from unittest.mock import MagicMock
 
 from ida_pro_mcp import idalib_pool_server
+from ida_pro_mcp.idalib_pool_manager import (
+    InstanceInfo,
+    InstanceManager,
+    PoolManager,
+)
 
 mcp_mod = idalib_pool_server._mcp_mod
 jsonrpc_mod = idalib_pool_server._jsonrpc_mod
@@ -201,6 +207,32 @@ class StreamableHttpTransportSpecTests(unittest.TestCase):
             closed,
             [(f"http:{session_id}", "client_terminated")],
         )
+
+    def test_delete_releases_ida_leases_and_closes_last_local_session(self):
+        session_id, _payload = self._initialize()
+        context_id = f"http:{session_id}"
+        pool = PoolManager(runtime_dir="/tmp/fake-pool")
+        pool.im = MagicMock(spec=InstanceManager)
+        process = MagicMock()
+        process.is_alive.return_value = True
+        inst = InstanceInfo(0, process, session_id="ida1")
+        pool.im.find.return_value = inst
+        pool.im.forward_tool_call.return_value = {"success": True}
+        pool.sr.create(
+            "ida1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0
+        )
+        pool.sr.acquire_context_session(context_id, "ida1")
+        pool.sr.bind_context(context_id, "ida1")
+        idalib_pool_server.wire_transport_session_cleanup(self.server, pool)
+
+        status, _headers, _data = self._request(
+            "DELETE", headers={"MCP-Session-Id": session_id}
+        )
+
+        self.assertEqual(status, 204)
+        self.assertIsNone(pool.sr.get("ida1"))
+        self.assertIsNone(pool.get_context_session_id(context_id))
+        pool.im.kill.assert_called_once_with(inst)
 
     def test_gzip_body_is_limited_after_decompression(self):
         self.server.post_body_limit = 512

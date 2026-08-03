@@ -98,6 +98,26 @@ class PoolClient:
         resp = self.request("tools/list")
         return resp.get("result", {}).get("tools", [])
 
+    def close(self) -> None:
+        """Terminate the logical HTTP MCP session and release all its leases."""
+        if self.session_id is None:
+            return
+        conn = HTTPConnection(self.host, self.port, timeout=120)
+        try:
+            conn.request(
+                "DELETE",
+                "/mcp",
+                headers={
+                    "MCP-Session-Id": self.session_id,
+                    "MCP-Protocol-Version": "2025-11-25",
+                },
+            )
+            response = conn.getresponse()
+            response.read()
+        finally:
+            conn.close()
+            self.session_id = None
+
 
 class TestPoolClient(unittest.TestCase):
     def test_tool_call_preserves_mcp_tool_errors(self):
@@ -174,6 +194,7 @@ class TestPoolIntegration(unittest.TestCase):
         client = PoolClient("127.0.0.1", self.port)
         client.initialize()
         self.assertIsNotNone(client.session_id, "Server should return Mcp-Session-Id")
+        self.addCleanup(client.close)
         return client
 
     def test_01_tools_list_no_unbind(self):
@@ -198,7 +219,9 @@ class TestPoolIntegration(unittest.TestCase):
         self.assertTrue(result.get("success"), f"Open failed: {result}")
         self.assertEqual(result["session"]["refcount"], 1)
 
-        funcs = client.tool_call("list_funcs")
+        funcs = client.tool_call(
+            "list_funcs", {"queries": {"offset": 0, "count": 10}}
+        )
         self.assertNotIn("error", funcs, f"list_funcs failed: {funcs}")
 
         close_result = client.tool_call("idalib_close")
@@ -260,8 +283,8 @@ class TestPoolIntegration(unittest.TestCase):
         self.assertTrue(close_b.get("success"))
         self.assertTrue(close_b.get("closed"))
 
-    def test_06_switch_does_not_change_refcount(self):
-        """idalib_switch only changes routing, not refcount."""
+    def test_06_switch_reuses_existing_context_lease(self):
+        """Switching to an already held session is idempotent."""
         agent = self._make_client()
 
         r1 = agent.tool_call("idalib_open", {"input_path": CRACKME})

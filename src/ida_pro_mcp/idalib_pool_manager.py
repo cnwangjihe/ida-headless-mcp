@@ -1075,6 +1075,63 @@ class PoolManager:
         except PoolShuttingDownError as e:
             return {"success": False, "closed": False, "error": str(e)}
 
+    def release_context(self, context_id: str) -> dict:
+        """Release every lease owned by a disconnected MCP context."""
+        try:
+            with self._operation():
+                pending_close: list[tuple[SessionInfo, InstanceInfo]] = []
+                released_sessions: list[str] = []
+                retained_sessions: list[str] = []
+                cleaned_sessions: list[str] = []
+
+                with self._lock:
+                    session_ids = self.sr.release_context(context_id)
+                    for session_id in session_ids:
+                        sess = self.sr.get(session_id)
+                        if sess is None:
+                            continue
+                        released_sessions.append(session_id)
+                        if sess.is_external or self.sr.get_refcount(session_id) > 0:
+                            retained_sessions.append(session_id)
+                            continue
+                        inst = self.im.find(sess.instance_index)
+                        if inst is None:
+                            self.sr.remove(session_id)
+                            cleaned_sessions.append(session_id)
+                            continue
+                        if inst.closing:
+                            continue
+                        inst.closing = True
+                        pending_close.append((sess, inst))
+                    if cleaned_sessions:
+                        self._condition.notify_all()
+
+                closed_sessions = list(cleaned_sessions)
+                close_errors: dict[str, str] = {}
+                for sess, inst in pending_close:
+                    result = self._finish_close_session(sess, inst)
+                    if result.get("success"):
+                        closed_sessions.append(sess.session_id)
+                    else:
+                        close_errors[sess.session_id] = result.get(
+                            "error", "unknown close error"
+                        )
+
+                return {
+                    "success": not close_errors,
+                    "context_id": context_id,
+                    "released_sessions": sorted(released_sessions),
+                    "closed_sessions": sorted(closed_sessions),
+                    "retained_sessions": sorted(retained_sessions),
+                    "close_errors": close_errors,
+                }
+        except PoolShuttingDownError as e:
+            return {
+                "success": False,
+                "context_id": context_id,
+                "error": str(e),
+            }
+
     # ------------------------------------------------------------------
     # External instance registration
     # ------------------------------------------------------------------
