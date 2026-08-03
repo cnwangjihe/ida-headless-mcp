@@ -1,4 +1,5 @@
 import multiprocessing
+import tempfile
 import threading
 import unittest
 
@@ -11,6 +12,7 @@ from ida_pro_mcp.backend_ipc import (
     send_message,
     wait_for_message,
 )
+from ida_pro_mcp.idalib_pool_manager import InstanceManager
 
 
 def _fake_backend(rpc_connection, control_connection):
@@ -48,6 +50,34 @@ def _cancellable_fake_backend(rpc_connection, control_connection):
         control_connection,
         dispatch=dispatch,
         cancel_pending=cancel_pending,
+    )
+    try:
+        server.serve()
+    finally:
+        rpc_connection.close()
+        control_connection.close()
+
+
+def _instance_manager_fake_backend(
+    rpc_connection,
+    control_connection,
+    log_path,
+    idalib_args,
+):
+    del log_path, idalib_args
+
+    def dispatch(request):
+        return {
+            "jsonrpc": "2.0",
+            "result": {"echo": request.get("method")},
+            "id": request.get("id"),
+        }
+
+    server = BackendIpcServer(
+        rpc_connection,
+        control_connection,
+        dispatch=dispatch,
+        cancel_pending=lambda: 0,
     )
     try:
         server.serve()
@@ -169,6 +199,24 @@ class BackendIpcTests(unittest.TestCase):
             parent_rpc.close()
             parent_control.close()
             process.close()
+
+    def test_instance_manager_runs_fake_backend_end_to_end(self):
+        with tempfile.TemporaryDirectory() as runtime_dir:
+            manager = InstanceManager(
+                runtime_dir,
+                worker_target=_instance_manager_fake_backend,
+            )
+            instance = manager.spawn()
+            try:
+                response = manager.forward_raw(
+                    instance,
+                    {"jsonrpc": "2.0", "method": "ping", "id": 11},
+                )
+                self.assertEqual(response["result"], {"echo": "ping"})
+            finally:
+                manager.kill(instance)
+
+        self.assertEqual(manager.instances, [])
 
 
 if __name__ == "__main__":

@@ -5,7 +5,6 @@ requiring idapro or running idalib_server subprocesses.
 """
 
 import json
-import signal
 import tempfile
 import threading
 import time
@@ -1517,12 +1516,12 @@ class TestPoolManager(unittest.TestCase):
         result = pool.list_sessions(context_id="ctx-a")
         self.assertEqual(result["current_context_session_id"], "s1")
 
-    @unittest.skipUnless(hasattr(signal, "SIGUSR1"), "SIGUSR1 is unavailable")
-    def test_cancel_local_instance_uses_out_of_band_signal(self):
+    def test_cancel_local_instance_uses_control_pipe(self):
         pool = self._make_pool()
         process = MagicMock()
         process.poll.return_value = None
         inst = InstanceInfo(0, "/tmp/0.sock", process)
+        pool.im.send_control.return_value = True
 
         delivered = pool.cancel_instance_request(
             inst,
@@ -1530,7 +1529,7 @@ class TestPoolManager(unittest.TestCase):
         )
 
         self.assertTrue(delivered)
-        process.send_signal.assert_called_once_with(signal.SIGUSR1)
+        pool.im.send_control.assert_called_once_with(inst, "cancel")
 
     def test_cancel_external_instance_queues_notification(self):
         pool = self._make_pool()
@@ -2234,41 +2233,147 @@ class TestInstanceInfoExternal(unittest.TestCase):
 
 class TestInstanceManager(unittest.TestCase):
 
-    def test_spawn_starts_backend_in_new_session(self):
-        with tempfile.TemporaryDirectory() as socket_dir:
-            im = InstanceManager(socket_dir)
-            proc = MagicMock()
-            with patch(
-                "ida_pro_mcp.idalib_pool_manager.subprocess.Popen",
-                return_value=proc,
-            ) as popen:
-                with patch.object(InstanceManager, "_wait_for_ready"):
-                    inst = im.spawn()
-            inst._log_file.close()
+    def _spawn_context(self, *, alive=True):
+        context = MagicMock()
+        parent_rpc = MagicMock(name="parent_rpc")
+        child_rpc = MagicMock(name="child_rpc")
+        child_control = MagicMock(name="child_control")
+        parent_control = MagicMock(name="parent_control")
+        context.Pipe.side_effect = [
+            (parent_rpc, child_rpc),
+            (child_control, parent_control),
+        ]
+        process = MagicMock(
+            spec=[
+                "start", "join", "is_alive", "terminate", "kill", "close",
+                "pid", "sentinel", "exitcode",
+            ]
+        )
+        process.pid = 1234
+        process.is_alive.return_value = alive
+        context.Process.return_value = process
+        return (
+            context,
+            process,
+            parent_rpc,
+            child_rpc,
+            child_control,
+            parent_control,
+        )
 
-        self.assertIs(inst.process, proc)
-        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+    def test_spawn_uses_spawn_context_and_inherited_pipes(self):
+        context, process, parent_rpc, child_rpc, child_control, parent_control = (
+            self._spawn_context()
+        )
+        worker_target = MagicMock()
+        with tempfile.TemporaryDirectory() as socket_dir:
+            im = InstanceManager(
+                socket_dir,
+                ["--safe"],
+                mp_context=context,
+                worker_target=worker_target,
+            )
+            with patch.object(InstanceManager, "_wait_for_ready"):
+                inst = im.spawn()
+
+        process.start.assert_called_once_with()
+        child_rpc.close.assert_called_once_with()
+        child_control.close.assert_called_once_with()
+        self.assertIs(inst.process, process)
+        self.assertIs(inst.rpc_connection, parent_rpc)
+        self.assertIs(inst.control_connection, parent_control)
+        process_call = context.Process.call_args
+        self.assertIs(process_call.kwargs["target"], worker_target)
+        self.assertEqual(process_call.kwargs["name"], "idalib-backend-0")
+        self.assertEqual(process_call.kwargs["args"][3], ["--safe"])
 
     def test_spawn_readiness_failure_stops_backend(self):
+        context, process, _parent_rpc, _child_rpc, _child_control, _parent_control = (
+            self._spawn_context()
+        )
+        process.is_alive.side_effect = [True, True, False, False, False]
         with tempfile.TemporaryDirectory() as socket_dir:
-            im = InstanceManager(socket_dir)
-            proc = MagicMock()
-            proc.poll.return_value = None
-            with patch(
-                "ida_pro_mcp.idalib_pool_manager.subprocess.Popen",
-                return_value=proc,
+            im = InstanceManager(socket_dir, mp_context=context)
+            with patch.object(
+                InstanceManager,
+                "_wait_for_ready",
+                side_effect=RuntimeError("not ready"),
             ):
-                with patch.object(
-                    InstanceManager,
-                    "_wait_for_ready",
-                    side_effect=RuntimeError("not ready"),
-                ):
-                    with patch.object(im, "kill", wraps=im.kill) as kill:
-                        with self.assertRaisesRegex(RuntimeError, "not ready"):
-                            im.spawn()
+                with patch.object(im, "kill", wraps=im.kill) as kill:
+                    with self.assertRaisesRegex(RuntimeError, "not ready"):
+                        im.spawn()
 
         kill.assert_called_once()
+        process.join.assert_called_once_with(timeout=10)
         self.assertEqual(im.instances, [])
+
+    def test_wait_for_ready_uses_process_sentinel(self):
+        context, process, parent_rpc, _child_rpc, _child_control, parent_control = (
+            self._spawn_context()
+        )
+        inst = InstanceInfo(
+            index=0,
+            socket_path="",
+            process=process,
+            rpc_connection=parent_rpc,
+            control_connection=parent_control,
+        )
+        im = InstanceManager("/tmp/fake-pool", mp_context=context)
+
+        with patch(
+            "ida_pro_mcp.idalib_pool_manager.wait_for_message",
+            return_value={"type": "ready", "protocol": 1, "pid": 1234},
+        ) as wait_message:
+            im._wait_for_ready(inst, timeout=7)
+
+        wait_message.assert_called_once_with(parent_rpc, process.sentinel, 7)
+
+    def test_forward_raw_uses_json_rpc_pipe(self):
+        context, process, parent_rpc, _child_rpc, _child_control, parent_control = (
+            self._spawn_context()
+        )
+        inst = InstanceInfo(
+            index=0,
+            socket_path="",
+            process=process,
+            rpc_connection=parent_rpc,
+            control_connection=parent_control,
+        )
+        im = InstanceManager("/tmp/fake-pool", mp_context=context)
+        response = {"jsonrpc": "2.0", "result": {"ok": True}, "id": 1}
+
+        with patch(
+            "ida_pro_mcp.idalib_pool_manager.wait_for_message",
+            return_value={"type": "response", "protocol": 1, "payload": response},
+        ):
+            result = im.forward_raw(
+                inst,
+                {"jsonrpc": "2.0", "method": "ping", "id": 1},
+            )
+
+        sent = json.loads(parent_rpc.send_bytes.call_args.args[0])
+        self.assertEqual(sent["type"], "request")
+        self.assertEqual(sent["payload"]["method"], "ping")
+        self.assertEqual(result, response)
+
+    def test_send_control_uses_independent_pipe(self):
+        context, process, parent_rpc, _child_rpc, _child_control, parent_control = (
+            self._spawn_context()
+        )
+        inst = InstanceInfo(
+            index=0,
+            socket_path="",
+            process=process,
+            rpc_connection=parent_rpc,
+            control_connection=parent_control,
+        )
+        im = InstanceManager("/tmp/fake-pool", mp_context=context)
+
+        self.assertTrue(im.send_control(inst, "cancel"))
+
+        sent = json.loads(parent_control.send_bytes.call_args.args[0])
+        self.assertEqual(sent["type"], "cancel")
+        parent_rpc.send_bytes.assert_not_called()
 
 
 if __name__ == "__main__":

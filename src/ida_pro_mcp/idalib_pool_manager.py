@@ -21,24 +21,28 @@ Key invariants
 
 from __future__ import annotations
 
-import http.client
 import hashlib
-import json
 import logging
+import multiprocessing
 import ntpath
 import os
 import re
 import secrets
-import signal
-import socket
-import subprocess
-import sys
 import tempfile
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
+
+from ida_pro_mcp.backend_bootstrap import run_backend_process
+from ida_pro_mcp.backend_ipc import (
+    BackendIpcError,
+    BackendProcessExited,
+    make_message,
+    send_message,
+    wait_for_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -110,13 +114,17 @@ class SessionInfo:
 class InstanceInfo:
     index: int
     socket_path: str
-    process: subprocess.Popen | None
+    process: Any | None
+    rpc_connection: Any | None = None
+    control_connection: Any | None = None
     session_id: str | None = None
     ws_bridge: Any | None = None  # ExternalInstanceBridge for external instances
     closing: bool = False
     operation_lock: threading.RLock = field(
         default_factory=threading.RLock, repr=False
     )
+    rpc_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    control_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
     def is_external(self) -> bool:
@@ -125,7 +133,14 @@ class InstanceInfo:
     def is_alive(self) -> bool:
         if self.is_external:
             return self.ws_bridge is not None and self.ws_bridge.alive
-        return self.process is not None and self.process.poll() is None
+        if self.process is None:
+            return False
+        if hasattr(self.process, "poll"):
+            return self.process.poll() is None
+        try:
+            return self.process.is_alive()
+        except ValueError:
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -139,9 +154,14 @@ class InstanceManager:
         self,
         socket_dir: str,
         idalib_args: list[str] | None = None,
+        *,
+        mp_context=None,
+        worker_target=None,
     ):
         self.socket_dir = socket_dir
         self.idalib_args = idalib_args or []
+        self._mp_context = mp_context or multiprocessing.get_context("spawn")
+        self._worker_target = worker_target or run_backend_process
         self.instances: list[InstanceInfo] = []
         self._next_index = 0
         self._lock = threading.RLock()
@@ -150,32 +170,32 @@ class InstanceManager:
         with self._lock:
             idx = self._next_index
             self._next_index += 1
-        sock_path = os.path.join(self.socket_dir, f"{idx}.sock")
         log_path = os.path.join(self.socket_dir, f"{idx}.log")
-        cmd = [
-            sys.executable, "-m", "ida_pro_mcp.idalib_server",
-            "--unix-socket", sock_path,
-            *self.idalib_args,
-        ]
-        logger.info("Spawning instance %d: %s (log: %s)", idx, " ".join(cmd), log_path)
-        log_file = open(log_path, "w")
+        parent_rpc, child_rpc = self._mp_context.Pipe(duplex=True)
+        child_control, parent_control = self._mp_context.Pipe(duplex=False)
+        proc = self._mp_context.Process(
+            target=self._worker_target,
+            args=(child_rpc, child_control, log_path, list(self.idalib_args)),
+            name=f"idalib-backend-{idx}",
+        )
+        logger.info("Spawning instance %d (log: %s)", idx, log_path)
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
+            proc.start()
         except Exception:
-            log_file.close()
+            parent_rpc.close()
+            child_rpc.close()
+            child_control.close()
+            parent_control.close()
             raise
+        child_rpc.close()
+        child_control.close()
         inst = InstanceInfo(
             index=idx,
-            socket_path=sock_path,
+            socket_path="",
             process=proc,
+            rpc_connection=parent_rpc,
+            control_connection=parent_control,
         )
-        inst._log_file = log_file  # type: ignore[attr-defined]
         with self._lock:
             self.instances.append(inst)
         try:
@@ -212,14 +232,16 @@ class InstanceManager:
         else:
             logger.info("Killing instance %d (pid %d)", inst.index, inst.process.pid)
             try:
-                inst.process.send_signal(signal.SIGTERM)
-                inst.process.wait(timeout=10)
-            except Exception:
-                inst.process.kill()
-                inst.process.wait(timeout=5)
-            log_file = getattr(inst, "_log_file", None)
-            if log_file:
-                log_file.close()
+                self.send_control(inst, "shutdown")
+                inst.process.join(timeout=10)
+                if inst.is_alive():
+                    inst.process.terminate()
+                    inst.process.join(timeout=5)
+                if inst.is_alive():
+                    inst.process.kill()
+                    inst.process.join(timeout=5)
+            finally:
+                self._close_local_resources(inst)
         with self._lock:
             if inst in self.instances:
                 self.instances.remove(inst)
@@ -228,17 +250,8 @@ class InstanceManager:
         """Forget an instance that is already unusable."""
         if inst.is_external and inst.ws_bridge:
             inst.ws_bridge.alive = False
-        log_file = getattr(inst, "_log_file", None)
-        if log_file:
-            try:
-                log_file.close()
-            except Exception:
-                pass
-        if inst.socket_path and os.path.exists(inst.socket_path):
-            try:
-                os.unlink(inst.socket_path)
-            except OSError:
-                pass
+        if not inst.is_external:
+            self._close_local_resources(inst)
         with self._lock:
             if inst in self.instances:
                 self.instances.remove(inst)
@@ -264,28 +277,59 @@ class InstanceManager:
         with self._lock:
             return inst in self.instances
 
-    def _wait_for_ready(self, inst: InstanceInfo, timeout: float = 120) -> None:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if inst.process.poll() is not None:
-                raise RuntimeError(
-                    f"Instance {inst.index} exited prematurely "
-                    f"(code {inst.process.returncode})"
-                )
-            if os.path.exists(inst.socket_path):
+    def _close_local_resources(self, inst: InstanceInfo) -> None:
+        for attribute in ("rpc_connection", "control_connection"):
+            connection = getattr(inst, attribute)
+            if connection is not None:
                 try:
-                    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                    sock.settimeout(1)
-                    sock.connect(inst.socket_path)
-                    sock.close()
-                    logger.info("Instance %d ready at %s", inst.index, inst.socket_path)
-                    return
-                except (ConnectionRefusedError, OSError):
+                    connection.close()
+                except (OSError, ValueError):
                     pass
-            time.sleep(0.2)
-        raise TimeoutError(
-            f"Instance {inst.index} did not become ready within {timeout}s"
-        )
+                setattr(inst, attribute, None)
+        process = inst.process
+        if process is not None and not inst.is_alive():
+            try:
+                process.close()
+            except (OSError, ValueError):
+                pass
+
+    def send_control(self, inst: InstanceInfo, command: str) -> bool:
+        if not inst.is_alive() or inst.control_connection is None:
+            return False
+        with inst.control_lock:
+            try:
+                send_message(
+                    inst.control_connection,
+                    make_message(command),
+                )
+                return True
+            except (BackendIpcError, BrokenPipeError, OSError, ValueError):
+                return False
+
+    def _wait_for_ready(self, inst: InstanceInfo, timeout: float = 120) -> None:
+        if inst.process is None or inst.rpc_connection is None:
+            raise RuntimeError(f"Instance {inst.index} has no local IPC channel")
+        try:
+            message = wait_for_message(
+                inst.rpc_connection,
+                inst.process.sentinel,
+                timeout,
+            )
+        except BackendProcessExited as e:
+            raise RuntimeError(
+                f"Instance {inst.index} exited prematurely "
+                f"(code {inst.process.exitcode})"
+            ) from e
+        if message["type"] == "startup_error":
+            raise RuntimeError(
+                f"Instance {inst.index} failed to start: {message.get('error')}"
+            )
+        if message["type"] != "ready":
+            raise RuntimeError(
+                f"Instance {inst.index} sent unexpected startup message: "
+                f"{message['type']}"
+            )
+        logger.info("Instance %d ready (pid %d)", inst.index, inst.process.pid)
 
     # --- HTTP forwarding ---
 
@@ -306,29 +350,29 @@ class InstanceManager:
     def forward_raw(self, inst: InstanceInfo, request: dict) -> dict:
         if inst.is_external:
             return inst.ws_bridge.forward_request(request)
-        conn = http.client.HTTPConnection("localhost", timeout=300)
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.connect(inst.socket_path)
-        conn.sock = sock
-        try:
-            body = json.dumps(request)
-            conn.request(
-                "POST",
-                "/mcp",
-                body,
-                {
-                    "Content-Type": "application/json",
-                    "Accept": "application/json, text/event-stream",
-                    "MCP-Protocol-Version": "2025-11-25",
-                },
+        if inst.process is None or inst.rpc_connection is None:
+            raise RuntimeError(f"Instance {inst.index} has no local IPC channel")
+        with inst.rpc_lock:
+            send_message(
+                inst.rpc_connection,
+                make_message("request", payload=request),
             )
-            resp = conn.getresponse()
-            data = resp.read().decode()
-            if resp.status >= 400:
-                raise RuntimeError(f"HTTP {resp.status}: {data}")
-            return json.loads(data)
-        finally:
-            conn.close()
+            message = wait_for_message(
+                inst.rpc_connection,
+                inst.process.sentinel,
+                300,
+            )
+        if message["type"] in {"error", "startup_error"}:
+            raise RuntimeError(message.get("error") or "backend IPC error")
+        if message["type"] != "response":
+            raise RuntimeError(
+                f"Instance {inst.index} sent unexpected RPC message: "
+                f"{message['type']}"
+            )
+        response = message.get("payload")
+        if not isinstance(response, dict):
+            raise RuntimeError("Backend returned a non-object JSON-RPC response")
+        return response
 
     def forward_tools_list(self, inst: InstanceInfo) -> list[dict]:
         request = {"jsonrpc": "2.0", "method": "tools/list", "id": 1}
@@ -729,7 +773,7 @@ class PoolManager:
                             "session_id": session_id,
                         })
                     break
-                except (ConnectionRefusedError, OSError) as e:
+                except (BackendIpcError, ConnectionRefusedError, OSError) as e:
                     last_error = e
                     logger.warning(
                         "Backend instance %d unavailable while opening %s: %s",
@@ -1049,17 +1093,7 @@ class PoolManager:
             inst.ws_bridge.send_notification(notification)
             return True
 
-        if (
-            inst.process is None
-            or inst.process.poll() is not None
-            or not hasattr(signal, "SIGUSR1")
-        ):
-            return False
-        try:
-            inst.process.send_signal(signal.SIGUSR1)
-            return True
-        except (OSError, ProcessLookupError):
-            return False
+        return self.im.send_control(inst, "cancel")
 
     def forward_tool_call(self, inst: InstanceInfo, tool_name: str, arguments: dict) -> Any:
         with self._operation():

@@ -21,6 +21,8 @@ from ida_pro_mcp.ida_mcp import MCP_SERVER, MCP_UNSAFE
 from ida_pro_mcp.ida_mcp.api_core import server_health, server_warmup
 from ida_pro_mcp.ida_mcp.rpc import tool
 from ida_pro_mcp.ida_mcp.zeromcp.jsonrpc import cancel_all_pending_requests
+from ida_pro_mcp.ida_mcp.zeromcp.mcp import LATEST_MCP_PROTOCOL_VERSION
+from ida_pro_mcp.backend_ipc import BackendIpcServer
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +150,67 @@ def idalib_warmup(
         return {"ready": False, "error": str(e)}
 
 
+def _close_current_database() -> None:
+    global _current_session_id, _current_input_path, _current_idb_path
+    if _current_session_id is not None:
+        try:
+            idb_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+            if idb_path:
+                ida_loader.save_database(idb_path, 0)
+        except Exception as e:
+            logger.warning("Failed to save on shutdown: %s", e)
+        idapro.close_database()
+        _current_session_id = None
+        _current_input_path = ""
+        _current_idb_path = ""
+
+
+def _dispatch_ipc_request(request: dict) -> dict | None:
+    setattr(MCP_SERVER._enabled_extensions, "data", set())
+    setattr(MCP_SERVER._protocol_version, "data", LATEST_MCP_PROTOCOL_VERSION)
+    setattr(MCP_SERVER._transport_session_id, "data", "backend:default")
+    try:
+        return MCP_SERVER.registry.dispatch(request)
+    finally:
+        setattr(MCP_SERVER._enabled_extensions, "data", set())
+        setattr(MCP_SERVER._protocol_version, "data", None)
+        setattr(MCP_SERVER._transport_session_id, "data", None)
+
+
+def run_ipc_backend(
+    rpc_connection,
+    control_connection,
+    *,
+    idalib_args: list[str],
+) -> None:
+    """Run the single-IDB backend over inherited multiprocessing pipes."""
+    unknown_args = set(idalib_args) - {"--verbose", "-v", "--safe", "--unsafe"}
+    if unknown_args:
+        raise ValueError(f"Unsupported backend arguments: {sorted(unknown_args)}")
+    verbose = "--verbose" in idalib_args or "-v" in idalib_args
+    safe = "--safe" in idalib_args and "--unsafe" not in idalib_args
+
+    idapro.enable_console_messages(verbose)
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        force=True,
+    )
+    if safe:
+        MCP_SERVER.disabled_tools.update(MCP_UNSAFE)
+
+    server = BackendIpcServer(
+        rpc_connection,
+        control_connection,
+        dispatch=_dispatch_ipc_request,
+        cancel_pending=cancel_all_pending_requests,
+    )
+    try:
+        server.serve(ready_fields={"pid": os.getpid()})
+    finally:
+        logger.info("Shutting down...")
+        _close_current_database()
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -185,20 +248,6 @@ def main():
     if args.safe:
         MCP_SERVER.disabled_tools.update(MCP_UNSAFE)
 
-    def close_current_database() -> None:
-        global _current_session_id, _current_input_path, _current_idb_path
-        if _current_session_id is not None:
-            try:
-                idb_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
-                if idb_path:
-                    ida_loader.save_database(idb_path, 0)
-            except Exception as e:
-                logger.warning("Failed to save on shutdown: %s", e)
-            idapro.close_database()
-            _current_session_id = None
-            _current_input_path = ""
-            _current_idb_path = ""
-
     def request_shutdown(signum, frame):
         logger.info("Shutdown requested")
         raise SystemExit(0)
@@ -216,7 +265,7 @@ def main():
         MCP_SERVER.serve(unix_socket=args.unix_socket, background=False)
     finally:
         logger.info("Shutting down...")
-        close_current_database()
+        _close_current_database()
 
 
 if __name__ == "__main__":

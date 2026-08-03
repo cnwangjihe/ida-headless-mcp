@@ -28,11 +28,14 @@ class IdalibServerLifecycleTests(unittest.TestCase):
         self.old_session_id = idalib_server._current_session_id
         self.old_input_path = idalib_server._current_input_path
         self.old_idb_path = idalib_server._current_idb_path
+        self.old_disabled_tools = set(idalib_server.MCP_SERVER.disabled_tools)
 
     def tearDown(self):
         idalib_server._current_session_id = self.old_session_id
         idalib_server._current_input_path = self.old_input_path
         idalib_server._current_idb_path = self.old_idb_path
+        idalib_server.MCP_SERVER.disabled_tools.clear()
+        idalib_server.MCP_SERVER.disabled_tools.update(self.old_disabled_tools)
 
     @patch.object(idalib_server.idapro, "close_database")
     @patch.object(idalib_server.idapro, "open_database")
@@ -74,6 +77,58 @@ class IdalibServerLifecycleTests(unittest.TestCase):
         save_database.assert_called_once_with("/tmp/test.i64", 0)
         close_database.assert_called_once_with()
         self.assertIsNone(idalib_server._current_session_id)
+
+    @patch.object(idalib_server, "BackendIpcServer")
+    @patch.object(idalib_server.idapro, "enable_console_messages")
+    def test_ipc_backend_configures_and_serves_inherited_connections(
+        self,
+        enable_console_messages,
+        server_cls,
+    ):
+        rpc_connection = MagicMock()
+        control_connection = MagicMock()
+
+        idalib_server.run_ipc_backend(
+            rpc_connection,
+            control_connection,
+            idalib_args=["--verbose", "--safe"],
+        )
+
+        enable_console_messages.assert_called_once_with(True)
+        server_cls.assert_called_once_with(
+            rpc_connection,
+            control_connection,
+            dispatch=idalib_server._dispatch_ipc_request,
+            cancel_pending=idalib_server.cancel_all_pending_requests,
+        )
+        server_cls.return_value.serve.assert_called_once()
+        ready_fields = server_cls.return_value.serve.call_args.kwargs["ready_fields"]
+        self.assertEqual(ready_fields["pid"], idalib_server.os.getpid())
+        self.assertTrue(idalib_server.MCP_UNSAFE <= idalib_server.MCP_SERVER.disabled_tools)
+
+    @patch.object(idalib_server.MCP_SERVER.registry, "dispatch")
+    def test_ipc_dispatch_sets_and_clears_transport_context(self, dispatch):
+        def inspect_context(request):
+            self.assertEqual(
+                idalib_server.MCP_SERVER.get_current_transport_session_id(),
+                "backend:default",
+            )
+            self.assertEqual(
+                idalib_server.MCP_SERVER._protocol_version.data,
+                idalib_server.LATEST_MCP_PROTOCOL_VERSION,
+            )
+            return {"jsonrpc": "2.0", "result": {}, "id": request["id"]}
+
+        dispatch.side_effect = inspect_context
+
+        response = idalib_server._dispatch_ipc_request(
+            {"jsonrpc": "2.0", "method": "ping", "id": 1}
+        )
+
+        self.assertEqual(response["id"], 1)
+        self.assertIsNone(
+            idalib_server.MCP_SERVER.get_current_transport_session_id()
+        )
 
 
 if __name__ == "__main__":
