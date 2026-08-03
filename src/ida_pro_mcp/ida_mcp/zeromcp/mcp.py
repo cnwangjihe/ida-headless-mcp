@@ -12,7 +12,7 @@ import inspect
 import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer, HTTPServer
-from typing import Any, Callable, Union, Annotated, BinaryIO, NotRequired, get_origin, get_args, get_type_hints, is_typeddict
+from typing import Any, Callable, Union, Annotated, BinaryIO, Literal, NotRequired, get_origin, get_args, get_type_hints, is_typeddict
 from types import UnionType
 from urllib.parse import urlparse, parse_qs
 from io import BufferedIOBase
@@ -26,6 +26,15 @@ SUPPORTED_HTTP_PROTOCOL_VERSIONS = {
     "2025-06-18",
     DEFAULT_HTTP_PROTOCOL_VERSION,
 }
+
+TransportSessionCloseReason = Literal[
+    "client_terminated",
+    "disconnect",
+    "idle_timeout",
+    "capacity_evicted",
+    "server_stopped",
+    "eof",
+]
 
 
 def _log(message: str) -> None:
@@ -236,9 +245,20 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             case "/mcp":
                 if not self._check_streamable_origin():
                     return
-                # This server does not support client-initiated MCP session
-                # termination. The Streamable HTTP spec permits 405 here.
-                self._send_method_not_allowed()
+                session_id = self.headers.get("MCP-Session-Id")
+                if session_id is None:
+                    self.send_error(400, "Missing MCP-Session-Id header")
+                    return
+                if not self._is_valid_mcp_session_id(session_id):
+                    self.send_error(400, "Invalid MCP-Session-Id")
+                    return
+                if not self.mcp_server.remove_http_session(session_id):
+                    self.send_error(404, "MCP session not found")
+                    return
+                self._send_empty_response(204)
+                self.mcp_server.terminate_transport_session(
+                    f"http:{session_id}", "client_terminated"
+                )
             case _:
                 self.send_error(404, "Not Found")
 
@@ -395,7 +415,10 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
     def _handle_sse_get(self):
         # Create SSE connection wrapper
         conn = _McpSseConnection(self.wfile)
-        self.mcp_server._sse_connections[conn.session_id] = conn
+        context_id = f"sse:{conn.session_id}"
+        self.mcp_server.open_transport_session(context_id)
+        with self.mcp_server._sse_connections_lock:
+            self.mcp_server._sse_connections[conn.session_id] = conn
 
         try:
             # Send SSE headers
@@ -443,8 +466,12 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
 
         finally:
             conn.alive = False
-            if conn.session_id in self.mcp_server._sse_connections:
-                del self.mcp_server._sse_connections[conn.session_id]
+            with self.mcp_server._sse_connections_lock:
+                self.mcp_server._sse_connections.pop(conn.session_id, None)
+            self.mcp_server.terminate_transport_session(
+                context_id,
+                "server_stopped" if not self.mcp_server._running else "disconnect",
+            )
 
     def _handle_sse_post(self, body: bytes):
         query_params = parse_qs(urlparse(self.path).query)
@@ -453,37 +480,46 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             self.send_error(400, "Missing ?session for SSE POST")
             return
 
-        sse_conn = self.mcp_server._sse_connections.get(session_id)
+        with self.mcp_server._sse_connections_lock:
+            sse_conn = self.mcp_server._sse_connections.get(session_id)
         if sse_conn is None or not sse_conn.alive:
             self.send_error(400, f"No active SSE connection found for session {session_id}")
             return
 
-        # Parse extensions from query params and store in thread-local
-        extensions = self._parse_extensions(self.path)
-        setattr(self.mcp_server._enabled_extensions, "data", extensions)
-        setattr(self.mcp_server._transport_session_id, "data", f"sse:{session_id}")
+        context_id = f"sse:{session_id}"
+        if not self.mcp_server.begin_transport_request(context_id):
+            self.send_error(400, f"SSE session is closing: {session_id}")
+            return
 
         try:
-            # Dispatch to MCP registry
-            setattr(self.mcp_server._protocol_version, "data", "2024-11-05")
-            response = self.mcp_server.registry.dispatch(body)
+            # Parse extensions from query params and store in thread-local
+            extensions = self._parse_extensions(self.path)
+            setattr(self.mcp_server._enabled_extensions, "data", extensions)
+            setattr(self.mcp_server._transport_session_id, "data", context_id)
+
+            try:
+                # Dispatch to MCP registry
+                setattr(self.mcp_server._protocol_version, "data", "2024-11-05")
+                response = self.mcp_server.registry.dispatch(body)
+            finally:
+                setattr(self.mcp_server._enabled_extensions, "data", set())
+                setattr(self.mcp_server._protocol_version, "data", None)
+                setattr(self.mcp_server._transport_session_id, "data", None)
+
+            # Send SSE response if necessary
+            if response is not None:
+                # Send response via SSE event stream
+                sse_conn.send_event("message", response)
+
+            # Return 202 Accepted to acknowledge POST
+            self.send_response(202)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_cors_headers()
+            self.end_headers()
+            self.wfile.write(body)
         finally:
-            setattr(self.mcp_server._enabled_extensions, "data", set())
-            setattr(self.mcp_server._protocol_version, "data", None)
-            setattr(self.mcp_server._transport_session_id, "data", None)
-
-        # Send SSE response if necessary
-        if response is not None:
-            # Send response via SSE event stream
-            sse_conn.send_event("message", response)
-
-        # Return 202 Accepted to acknowledge POST
-        self.send_response(202)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_cors_headers()
-        self.end_headers()
-        self.wfile.write(body)
+            self.mcp_server.end_transport_request(context_id)
 
     def _send_jsonrpc_http_error(self, status: int, code: int, message: str):
         body = json.dumps({
@@ -624,43 +660,47 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             self._send_empty_response(202, mcp_session_id=mcp_session_id)
             return
 
-        # Parse extensions from query params and store in thread-local
-        extensions = self._parse_extensions(self.path)
-        setattr(self.mcp_server._enabled_extensions, "data", extensions)
-        setattr(
-            self.mcp_server._transport_session_id,
-            "data",
-            f"http:{mcp_session_id}" if mcp_session_id else "http:anonymous",
-        )
+        context_id = f"http:{mcp_session_id}" if mcp_session_id else "http:anonymous"
+        if not self.mcp_server.begin_transport_request(context_id):
+            self.send_error(404, "MCP session not found")
+            return
 
-        # Dispatch to MCP registry
-        setattr(self.mcp_server._protocol_version, "data", protocol_version)
         try:
-            response = self.mcp_server.registry.dispatch(parsed)
-        finally:
-            setattr(self.mcp_server._enabled_extensions, "data", set())
-            setattr(self.mcp_server._protocol_version, "data", None)
-            setattr(self.mcp_server._transport_session_id, "data", None)
+            # Parse extensions from query params and store in thread-local
+            extensions = self._parse_extensions(self.path)
+            setattr(self.mcp_server._enabled_extensions, "data", extensions)
+            setattr(self.mcp_server._transport_session_id, "data", context_id)
 
-        def send_response(status: int, body: bytes):
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            if mcp_session_id is not None:
-                self.send_header("MCP-Session-Id", mcp_session_id)
-            self.send_cors_headers()
-            self.end_headers()
-            self.wfile.write(body)
+            # Dispatch to MCP registry
+            setattr(self.mcp_server._protocol_version, "data", protocol_version)
+            try:
+                response = self.mcp_server.registry.dispatch(parsed)
+            finally:
+                setattr(self.mcp_server._enabled_extensions, "data", set())
+                setattr(self.mcp_server._protocol_version, "data", None)
+                setattr(self.mcp_server._transport_session_id, "data", None)
 
-        if is_notification:
-            if response is None:
-                self._send_empty_response(202, mcp_session_id=mcp_session_id)
+            def send_response(status: int, body: bytes):
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                if mcp_session_id is not None:
+                    self.send_header("MCP-Session-Id", mcp_session_id)
+                self.send_cors_headers()
+                self.end_headers()
+                self.wfile.write(body)
+
+            if is_notification:
+                if response is None:
+                    self._send_empty_response(202, mcp_session_id=mcp_session_id)
+                else:
+                    self._send_jsonrpc_http_error(400, -32600, "Notification was not accepted")
+            elif response is None:
+                self._send_jsonrpc_http_error(400, -32603, "Request did not produce a response")
             else:
-                self._send_jsonrpc_http_error(400, -32600, "Notification was not accepted")
-        elif response is None:
-            self._send_jsonrpc_http_error(400, -32603, "Request did not produce a response")
-        else:
-            send_response(200, json.dumps(response).encode("utf-8"))
+                send_response(200, json.dumps(response).encode("utf-8"))
+        finally:
+            self.mcp_server.end_transport_request(context_id)
 
 class McpServer:
     def __init__(
@@ -688,8 +728,16 @@ class McpServer:
         self._server_thread: threading.Thread | None = None
         self._running = False
         self._sse_connections: dict[str, _McpSseConnection] = {}
+        self._sse_connections_lock = threading.Lock()
         self._http_sessions: dict[str, tuple[str, float]] = {}
         self._http_sessions_lock = threading.Lock()
+        self._transport_sessions_lock = threading.Lock()
+        self._transport_active_requests: dict[str, int] = {}
+        self._transport_closing: dict[str, TransportSessionCloseReason] = {}
+        self._terminated_transport_sessions: set[str] = set()
+        self.transport_session_closed: (
+            Callable[[str, TransportSessionCloseReason], None] | None
+        ) = None
         self._protocol_version = threading.local()
         self._transport_session_id = threading.local()
         self._enabled_extensions = threading.local()  # set[str] per request
@@ -800,9 +848,22 @@ class McpServer:
         self._running = False
 
         # Close all SSE connections
-        for conn in self._sse_connections.values():
-            conn.alive = False
-        self._sse_connections.clear()
+        with self._sse_connections_lock:
+            sse_session_ids = list(self._sse_connections)
+            for conn in self._sse_connections.values():
+                conn.alive = False
+            self._sse_connections.clear()
+        with self._http_sessions_lock:
+            http_session_ids = list(self._http_sessions)
+            self._http_sessions.clear()
+        for session_id in sse_session_ids:
+            self.terminate_transport_session(
+                f"sse:{session_id}", "server_stopped"
+            )
+        for session_id in http_session_ids:
+            self.terminate_transport_session(
+                f"http:{session_id}", "server_stopped"
+            )
 
         # Shutdown the HTTP server
         if self._http_server:
@@ -823,20 +884,28 @@ class McpServer:
         stdout = stdout or sys.stdout.buffer
         write_lock = threading.Lock()
         workers: set[threading.Thread] = set()
+        context_id = "stdio:default"
+        close_reason: TransportSessionCloseReason = "eof"
+        self.open_transport_session(context_id)
 
         def dispatch(request: bytes) -> None:
-            setattr(self._transport_session_id, "data", "stdio:default")
+            if not self.begin_transport_request(context_id):
+                return
             try:
-                response = self.registry.dispatch(request)
+                setattr(self._transport_session_id, "data", context_id)
+                try:
+                    response = self.registry.dispatch(request)
+                finally:
+                    setattr(self._transport_session_id, "data", None)
+                if response is not None:
+                    with write_lock:
+                        try:
+                            stdout.write(json.dumps(response).encode("utf-8") + b"\n")
+                            stdout.flush()
+                        except BrokenPipeError:
+                            pass
             finally:
-                setattr(self._transport_session_id, "data", None)
-            if response is not None:
-                with write_lock:
-                    try:
-                        stdout.write(json.dumps(response).encode("utf-8") + b"\n")
-                        stdout.flush()
-                    except BrokenPipeError:
-                        pass
+                self.end_transport_request(context_id)
 
         try:
             while True:
@@ -865,21 +934,94 @@ class McpServer:
                     workers.add(worker)
                     workers = {thread for thread in workers if thread.is_alive()}
         except (BrokenPipeError, KeyboardInterrupt): # Client disconnected
-            pass
+            close_reason = "disconnect"
         finally:
             for worker in workers:
                 worker.join()
+            self.terminate_transport_session(context_id, close_reason)
 
     def get_current_transport_session_id(self) -> str | None:
         return getattr(self._transport_session_id, "data", None)
+
+    def open_transport_session(self, context_id: str) -> None:
+        """Mark a transport context as live, allowing deliberate ID reuse."""
+        with self._transport_sessions_lock:
+            if self._transport_active_requests.get(context_id, 0) > 0:
+                return
+            self._transport_closing.pop(context_id, None)
+            self._terminated_transport_sessions.discard(context_id)
+
+    def begin_transport_request(self, context_id: str) -> bool:
+        """Track an in-flight request unless the logical session is closing."""
+        with self._transport_sessions_lock:
+            if (
+                context_id in self._transport_closing
+                or context_id in self._terminated_transport_sessions
+            ):
+                return False
+            self._transport_active_requests[context_id] = (
+                self._transport_active_requests.get(context_id, 0) + 1
+            )
+            return True
+
+    def end_transport_request(self, context_id: str) -> None:
+        callback_reason: TransportSessionCloseReason | None = None
+        with self._transport_sessions_lock:
+            active = self._transport_active_requests.get(context_id, 0)
+            if active > 1:
+                self._transport_active_requests[context_id] = active - 1
+            else:
+                self._transport_active_requests.pop(context_id, None)
+                callback_reason = self._transport_closing.pop(context_id, None)
+                if callback_reason is not None:
+                    self._terminated_transport_sessions.add(context_id)
+        if callback_reason is not None:
+            self._notify_transport_session_closed(context_id, callback_reason)
+
+    def terminate_transport_session(
+        self,
+        context_id: str,
+        reason: TransportSessionCloseReason,
+    ) -> bool:
+        """Close a logical transport session exactly once after active work."""
+        notify_now = False
+        with self._transport_sessions_lock:
+            if (
+                context_id in self._transport_closing
+                or context_id in self._terminated_transport_sessions
+            ):
+                return False
+            if self._transport_active_requests.get(context_id, 0) > 0:
+                self._transport_closing[context_id] = reason
+            else:
+                self._terminated_transport_sessions.add(context_id)
+                notify_now = True
+        if notify_now:
+            self._notify_transport_session_closed(context_id, reason)
+        return True
+
+    def _notify_transport_session_closed(
+        self,
+        context_id: str,
+        reason: TransportSessionCloseReason,
+    ) -> None:
+        callback = self.transport_session_closed
+        if callback is None:
+            return
+        try:
+            callback(context_id, reason)
+        except Exception as e:
+            _log(f"[MCP] Transport session close callback failed: {e}")
+            traceback.print_exc()
 
     def register_http_session(
         self,
         session_id: str,
         protocol_version: str = LATEST_MCP_PROTOCOL_VERSION,
     ) -> None:
+        evicted: list[str] = []
         with self._http_sessions_lock:
-            self._prune_http_sessions_locked()
+            expired = self._prune_http_sessions_locked()
             if session_id not in self._http_sessions:
                 max_entries = max(1, self.http_session_max_entries)
                 while len(self._http_sessions) >= max_entries:
@@ -888,35 +1030,56 @@ class McpServer:
                         key=lambda key: self._http_sessions[key][1],
                     )
                     self._http_sessions.pop(oldest, None)
+                    evicted.append(oldest)
             self._http_sessions[session_id] = (
                 protocol_version,
                 time.monotonic(),
             )
+        for expired_id in expired:
+            self.terminate_transport_session(
+                f"http:{expired_id}", "idle_timeout"
+            )
+        for evicted_id in evicted:
+            self.terminate_transport_session(
+                f"http:{evicted_id}", "capacity_evicted"
+            )
+        self.open_transport_session(f"http:{session_id}")
 
     def has_http_session(self, session_id: str) -> bool:
         with self._http_sessions_lock:
-            self._prune_http_sessions_locked()
+            expired = self._prune_http_sessions_locked()
             session = self._http_sessions.get(session_id)
-            if session is None:
-                return False
-            self._http_sessions[session_id] = (session[0], time.monotonic())
-            return True
+            if session is not None:
+                self._http_sessions[session_id] = (session[0], time.monotonic())
+        for expired_id in expired:
+            self.terminate_transport_session(
+                f"http:{expired_id}", "idle_timeout"
+            )
+        return session is not None
 
     def get_http_session_protocol_version(self, session_id: str | None) -> str | None:
         if session_id is None:
             return None
         with self._http_sessions_lock:
-            self._prune_http_sessions_locked()
+            expired = self._prune_http_sessions_locked()
             session = self._http_sessions.get(session_id)
-            if session is None:
-                return None
-            self._http_sessions[session_id] = (session[0], time.monotonic())
-            return session[0]
+            if session is not None:
+                self._http_sessions[session_id] = (session[0], time.monotonic())
+        for expired_id in expired:
+            self.terminate_transport_session(
+                f"http:{expired_id}", "idle_timeout"
+            )
+        return session[0] if session is not None else None
 
-    def _prune_http_sessions_locked(self) -> None:
+    def remove_http_session(self, session_id: str) -> bool:
+        """Remove a Streamable HTTP session without firing its callback."""
+        with self._http_sessions_lock:
+            return self._http_sessions.pop(session_id, None) is not None
+
+    def _prune_http_sessions_locked(self) -> list[str]:
         ttl = self.http_session_ttl_seconds
         if ttl <= 0:
-            return
+            return []
         cutoff = time.monotonic() - ttl
         expired = [
             session_id
@@ -925,6 +1088,7 @@ class McpServer:
         ]
         for session_id in expired:
             self._http_sessions.pop(session_id, None)
+        return expired
 
     def cors_localhost(self, origin: str) -> bool:
         """Allow CORS requests from localhost on ANY port."""

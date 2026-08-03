@@ -64,6 +64,38 @@ class StdioTransportSpecTests(unittest.TestCase):
         self.assertEqual(response["id"], 1)
         self.assertEqual(response["result"]["protocolVersion"], "2025-11-25")
 
+    def test_stdio_eof_reports_transport_session_closed(self):
+        server = McpServer("ida-pro-mcp")
+        closed = []
+        server.transport_session_closed = (
+            lambda context_id, reason: closed.append((context_id, reason))
+        )
+
+        server.stdio(stdin=io.BytesIO(), stdout=io.BytesIO())
+
+        self.assertEqual(closed, [("stdio:default", "eof")])
+
+    def test_transport_close_callback_waits_for_active_request(self):
+        server = McpServer("ida-pro-mcp")
+        closed = []
+        server.transport_session_closed = (
+            lambda context_id, reason: closed.append((context_id, reason))
+        )
+        server.open_transport_session("http:test")
+        self.assertTrue(server.begin_transport_request("http:test"))
+
+        self.assertTrue(
+            server.terminate_transport_session("http:test", "client_terminated")
+        )
+        self.assertFalse(
+            server.terminate_transport_session("http:test", "server_stopped")
+        )
+        self.assertEqual(closed, [])
+
+        server.end_transport_request("http:test")
+
+        self.assertEqual(closed, [("http:test", "client_terminated")])
+
     def test_stdio_cancel_notification_logs_to_stderr(self):
         jsonrpc_mod.register_pending_request("req-1", "stdio:default")
         try:

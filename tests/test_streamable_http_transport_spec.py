@@ -167,15 +167,40 @@ class StreamableHttpTransportSpecTests(unittest.TestCase):
 
         self.assertEqual(status, 406)
 
-    def test_get_and_delete_mcp_are_method_not_allowed(self):
+    def test_get_mcp_is_method_not_allowed(self):
         get_status, _headers, _data = self._request(
             "GET",
             headers={"Accept": "text/event-stream"},
         )
-        delete_status, _headers, _data = self._request("DELETE")
 
         self.assertEqual(get_status, 405)
-        self.assertEqual(delete_status, 405)
+
+    def test_delete_requires_session_header(self):
+        status, _headers, _data = self._request("DELETE")
+
+        self.assertEqual(status, 400)
+
+    def test_delete_terminates_http_session_exactly_once(self):
+        closed = []
+        self.server.transport_session_closed = (
+            lambda context_id, reason: closed.append((context_id, reason))
+        )
+        session_id, _payload = self._initialize()
+
+        status, _headers, data = self._request(
+            "DELETE", headers={"MCP-Session-Id": session_id}
+        )
+        second_status, _headers, _data = self._request(
+            "DELETE", headers={"MCP-Session-Id": session_id}
+        )
+
+        self.assertEqual(status, 204)
+        self.assertEqual(data, b"")
+        self.assertEqual(second_status, 404)
+        self.assertEqual(
+            closed,
+            [(f"http:{session_id}", "client_terminated")],
+        )
 
     def test_gzip_body_is_limited_after_decompression(self):
         self.server.post_body_limit = 512
@@ -252,6 +277,10 @@ class StreamableHttpTransportSpecTests(unittest.TestCase):
 
     def test_expired_http_session_is_pruned(self):
         session_id, _payload = self._initialize()
+        closed = []
+        self.server.transport_session_closed = (
+            lambda context_id, reason: closed.append((context_id, reason))
+        )
         self.server.http_session_ttl_seconds = 1
         with self.server._http_sessions_lock:
             version, _last_accessed = self.server._http_sessions[session_id]
@@ -276,8 +305,16 @@ class StreamableHttpTransportSpecTests(unittest.TestCase):
         self.assertEqual(status, 404)
         with self.server._http_sessions_lock:
             self.assertNotIn(session_id, self.server._http_sessions)
+        self.assertEqual(
+            closed,
+            [(f"http:{session_id}", "idle_timeout")],
+        )
 
     def test_http_session_registry_evicts_oldest_entry_at_capacity(self):
+        closed = []
+        self.server.transport_session_closed = (
+            lambda context_id, reason: closed.append((context_id, reason))
+        )
         self.server.http_session_max_entries = 2
         self.server.register_http_session("first")
         self.server.register_http_session("second")
@@ -287,6 +324,10 @@ class StreamableHttpTransportSpecTests(unittest.TestCase):
             self.assertNotIn("first", self.server._http_sessions)
             self.assertIn("second", self.server._http_sessions)
             self.assertIn("third", self.server._http_sessions)
+        self.assertEqual(
+            closed,
+            [("http:first", "capacity_evicted")],
+        )
 
 
 if __name__ == "__main__":
