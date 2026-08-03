@@ -27,7 +27,6 @@ import secrets
 import signal
 import sys
 import threading
-import time
 from typing import Any
 
 # Import zeromcp directly from the vendored package path without triggering
@@ -269,7 +268,9 @@ _SESSION_ID_SCHEMA: dict = {
     "type": "string",
     "description": (
         "Session ID to route this call to. "
-        "If omitted, routes to the session bound to the caller's context."
+        "If omitted, routes to the session bound to the caller's context. "
+        "The first successful access creates an idempotent lease for the "
+        "caller's MCP session."
     ),
 }
 
@@ -281,7 +282,8 @@ _MGMT_TOOL_OVERRIDES: dict[str, dict] = {
             "Open a binary or IDB for analysis. If the same binary/IDB is "
             "already open, reuse and share the existing session. On success, "
             "the pool returns a session_id and binds it as the default for the "
-            "current context. Subsequent calls may omit session_id; use "
+            "current MCP session. Repeated opens from the same MCP session "
+            "reuse one lease. Subsequent calls may omit session_id; use "
             "idalib_switch to change the default session, or pass session_id "
             "explicitly to target a specific session. Use idalib_close to "
             "release the database reference when you no longer need it."
@@ -318,9 +320,10 @@ _MGMT_TOOL_OVERRIDES: dict[str, dict] = {
     "idalib_close": {
         "name": "idalib_close",
         "description": (
-            "Release your reference to a session. The IDB is only closed "
-            "when all agents have released their references (refcount "
-            "reaches zero). Defaults to your currently bound session."
+            "Release this MCP session's lease on an IDA session. The IDB is "
+            "only closed when all MCP sessions have released their leases. "
+            "Closing a session not held by the caller is rejected. Defaults "
+            "to the caller's currently bound session."
         ),
         "inputSchema": {
             "type": "object",
@@ -348,9 +351,9 @@ _MGMT_TOOL_OVERRIDES: dict[str, dict] = {
         "name": "idalib_switch",
         "description": (
             "Switch your default session routing to a different existing "
-            "session. This does not affect reference counts — you still need "
-            "to idalib_close sessions you opened. Use this to access a "
-            "session opened by another agent without changing ownership."
+            "session. Switching also creates an idempotent lease for this "
+            "MCP session, so the target remains alive until idalib_close or "
+            "the MCP session terminates."
         ),
         "inputSchema": {
             "type": "object",
@@ -510,6 +513,12 @@ def build_dispatch(
     def _get_transport_ctx() -> str | None:
         return mcp.get_current_transport_session_id()
 
+    def _require_transport_ctx() -> str:
+        ctx = _get_transport_ctx()
+        if not ctx:
+            raise RuntimeError("No transport context available.")
+        return ctx
+
     def _resolve_session_id(arguments: dict) -> str:
         """2-tier session resolution: explicit arg > context binding."""
         sid = arguments.pop("session_id", None)
@@ -570,20 +579,20 @@ def build_dispatch(
         run_auto = arguments.get("run_auto_analysis", True)
         allow_dup = arguments.get("allow_duplicate_input", False)
 
+        ctx = _get_transport_ctx()
+        if not ctx:
+            return {"success": False, "error": "No transport context available."}
+
         result = pool.open_session(
             input_path,
             run_auto_analysis=run_auto,
             allow_duplicate_input=allow_dup,
+            context_id=ctx,
         )
         if not result.get("success"):
             return result
 
         actual_sid = result["session"]["session_id"]
-        ctx = _get_transport_ctx()
-        if ctx:
-            pool.bind_context(ctx, actual_sid)
-            pool.increment_refcount(actual_sid)
-
         result["session"]["refcount"] = pool.get_refcount(actual_sid)
         return result
 
@@ -597,54 +606,11 @@ def build_dispatch(
         if not sid:
             return {"success": False, "error": "No session bound. Use idalib_open first."}
 
-        # Guard: external sessions cannot be force-closed by agents
-        with pool._lock:
-            sess = pool.sr.get(sid)
-        if sess and sess.is_external:
-            if force:
-                return {
-                    "success": False,
-                    "error": (
-                        "Cannot force-close an externally registered session. "
-                        "The session owner must disconnect from the pool."
-                    ),
-                }
-            if ctx:
-                bound_sid = pool.get_context_session_id(ctx)
-                if bound_sid == sid:
-                    pool.unbind_context(ctx)
-            new_rc = pool.decrement_refcount(sid)
-            return {
-                "success": True,
-                "closed": False,
-                "refcount": new_rc,
-                "message": "Reference released. Session is externally managed.",
-            }
-
-        if ctx:
-            bound_sid = pool.get_context_session_id(ctx)
-            if bound_sid == sid:
-                pool.unbind_context(ctx)
-
         if force:
-            with pool._lock:
-                pool.sr._unbind_session_everywhere(sid)
-            result = pool.close_session(sid)
-            result["closed"] = True
-            return result
-
-        new_rc = pool.decrement_refcount(sid)
-        if new_rc <= 0:
-            result = pool.close_session(sid)
-            result["closed"] = True
-            return result
-
-        return {
-            "success": True,
-            "closed": False,
-            "refcount": new_rc,
-            "message": f"Reference released. Session '{sid}' still has {new_rc} reference(s).",
-        }
+            return pool.close_session(sid)
+        if not ctx:
+            return {"success": False, "error": "No transport context available."}
+        return pool.release_session(ctx, sid)
 
     def _handle_idalib_switch(arguments: dict) -> dict:
         sid = arguments.get("session_id", "")
@@ -652,17 +618,16 @@ def build_dispatch(
         if not ctx:
             return {"success": False, "error": "No transport context available."}
 
-        with pool._lock:
-            sess = pool.sr.get(sid)
-            if sess is None:
-                return {"success": False, "error": f"Session not found: {sid}"}
-            pool.sr.bind_context(ctx, sid)
-            sess.last_accessed = time.monotonic()
-            return {
-                "success": True,
-                "session": sess.to_dict(refcount=pool.sr.get_refcount(sid)),
-                "message": f"Context now routes to session: {sid}",
-            }
+        try:
+            sess, _inst = pool.acquire_session(ctx, sid, bind=True)
+        except (KeyError, RuntimeError) as e:
+            message = str(e.args[0]) if isinstance(e, KeyError) else str(e)
+            return {"success": False, "error": message}
+        return {
+            "success": True,
+            "session": sess.to_dict(refcount=pool.get_refcount(sid)),
+            "message": f"Context now routes to session: {sid}",
+        }
 
     def _handle_idalib_list(_arguments: dict) -> dict:
         ctx = _get_transport_ctx()
@@ -688,8 +653,10 @@ def build_dispatch(
             sid = pool.get_context_session_id(ctx)
         if not sid:
             return {"error": "No session to save. Use idalib_open first."}
+        if not ctx:
+            return {"error": "No transport context available."}
         try:
-            _sess, inst = pool.resolve_session_instance(sid)
+            _sess, inst = pool.acquire_session(ctx, sid)
         except (KeyError, RuntimeError) as e:
             return {"error": str(e)}
         return pool.forward_tool_call(inst, "idalib_save", arguments)
@@ -701,8 +668,10 @@ def build_dispatch(
             sid = pool.get_context_session_id(ctx)
         if not sid:
             return {"ready": False, "error": "No session bound. Use idalib_open first."}
+        if not ctx:
+            return {"ready": False, "error": "No transport context available."}
         try:
-            sess, inst = pool.resolve_session_instance(sid)
+            sess, inst = pool.acquire_session(ctx, sid)
         except (KeyError, RuntimeError) as e:
             return {"ready": False, "error": str(e)}
         if getattr(inst, "is_external", False) is True:
@@ -721,8 +690,10 @@ def build_dispatch(
             sid = pool.get_context_session_id(ctx)
         if not sid:
             return {"ready": False, "error": "No session bound. Use idalib_open first."}
+        if not ctx:
+            return {"ready": False, "error": "No transport context available."}
         try:
-            sess, inst = pool.resolve_session_instance(sid)
+            sess, inst = pool.acquire_session(ctx, sid)
         except (KeyError, RuntimeError) as e:
             return {"ready": False, "error": str(e)}
         if getattr(inst, "is_external", False) is True:
@@ -777,7 +748,8 @@ def build_dispatch(
             return _tool_error_response(request_id, str(e.args[0]))
 
         try:
-            _sess, inst = pool.resolve_session_instance(session_id)
+            ctx = _require_transport_ctx()
+            _sess, inst = pool.acquire_session(ctx, session_id)
         except (KeyError, RuntimeError) as e:
             message = str(e.args[0]) if isinstance(e, KeyError) else str(e)
             return _tool_error_response(request_id, message)
@@ -865,7 +837,7 @@ def build_dispatch(
                 f"No session bound for method '{method}'. Use idalib_open first.",
             )
         try:
-            _sess, inst = pool.resolve_session_instance(sid)
+            _sess, inst = pool.acquire_session(ctx, sid)
         except (KeyError, RuntimeError) as e:
             return _error_response(request_id, -32001, str(e))
         return _forward_request(inst, request_obj)

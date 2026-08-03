@@ -1,6 +1,6 @@
 """Tests for idalib_pool_manager — SessionRegistry, PoolManager, and pool server dispatch.
 
-These tests exercise the pure-Python session/context/refcount logic without
+These tests exercise the pure-Python session/context/lease logic without
 requiring idapro or running real idalib backend processes.
 """
 
@@ -61,7 +61,7 @@ class TestSessionRegistry(unittest.TestCase):
 
     def test_remove_cleans_up_everything(self):
         self.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
-        self.sr.increment_refcount("s1")
+        self.sr.acquire_context_session("ctx-a", "s1")
         self.sr.bind_context("ctx-a", "s1")
 
         removed = self.sr.remove("s1")
@@ -112,21 +112,38 @@ class TestSessionRegistry(unittest.TestCase):
         self.assertIsNone(self.sr.get_context_session_id("ctx-b"))
         self.assertIsNone(self.sr.get_context_session_id("ctx-c"))
 
-    # --- Refcounts ---
+    # --- Context leases / derived refcounts ---
 
-    def test_increment_decrement_refcount(self):
+    def test_acquire_release_context_session_is_idempotent(self):
         self.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
-        self.assertEqual(self.sr.increment_refcount("s1"), 1)
-        self.assertEqual(self.sr.increment_refcount("s1"), 2)
-        self.assertEqual(self.sr.increment_refcount("s1"), 3)
-        self.assertEqual(self.sr.decrement_refcount("s1"), 2)
-        self.assertEqual(self.sr.decrement_refcount("s1"), 1)
-        self.assertEqual(self.sr.decrement_refcount("s1"), 0)
+        self.assertTrue(self.sr.acquire_context_session("ctx-a", "s1"))
+        self.assertFalse(self.sr.acquire_context_session("ctx-a", "s1"))
+        self.assertTrue(self.sr.acquire_context_session("ctx-b", "s1"))
+        self.assertEqual(self.sr.get_refcount("s1"), 2)
+        self.assertTrue(self.sr.release_context_session("ctx-a", "s1"))
+        self.assertEqual(self.sr.get_refcount("s1"), 1)
+        self.assertFalse(self.sr.release_context_session("ctx-a", "s1"))
+        self.assertTrue(self.sr.release_context_session("ctx-b", "s1"))
+        self.assertEqual(self.sr.get_refcount("s1"), 0)
 
-    def test_decrement_below_zero_clamps(self):
+    def test_release_unowned_lease_is_noop(self):
         self.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
-        self.assertEqual(self.sr.decrement_refcount("s1"), 0)
-        self.assertEqual(self.sr.decrement_refcount("s1"), 0)
+        self.assertFalse(self.sr.release_context_session("ctx-a", "s1"))
+        self.assertEqual(self.sr.get_refcount("s1"), 0)
+
+    def test_release_context_updates_both_indexes_and_binding(self):
+        self.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
+        self.sr.create("s2", "/tmp/b.elf", "/tmp/b.elf.i64", instance_index=1)
+        self.sr.acquire_context_session("ctx-a", "s1")
+        self.sr.acquire_context_session("ctx-a", "s2")
+        self.sr.acquire_context_session("ctx-b", "s2")
+        self.sr.bind_context("ctx-a", "s1")
+
+        self.assertEqual(self.sr.release_context("ctx-a"), {"s1", "s2"})
+        self.assertEqual(self.sr.get_context_sessions("ctx-a"), set())
+        self.assertIsNone(self.sr.get_context_session_id("ctx-a"))
+        self.assertEqual(self.sr.get_refcount("s1"), 0)
+        self.assertEqual(self.sr.get_refcount("s2"), 1)
 
     def test_refcount_unknown_session(self):
         self.assertEqual(self.sr.get_refcount("nope"), 0)
@@ -136,9 +153,9 @@ class TestSessionRegistry(unittest.TestCase):
     def test_list_all_includes_refcount_and_context(self):
         self.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
         self.sr.create("s2", "/tmp/b.elf", "/tmp/b.elf.i64", instance_index=1)
-        self.sr.increment_refcount("s1")
-        self.sr.increment_refcount("s1")
-        self.sr.increment_refcount("s2")
+        self.sr.acquire_context_session("ctx-a", "s1")
+        self.sr.acquire_context_session("ctx-b", "s1")
+        self.sr.acquire_context_session("ctx-c", "s2")
         self.sr.bind_context("ctx-a", "s1")
 
         result = self.sr.list_all(context_id="ctx-a")
@@ -234,11 +251,11 @@ class TestSessionRegistryEdgeCases(unittest.TestCase):
         self.assertIsNone(result["current_context_session_id"])
         self.assertFalse(result["sessions"][0]["is_current_context"])
 
-    def test_remove_with_multiple_contexts_and_refcount(self):
-        """remove() should clean up all contexts and refcount."""
+    def test_remove_with_multiple_contexts_and_leases(self):
+        """remove() should clean up all context bindings and leases."""
         self.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
-        self.sr.increment_refcount("s1")
-        self.sr.increment_refcount("s1")
+        self.sr.acquire_context_session("ctx-a", "s1")
+        self.sr.acquire_context_session("ctx-b", "s1")
         self.sr.bind_context("ctx-a", "s1")
         self.sr.bind_context("ctx-b", "s1")
         self.sr.remove("s1")
@@ -362,10 +379,67 @@ class TestPoolServerDispatch(unittest.TestCase):
         pool.get_context_session_id.side_effect = lambda ctx: pool.sr.get_context_session_id(ctx)
         pool.bind_context.side_effect = lambda ctx, sid: pool.sr.bind_context(ctx, sid)
         pool.unbind_context.side_effect = lambda ctx: pool.sr.unbind_context(ctx)
-        pool.increment_refcount.side_effect = lambda sid: pool.sr.increment_refcount(sid)
-        pool.decrement_refcount.side_effect = lambda sid: pool.sr.decrement_refcount(sid)
         pool.get_refcount.side_effect = lambda sid: pool.sr.get_refcount(sid)
         pool.list_sessions.side_effect = lambda context_id=None: pool.sr.list_all(context_id=context_id)
+
+        def open_session(_path, **kwargs):
+            result = pool.open_session.return_value
+            if isinstance(result, dict) and result.get("success"):
+                context_id = kwargs.get("context_id")
+                sid = result["session"]["session_id"]
+                pool.sr.acquire_context_session(context_id, sid)
+                pool.sr.bind_context(context_id, sid)
+            return result
+
+        def acquire_session(context_id, session_id, *, bind=False):
+            sess = pool.sr.get(session_id)
+            if sess is None:
+                raise KeyError(f"Session not found: {session_id}")
+            pool.sr.acquire_context_session(context_id, session_id)
+            if bind:
+                pool.sr.bind_context(context_id, session_id)
+            resolved = pool.resolve_session_instance(session_id)
+            try:
+                _resolved_sess, inst = resolved
+            except (TypeError, ValueError):
+                inst = MagicMock(spec=InstanceInfo)
+            return sess, inst
+
+        def release_session(context_id, session_id):
+            sess = pool.sr.get(session_id)
+            if sess is None:
+                return {"success": False, "closed": False, "error": f"Session not found: {session_id}"}
+            if not pool.sr.release_context_session(context_id, session_id):
+                return {"success": False, "closed": False, "error": "MCP context does not hold session"}
+            if pool.sr.get_context_session_id(context_id) == session_id:
+                pool.sr.unbind_context(context_id)
+            refcount = pool.sr.get_refcount(session_id)
+            if sess.is_external or refcount:
+                return {"success": True, "closed": False, "refcount": refcount}
+            result = pool.close_session(session_id)
+            if not isinstance(result, dict):
+                result = {"success": True}
+            return {**result, "closed": bool(result.get("success"))}
+
+        def close_session(session_id):
+            sess = pool.sr.get(session_id)
+            if sess is not None and sess.is_external:
+                return {
+                    "success": False,
+                    "closed": False,
+                    "error": "Cannot force-close an externally registered session.",
+                }
+            pool.sr.clear_session_contexts(session_id)
+            pool.sr._unbind_session_everywhere(session_id)
+            result = pool.close_session.return_value
+            if not isinstance(result, dict):
+                return {"success": True, "closed": True}
+            return {**result, "closed": bool(result.get("success"))}
+
+        pool.open_session.side_effect = open_session
+        pool.acquire_session.side_effect = acquire_session
+        pool.release_session.side_effect = release_session
+        pool.close_session.side_effect = close_session
         return mcp, pool
 
     def _dispatch(self, mcp, request, transport_session_id=None):
@@ -428,6 +502,7 @@ class TestPoolServerDispatch(unittest.TestCase):
             "/tmp/a.elf",
             run_auto_analysis=True,
             allow_duplicate_input=False,
+            context_id="sse:agent-a",
         )
 
     def test_open_existing_binary_shares_session(self):
@@ -459,8 +534,8 @@ class TestPoolServerDispatch(unittest.TestCase):
     def test_close_decrements_refcount_session_stays(self):
         mcp, pool = self._make_mcp_and_pool()
         pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
-        pool.sr.increment_refcount("s1")
-        pool.sr.increment_refcount("s1")
+        pool.sr.acquire_context_session("sse:agent-a", "s1")
+        pool.sr.acquire_context_session("sse:agent-b", "s1")
         pool.sr.bind_context("sse:agent-a", "s1")
         pool.sr.bind_context("sse:agent-b", "s1")
         self.build_dispatch(mcp, pool)
@@ -484,7 +559,7 @@ class TestPoolServerDispatch(unittest.TestCase):
     def test_close_refcount_zero_closes_session(self):
         mcp, pool = self._make_mcp_and_pool()
         pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
-        pool.sr.increment_refcount("s1")
+        pool.sr.acquire_context_session("sse:agent-a", "s1")
         pool.sr.bind_context("sse:agent-a", "s1")
         pool.close_session.return_value = {"success": True, "message": "closed"}
         self.build_dispatch(mcp, pool)
@@ -505,9 +580,9 @@ class TestPoolServerDispatch(unittest.TestCase):
     def test_close_force_ignores_refcount(self):
         mcp, pool = self._make_mcp_and_pool()
         pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
-        pool.sr.increment_refcount("s1")
-        pool.sr.increment_refcount("s1")
-        pool.sr.increment_refcount("s1")
+        pool.sr.acquire_context_session("sse:agent-a", "s1")
+        pool.sr.acquire_context_session("sse:agent-b", "s1")
+        pool.sr.acquire_context_session("sse:agent-c", "s1")
         pool.sr.bind_context("sse:agent-a", "s1")
         pool.sr.bind_context("sse:agent-b", "s1")
         pool.sr.bind_context("sse:agent-c", "s1")
@@ -545,11 +620,11 @@ class TestPoolServerDispatch(unittest.TestCase):
         result = resp["result"]["structuredContent"]
         self.assertIn("error", result)
 
-    def test_switch_changes_routing_without_refcount(self):
+    def test_switch_acquires_target_lease_and_changes_routing(self):
         mcp, pool = self._make_mcp_and_pool()
         pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
         pool.sr.create("s2", "/tmp/b.elf", "/tmp/b.elf.i64", instance_index=1)
-        pool.sr.increment_refcount("s1")
+        pool.sr.acquire_context_session("sse:agent-a", "s1")
         pool.sr.bind_context("sse:agent-a", "s1")
         self.build_dispatch(mcp, pool)
 
@@ -564,9 +639,9 @@ class TestPoolServerDispatch(unittest.TestCase):
         result = resp["result"]["structuredContent"]
         self.assertTrue(result["success"])
         self.assertEqual(pool.sr.get_context_session_id("sse:agent-a"), "s2")
-        # Refcounts unchanged
+        # Switching retains the old lease and idempotently acquires the target.
         self.assertEqual(pool.sr.get_refcount("s1"), 1)
-        self.assertEqual(pool.sr.get_refcount("s2"), 0)
+        self.assertEqual(pool.sr.get_refcount("s2"), 1)
 
     def test_switch_nonexistent_session_returns_error(self):
         mcp, pool = self._make_mcp_and_pool()
@@ -804,7 +879,7 @@ class TestPoolServerDispatch(unittest.TestCase):
     def test_list_returns_context_info(self):
         mcp, pool = self._make_mcp_and_pool()
         pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
-        pool.sr.increment_refcount("s1")
+        pool.sr.acquire_context_session("sse:agent-a", "s1")
         pool.sr.bind_context("sse:agent-a", "s1")
         self.build_dispatch(mcp, pool)
 
@@ -825,7 +900,7 @@ class TestPoolServerDispatch(unittest.TestCase):
     def test_current_returns_bound_session(self):
         mcp, pool = self._make_mcp_and_pool()
         pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
-        pool.sr.increment_refcount("s1")
+        pool.sr.acquire_context_session("sse:agent-a", "s1")
         pool.sr.bind_context("sse:agent-a", "s1")
         self.build_dispatch(mcp, pool)
 
@@ -903,8 +978,7 @@ class TestPoolServerDispatch(unittest.TestCase):
         self.assertIn("error", result)
         self.assertIsNone(pool.sr.get_context_session_id("sse:agent-a"))
 
-    def test_open_without_transport_context(self):
-        """stdio mode: no transport ctx → refcount still 0, no binding."""
+    def test_open_without_transport_context_is_rejected(self):
         mcp, pool = self._make_mcp_and_pool()
         pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
         pool.open_session.return_value = {
@@ -922,7 +996,8 @@ class TestPoolServerDispatch(unittest.TestCase):
         resp = self._dispatch(mcp, req, transport_session_id=None)
 
         result = resp["result"]["structuredContent"]
-        self.assertTrue(result["success"])
+        self.assertFalse(result["success"])
+        self.assertIn("transport context", result["error"])
         self.assertEqual(pool.sr.get_refcount("s1"), 0)
 
     # --- close edge cases ---
@@ -932,8 +1007,8 @@ class TestPoolServerDispatch(unittest.TestCase):
         mcp, pool = self._make_mcp_and_pool()
         pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
         pool.sr.create("s2", "/tmp/b.elf", "/tmp/b.elf.i64", instance_index=1)
-        pool.sr.increment_refcount("s1")
-        pool.sr.increment_refcount("s2")
+        pool.sr.acquire_context_session("sse:agent-a", "s1")
+        pool.sr.acquire_context_session("sse:agent-a", "s2")
         pool.sr.bind_context("sse:agent-a", "s1")
         pool.close_session.return_value = {"success": True, "message": "closed"}
         self.build_dispatch(mcp, pool)
@@ -954,10 +1029,10 @@ class TestPoolServerDispatch(unittest.TestCase):
         self.assertEqual(pool.sr.get_context_session_id("sse:agent-a"), "s1")
 
     def test_close_without_transport_context(self):
-        """Close with explicit session_id but no transport context."""
+        """An explicit session_id cannot bypass MCP lease ownership."""
         mcp, pool = self._make_mcp_and_pool()
         pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
-        pool.sr.increment_refcount("s1")
+        pool.sr.acquire_context_session("sse:agent-a", "s1")
         pool.close_session.return_value = {"success": True, "message": "closed"}
         self.build_dispatch(mcp, pool)
 
@@ -970,8 +1045,8 @@ class TestPoolServerDispatch(unittest.TestCase):
         resp = self._dispatch(mcp, req, transport_session_id=None)
 
         result = resp["result"]["structuredContent"]
-        self.assertTrue(result["success"])
-        self.assertTrue(result["closed"])
+        self.assertFalse(result["success"])
+        self.assertIn("transport context", result["error"])
 
     def test_close_without_context_and_without_sid_returns_error(self):
         """No transport context and no explicit session_id → error."""
@@ -1133,7 +1208,7 @@ class TestPoolServerDispatch(unittest.TestCase):
     def test_health_maps_to_server_health_for_external_session(self):
         mcp, pool = self._make_mcp_and_pool()
         pool.sr.create("ext1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0, is_external=True)
-        pool.sr.increment_refcount("ext1")
+        pool.sr.acquire_context_session("sse:agent-a", "ext1")
         pool.sr.bind_context("sse:agent-a", "ext1")
         bridge = MagicMock()
         bridge.alive = True
@@ -1194,7 +1269,7 @@ class TestPoolServerDispatch(unittest.TestCase):
     def test_warmup_maps_to_server_warmup_for_external_session(self):
         mcp, pool = self._make_mcp_and_pool()
         pool.sr.create("ext1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0, is_external=True)
-        pool.sr.increment_refcount("ext1")
+        pool.sr.acquire_context_session("sse:agent-a", "ext1")
         pool.sr.bind_context("sse:agent-a", "ext1")
         bridge = MagicMock()
         bridge.alive = True
@@ -1515,13 +1590,83 @@ class TestPoolManager(unittest.TestCase):
         pool.unbind_context("ctx-a")
         self.assertIsNone(pool.get_context_session_id("ctx-a"))
 
-    def test_refcount_passthrough(self):
+    def test_refcount_is_derived_from_context_leases(self):
         pool = self._make_pool()
         pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
-        self.assertEqual(pool.increment_refcount("s1"), 1)
-        self.assertEqual(pool.increment_refcount("s1"), 2)
+        pool.sr.acquire_context_session("ctx-a", "s1")
+        pool.sr.acquire_context_session("ctx-b", "s1")
         self.assertEqual(pool.get_refcount("s1"), 2)
-        self.assertEqual(pool.decrement_refcount("s1"), 1)
+        pool.sr.release_context_session("ctx-a", "s1")
+        self.assertEqual(pool.get_refcount("s1"), 1)
+
+    def test_acquire_session_is_idempotent_per_context(self):
+        pool = self._make_pool()
+        process = MagicMock()
+        process.is_alive.return_value = True
+        inst = InstanceInfo(0, process)
+        pool.im.find.return_value = inst
+        pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
+
+        pool.acquire_session("ctx-a", "s1", bind=True)
+        pool.acquire_session("ctx-a", "s1")
+        pool.acquire_session("ctx-b", "s1")
+
+        self.assertEqual(pool.get_refcount("s1"), 2)
+        self.assertEqual(pool.get_context_session_id("ctx-a"), "s1")
+        self.assertEqual(pool.sr.get_context_sessions("ctx-a"), {"s1"})
+
+    def test_release_session_rejects_unowned_session(self):
+        pool = self._make_pool()
+        pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
+        pool.sr.acquire_context_session("ctx-a", "s1")
+
+        result = pool.release_session("ctx-b", "s1")
+
+        self.assertFalse(result["success"])
+        self.assertIn("does not hold", result["error"])
+        self.assertEqual(pool.get_refcount("s1"), 1)
+
+    def test_release_last_local_lease_closes_session(self):
+        pool = self._make_pool()
+        process = MagicMock()
+        process.is_alive.return_value = True
+        inst = InstanceInfo(0, process, session_id="s1")
+        pool.im.find.return_value = inst
+        pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
+        pool.sr.acquire_context_session("ctx-a", "s1")
+        pool.sr.bind_context("ctx-a", "s1")
+        pool.im.forward_tool_call.return_value = {"success": True}
+
+        result = pool.release_session("ctx-a", "s1")
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["closed"])
+        self.assertIsNone(pool.sr.get("s1"))
+        self.assertIsNone(pool.get_context_session_id("ctx-a"))
+        self.assertEqual(
+            pool.im.forward_tool_call.call_args_list,
+            [
+                call(inst, "idalib_save", {}),
+                call(inst, "idalib_close", {"session_id": "s1"}),
+            ],
+        )
+        pool.im.kill.assert_called_once_with(inst)
+
+    def test_release_external_lease_preserves_owner_baseline(self):
+        pool = self._make_pool()
+        pool.sr.create(
+            "ext1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0,
+            is_external=True,
+        )
+        pool.sr.acquire_context_session("ctx-a", "ext1")
+
+        result = pool.release_session("ctx-a", "ext1")
+
+        self.assertTrue(result["success"])
+        self.assertFalse(result["closed"])
+        self.assertEqual(result["refcount"], 1)
+        self.assertIsNotNone(pool.sr.get("ext1"))
+        pool.im.kill.assert_not_called()
 
     def test_list_sessions_with_context(self):
         pool = self._make_pool()
@@ -1563,13 +1708,14 @@ class TestPoolManager(unittest.TestCase):
     def test_shutdown_all_clears_everything(self):
         pool = self._make_pool()
         pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
-        pool.sr.increment_refcount("s1")
+        pool.sr.acquire_context_session("ctx-a", "s1")
         pool.sr.bind_context("ctx-a", "s1")
         pool.im.instances = []
         pool.shutdown_all()
         self.assertEqual(len(pool.sr.sessions), 0)
         self.assertEqual(len(pool.sr._context_bindings), 0)
-        self.assertEqual(len(pool.sr._refcounts), 0)
+        self.assertEqual(len(pool.sr._context_sessions), 0)
+        self.assertEqual(len(pool.sr._session_contexts), 0)
 
     def test_shutdown_all_skips_external_instance_save(self):
         pool = self._make_pool()
@@ -1974,6 +2120,7 @@ class TestMultiAgentScenario(unittest.TestCase):
     def setUp(self):
         from ida_pro_mcp import idalib_pool_server
         self.mcp_mod = idalib_pool_server._mcp_mod
+        self.McpServer = self.mcp_mod.McpServer
         self.build_dispatch = idalib_pool_server.build_dispatch
 
     def _dispatch(self, mcp, request, transport_session_id):
@@ -2004,20 +2151,7 @@ class TestMultiAgentScenario(unittest.TestCase):
         6. Agent A closes → S1 refcount=1, stays alive
         7. Agent B closes S1 explicitly → refcount=0, S1 closes
         """
-        mcp = self.mcp_mod.McpServer("test")
-        pool = MagicMock(spec=PoolManager)
-        pool._lock = threading.Lock()
-        pool.sr = SessionRegistry()
-        pool.discover_tools.return_value = [
-            {"name": "get_functions", "inputSchema": {"type": "object", "properties": {}}},
-        ]
-        pool.get_context_session_id.side_effect = lambda ctx: pool.sr.get_context_session_id(ctx)
-        pool.bind_context.side_effect = lambda ctx, sid: pool.sr.bind_context(ctx, sid)
-        pool.unbind_context.side_effect = lambda ctx: pool.sr.unbind_context(ctx)
-        pool.increment_refcount.side_effect = lambda sid: pool.sr.increment_refcount(sid)
-        pool.decrement_refcount.side_effect = lambda sid: pool.sr.decrement_refcount(sid)
-        pool.get_refcount.side_effect = lambda sid: pool.sr.get_refcount(sid)
-        pool.list_sessions.side_effect = lambda context_id=None: pool.sr.list_all(context_id=context_id)
+        mcp, pool = TestPoolServerDispatch._make_mcp_and_pool(self)
         pool.close_session.return_value = {"success": True, "message": "closed"}
 
         mock_inst_0 = MagicMock(spec=InstanceInfo)
@@ -2068,7 +2202,7 @@ class TestMultiAgentScenario(unittest.TestCase):
         self.assertEqual(pool.sr.get_refcount("s1"), 2)
         self.assertEqual(pool.sr.get_context_session_id("sse:B"), "s1")
 
-        # Step 5: Agent B switches back to S2 (refcounts unchanged)
+        # Step 5: Agent B switches back to S2 (the existing lease is idempotent)
         r = self._tool_call(mcp, "idalib_switch", {"session_id": "s2"}, "sse:B")
         self.assertTrue(r["success"])
         self.assertEqual(pool.sr.get_context_session_id("sse:B"), "s2")
@@ -2157,7 +2291,7 @@ class TestExternalRegistration(unittest.TestCase):
         sid = reg["session"]["session_id"]
 
         # Simulate agent refcount
-        pool.sr.increment_refcount(sid)  # agent opens
+        pool.sr.acquire_context_session("http:agent-a", sid)
         self.assertEqual(pool.sr.get_refcount(sid), 2)  # user + agent
 
         result = pool.unregister_external(sid)
@@ -2174,7 +2308,7 @@ class TestExternalRegistration(unittest.TestCase):
         sid = reg["session"]["session_id"]
         self.assertEqual(pool.get_external_agent_count(sid), 0)
 
-        pool.sr.increment_refcount(sid)
+        pool.sr.acquire_context_session("http:agent-a", sid)
         self.assertEqual(pool.get_external_agent_count(sid), 1)
 
 
@@ -2194,8 +2328,7 @@ class TestExternalCloseGuard(TestPoolServerDispatch):
     def test_force_close_external_rejected(self):
         mcp, pool = self._make_mcp_and_pool()
         pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0, is_external=True)
-        pool.sr.increment_refcount("s1")
-        pool.sr.increment_refcount("s1")  # agent ref
+        pool.sr.acquire_context_session("sse:agent-a", "s1")
         pool.sr.bind_context("sse:agent-a", "s1")
 
         self.build_dispatch(mcp, pool)
@@ -2206,8 +2339,7 @@ class TestExternalCloseGuard(TestPoolServerDispatch):
     def test_normal_close_external_keeps_session(self):
         mcp, pool = self._make_mcp_and_pool()
         pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0, is_external=True)
-        pool.sr.increment_refcount("s1")  # user ref
-        pool.sr.increment_refcount("s1")  # agent ref
+        pool.sr.acquire_context_session("sse:agent-a", "s1")
         pool.sr.bind_context("sse:agent-a", "s1")
 
         self.build_dispatch(mcp, pool)

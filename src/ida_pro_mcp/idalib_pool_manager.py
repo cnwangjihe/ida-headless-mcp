@@ -10,8 +10,9 @@ Key invariants
   explicitly confirms a duplicate input.
 * Sessions are always "hot" (backed by a dedicated running instance). Opening
   a new session starts a new instance; closing the session kills it.
-* Each session has a reference count tracking how many agents have it open.
-  When the refcount reaches zero the session is closed automatically.
+* MCP transport contexts hold idempotent leases on IDA sessions.  The
+  bidirectional context/session indexes are the source of truth for refcounts.
+  When the last lease is released the session is closed automatically.
 * ``_context_bindings`` maps MCP transport session IDs to IDA session IDs,
   providing per-agent routing so multiple agents sharing one MCP endpoint
   can work on different IDBs without interfering.
@@ -380,7 +381,7 @@ class InstanceManager:
 # ---------------------------------------------------------------------------
 
 class SessionRegistry:
-    """Tracks session metadata, path uniqueness, context bindings, and refcounts.
+    """Tracks sessions, routing bindings, and bidirectional context leases.
 
     Two path indices provide dedup:
     - ``_input_path_index``: canonical binary path → list of session IDs
@@ -393,7 +394,8 @@ class SessionRegistry:
         self._input_path_index: dict[str, list[str]] = {}
         self._idb_path_index: dict[str, str] = {}
         self._context_bindings: dict[str, str] = {}
-        self._refcounts: dict[str, int] = {}
+        self._context_sessions: dict[str, set[str]] = {}
+        self._session_contexts: dict[str, set[str]] = {}
 
     def create(
         self,
@@ -417,7 +419,7 @@ class SessionRegistry:
         self._input_path_index.setdefault(input_path, []).append(session_id)
         if idb_path:
             self._idb_path_index[idb_path] = session_id
-        self._refcounts[session_id] = 0
+        self._session_contexts[session_id] = set()
         return sess
 
     def remove(self, session_id: str) -> SessionInfo | None:
@@ -431,7 +433,8 @@ class SessionRegistry:
                 self._input_path_index.pop(sess.input_path, None)
             if sess.idb_path:
                 self._idb_path_index.pop(sess.idb_path, None)
-        self._refcounts.pop(session_id, None)
+        self.clear_session_contexts(session_id)
+        self._session_contexts.pop(session_id, None)
         self._unbind_session_everywhere(session_id)
         return sess
 
@@ -496,20 +499,68 @@ class SessionRegistry:
         for ctx in stale:
             del self._context_bindings[ctx]
 
-    # --- Refcounts ---
+    # --- Context leases ---
 
-    def increment_refcount(self, session_id: str) -> int:
-        rc = self._refcounts.get(session_id, 0) + 1
-        self._refcounts[session_id] = rc
-        return rc
+    def acquire_context_session(self, context_id: str, session_id: str) -> bool:
+        """Acquire an idempotent context lease. Returns True when newly added."""
+        if session_id not in self.sessions:
+            raise ValueError(f"Session not found: {session_id}")
+        context_sessions = self._context_sessions.setdefault(context_id, set())
+        if session_id in context_sessions:
+            return False
+        context_sessions.add(session_id)
+        self._session_contexts.setdefault(session_id, set()).add(context_id)
+        return True
 
-    def decrement_refcount(self, session_id: str) -> int:
-        rc = max(0, self._refcounts.get(session_id, 0) - 1)
-        self._refcounts[session_id] = rc
-        return rc
+    def release_context_session(self, context_id: str, session_id: str) -> bool:
+        """Release one context lease. Returns False when it was not owned."""
+        context_sessions = self._context_sessions.get(context_id)
+        if not context_sessions or session_id not in context_sessions:
+            return False
+        context_sessions.remove(session_id)
+        if not context_sessions:
+            self._context_sessions.pop(context_id, None)
+        session_contexts = self._session_contexts.get(session_id)
+        if session_contexts is not None:
+            session_contexts.discard(context_id)
+        return True
+
+    def release_context(self, context_id: str) -> set[str]:
+        """Release every session held by a context and remove its binding."""
+        session_ids = self._context_sessions.pop(context_id, set())
+        for session_id in session_ids:
+            session_contexts = self._session_contexts.get(session_id)
+            if session_contexts is not None:
+                session_contexts.discard(context_id)
+        self._context_bindings.pop(context_id, None)
+        return set(session_ids)
+
+    def clear_session_contexts(self, session_id: str) -> set[str]:
+        """Remove a session from every context lease set."""
+        session_contexts = self._session_contexts.get(session_id, set())
+        context_ids = set(session_contexts)
+        for context_id in context_ids:
+            context_sessions = self._context_sessions.get(context_id)
+            if context_sessions is None:
+                continue
+            context_sessions.discard(session_id)
+            if not context_sessions:
+                self._context_sessions.pop(context_id, None)
+        session_contexts.clear()
+        return context_ids
+
+    def context_holds_session(self, context_id: str, session_id: str) -> bool:
+        return session_id in self._context_sessions.get(context_id, set())
+
+    def get_context_sessions(self, context_id: str) -> set[str]:
+        return set(self._context_sessions.get(context_id, set()))
 
     def get_refcount(self, session_id: str) -> int:
-        return self._refcounts.get(session_id, 0)
+        sess = self.sessions.get(session_id)
+        if sess is None:
+            return 0
+        owner_ref = 1 if sess.is_external else 0
+        return owner_ref + len(self._session_contexts.get(session_id, set()))
 
     # --- Listing ---
 
@@ -636,7 +687,8 @@ class PoolManager:
                     self.sr._input_path_index.clear()
                     self.sr._idb_path_index.clear()
                     self.sr._context_bindings.clear()
-                    self.sr._refcounts.clear()
+                    self.sr._context_sessions.clear()
+                    self.sr._session_contexts.clear()
                     self._opening_inputs.clear()
                     self._reserved_session_ids.clear()
                 finally:
@@ -686,6 +738,8 @@ class PoolManager:
         binary_path: str,
         run_auto_analysis: bool = True,
         allow_duplicate_input: bool = False,
+        *,
+        context_id: str | None = None,
     ) -> dict:
         try:
             with self._operation():
@@ -693,6 +747,7 @@ class PoolManager:
                     binary_path,
                     run_auto_analysis=run_auto_analysis,
                     allow_duplicate_input=allow_duplicate_input,
+                    context_id=context_id,
                 )
         except PoolShuttingDownError as e:
             return {"success": False, "error": str(e)}
@@ -702,6 +757,7 @@ class PoolManager:
         binary_path: str,
         run_auto_analysis: bool,
         allow_duplicate_input: bool,
+        context_id: str | None,
     ) -> dict:
         resolved = _normalize_path(binary_path)
         is_idb = resolved.endswith((".idb", ".i64"))
@@ -718,8 +774,15 @@ class PoolManager:
                 if is_idb:
                     existing_sid = self.sr.find_by_idb_path(resolved)
                     if existing_sid is not None:
+                        inst = self.im.find(self.sr.get(existing_sid).instance_index)
+                        if inst is not None and inst.closing is True:
+                            self._condition.wait()
+                            continue
                         self.sr.touch(existing_sid)
                         sess = self.sr.get(existing_sid)
+                        if context_id:
+                            self.sr.acquire_context_session(context_id, existing_sid)
+                            self.sr.bind_context(context_id, existing_sid)
                         return {
                             "success": True,
                             "existing": True,
@@ -736,8 +799,15 @@ class PoolManager:
                             if len(matching_sids) == 1
                             else self.sr.disambiguate(matching_sids, resolved)
                         )
+                        inst = self.im.find(self.sr.get(existing_sid).instance_index)
+                        if inst is not None and inst.closing is True:
+                            self._condition.wait()
+                            continue
                         self.sr.touch(existing_sid)
                         sess = self.sr.get(existing_sid)
+                        if context_id:
+                            self.sr.acquire_context_session(context_id, existing_sid)
+                            self.sr.bind_context(context_id, existing_sid)
                         return {
                             "success": True,
                             "existing": True,
@@ -820,6 +890,9 @@ class PoolManager:
                         session_id, canonical_input, idb_path, inst.index
                     )
                     inst.session_id = session_id
+                    if context_id:
+                        self.sr.acquire_context_session(context_id, session_id)
+                        self.sr.bind_context(context_id, session_id)
 
             if conflict_sid is not None:
                 try:
@@ -887,8 +960,25 @@ class PoolManager:
                     "closed": False,
                     "error": f"Session is already closing: {session_id}",
                 }
+            if sess.is_external:
+                return {
+                    "success": False,
+                    "closed": False,
+                    "error": (
+                        "Cannot force-close an externally registered session. "
+                        "The session owner must disconnect from the pool."
+                    ),
+                }
+            self.sr.clear_session_contexts(session_id)
+            self.sr._unbind_session_everywhere(session_id)
             inst.closing = True
 
+        return self._finish_close_session(sess, inst)
+
+    def _finish_close_session(
+        self, sess: SessionInfo, inst: InstanceInfo
+    ) -> dict:
+        session_id = sess.session_id
         with inst.operation_lock:
             if not sess.is_external:
                 try:
@@ -905,10 +995,85 @@ class PoolManager:
         with self._lock:
             self.sr.remove(session_id)
             inst.session_id = None
+            self._condition.notify_all()
 
         self.im.kill(inst)
 
         return {"success": True, "closed": True, "message": f"Session closed: {session_id}"}
+
+    def acquire_session(
+        self,
+        context_id: str,
+        session_id: str,
+        *,
+        bind: bool = False,
+    ) -> tuple[SessionInfo, InstanceInfo]:
+        """Acquire an idempotent lease and resolve a live session atomically."""
+        with self._operation():
+            with self._lock:
+                sess, inst = self._resolve_session_instance_locked(session_id)
+                self.sr.acquire_context_session(context_id, session_id)
+                if bind:
+                    self.sr.bind_context(context_id, session_id)
+                self.sr.touch(session_id)
+                return sess, inst
+
+    def release_session(self, context_id: str, session_id: str) -> dict:
+        """Release a context-owned lease and close an unreferenced local IDB."""
+        try:
+            with self._operation():
+                with self._lock:
+                    sess = self.sr.get(session_id)
+                    if sess is None:
+                        return {
+                            "success": False,
+                            "closed": False,
+                            "error": f"Session not found: {session_id}",
+                        }
+                    if not self.sr.release_context_session(context_id, session_id):
+                        return {
+                            "success": False,
+                            "closed": False,
+                            "error": (
+                                f"MCP context does not hold session '{session_id}'. "
+                                "Use idalib_open, idalib_switch, or an explicit "
+                                "session_id tool call first."
+                            ),
+                        }
+                    if self.sr.get_context_session_id(context_id) == session_id:
+                        self.sr.unbind_context(context_id)
+                    new_rc = self.sr.get_refcount(session_id)
+                    if sess.is_external or new_rc > 0:
+                        return {
+                            "success": True,
+                            "closed": False,
+                            "refcount": new_rc,
+                            "message": (
+                                "Reference released. Session is externally managed."
+                                if sess.is_external
+                                else f"Reference released. Session '{session_id}' "
+                                f"still has {new_rc} reference(s)."
+                            ),
+                        }
+                    inst = self.im.find(sess.instance_index)
+                    if inst is None:
+                        self.sr.remove(session_id)
+                        self._condition.notify_all()
+                        return {
+                            "success": True,
+                            "closed": True,
+                            "message": f"Session cleaned up: {session_id}",
+                        }
+                    if inst.closing:
+                        return {
+                            "success": False,
+                            "closed": False,
+                            "error": f"Session is already closing: {session_id}",
+                        }
+                    inst.closing = True
+                return self._finish_close_session(sess, inst)
+        except PoolShuttingDownError as e:
+            return {"success": False, "closed": False, "error": str(e)}
 
     # ------------------------------------------------------------------
     # External instance registration
@@ -977,8 +1142,6 @@ class PoolManager:
                 is_external=True,
             )
             inst.session_id = session_id
-            # User's baseline refcount
-            self.sr.increment_refcount(session_id)
 
         return {
             "success": True,
@@ -1018,27 +1181,33 @@ class PoolManager:
     ) -> tuple[SessionInfo, InstanceInfo]:
         """Return (session, instance) for a hot session."""
         with self._lock:
-            sess = self.sr.get(session_id)
-            if sess is None:
-                raise KeyError(
-                    f"Session '{session_id}' not found. "
-                    f"Use idalib_open to create a session first."
-                )
+            sess, inst = self._resolve_session_instance_locked(session_id)
             self.sr.touch(session_id)
-            inst = self.im.find(sess.instance_index)
-            if inst is None:
-                raise RuntimeError(
-                    f"Instance for session '{session_id}' is gone. "
-                    f"The session may need to be re-opened."
-                )
-            if inst.closing:
-                raise RuntimeError(f"Session '{session_id}' is closing.")
-            if not inst.is_alive():
-                raise RuntimeError(
-                    f"Instance for session '{session_id}' is not running. "
-                    "The session may need to be re-opened."
-                )
             return sess, inst
+
+    def _resolve_session_instance_locked(
+        self, session_id: str
+    ) -> tuple[SessionInfo, InstanceInfo]:
+        sess = self.sr.get(session_id)
+        if sess is None:
+            raise KeyError(
+                f"Session '{session_id}' not found. "
+                f"Use idalib_open to create a session first."
+            )
+        inst = self.im.find(sess.instance_index)
+        if inst is None:
+            raise RuntimeError(
+                f"Instance for session '{session_id}' is gone. "
+                f"The session may need to be re-opened."
+            )
+        if inst.closing:
+            raise RuntimeError(f"Session '{session_id}' is closing.")
+        if not inst.is_alive():
+            raise RuntimeError(
+                f"Instance for session '{session_id}' is not running. "
+                "The session may need to be re-opened."
+            )
+        return sess, inst
 
     # ------------------------------------------------------------------
     # Context binding pass-throughs
@@ -1055,14 +1224,6 @@ class PoolManager:
     def get_context_session_id(self, context_id: str) -> str | None:
         with self._lock:
             return self.sr.get_context_session_id(context_id)
-
-    def increment_refcount(self, session_id: str) -> int:
-        with self._lock:
-            return self.sr.increment_refcount(session_id)
-
-    def decrement_refcount(self, session_id: str) -> int:
-        with self._lock:
-            return self.sr.decrement_refcount(session_id)
 
     def get_refcount(self, session_id: str) -> int:
         with self._lock:
