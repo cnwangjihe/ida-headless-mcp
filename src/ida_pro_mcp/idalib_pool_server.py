@@ -483,11 +483,12 @@ def build_dispatch(
     pool: PoolManager,
     *,
     output_cache: PoolOutputCache | None = None,
+    initial_tools: list[dict] | None = None,
 ):
     """Patch ``mcp.registry.dispatch`` with pool-aware routing."""
 
     dispatch_original = mcp.registry.dispatch
-    _tools_cache: list[dict] | None = None
+    _tools_cache = _prepare_tools(initial_tools) if initial_tools is not None else None
     _tools_cache_lock = threading.Lock()
     _active_forwards_lock = threading.Lock()
     _active_forwards: dict[tuple[str | None, int | str], tuple[Any, object]] = {}
@@ -1050,7 +1051,20 @@ def main():
     signal.signal(signal.SIGTERM, request_shutdown)
 
     try:
-        build_dispatch(mcp, pool, output_cache=output_cache)
+        logger.info("Checking IDA backend startup...")
+        try:
+            initial_tools = pool.discover_tools()
+        except Exception as e:
+            print(f"Error: IDA backend startup check failed: {e}", file=sys.stderr)
+            raise SystemExit(1) from None
+        logger.info("IDA backend ready; discovered %d tools", len(initial_tools))
+
+        build_dispatch(
+            mcp,
+            pool,
+            output_cache=output_cache,
+            initial_tools=initial_tools,
+        )
 
         transport = args.transport
         if transport == "stdio":

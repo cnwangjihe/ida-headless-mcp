@@ -40,12 +40,44 @@ class PoolServerLifecycleTests(unittest.TestCase):
     ):
         pool = pool_cls.return_value
         mcp = mcp_cls.return_value
+        initial_tools = [{"name": "get_functions", "inputSchema": {}}]
+        pool.discover_tools.return_value = initial_tools
 
         with patch.object(sys, "argv", ["idalib-pool"]):
             idalib_pool_server.main()
 
         pool_cls.assert_called_once_with(runtime_dir=None, idalib_args=[])
+        pool.discover_tools.assert_called_once_with()
+        build_dispatch.assert_called_once_with(
+            mcp,
+            pool,
+            output_cache=None,
+            initial_tools=initial_tools,
+        )
         mcp.stdio.assert_called_once_with()
+        pool.shutdown_all.assert_called_once_with()
+
+    @patch.object(idalib_pool_server.signal, "signal")
+    @patch.object(idalib_pool_server, "build_dispatch")
+    @patch.object(idalib_pool_server, "McpServer")
+    @patch.object(idalib_pool_server, "PoolManager")
+    def test_backend_startup_failure_prevents_listening(
+        self, pool_cls, mcp_cls, build_dispatch, signal_mock
+    ):
+        pool = pool_cls.return_value
+        pool.discover_tools.side_effect = RuntimeError("idalib.dll unavailable")
+
+        with (
+            patch.object(sys, "argv", ["idalib-pool"]),
+            patch.object(sys, "stderr"),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            idalib_pool_server.main()
+
+        self.assertEqual(raised.exception.code, 1)
+        build_dispatch.assert_not_called()
+        mcp_cls.return_value.stdio.assert_not_called()
+        mcp_cls.return_value.serve.assert_not_called()
         pool.shutdown_all.assert_called_once_with()
 
 

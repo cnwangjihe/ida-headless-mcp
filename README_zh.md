@@ -134,6 +134,10 @@ uv run idalib-pool --runtime-dir ./ida-mcp-runtime
 配置文件自动发现方式保持不变。PowerShell 中包含空格的路径需要加引号，例如
 `--ida-dir "C:\Program Files\IDA Professional 9.1"`。
 
+Pool 会在打开 stdio 或网络监听前启动一个临时 backend 并完成工具发现。如果
+IDA 无法加载或初始化，启动命令会立即失败。验证完成后该临时 backend 会被关闭，
+不会作为空闲或预热实例保留。
+
 环境变量 `IDA_MCP_AUTH_TOKEN` 与 `--auth-token` 等效。
 
 请在 MCP Client 连接后通过 `idalib_open` 打开 binary 或 IDB。这样每个新建

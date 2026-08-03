@@ -138,6 +138,11 @@ environment-variable and idapro configuration-file discovery continue to work.
 On PowerShell, quote paths containing spaces, for example
 `--ida-dir "C:\Program Files\IDA Professional 9.1"`.
 
+Before opening its stdio or network transport, the pool starts one temporary
+backend and performs tool discovery. Startup fails immediately if IDA cannot be
+loaded or initialized. The temporary validation backend is then closed; it is
+not retained as an idle or prewarmed instance.
+
 `IDA_MCP_AUTH_TOKEN` is equivalent to `--auth-token`.
 
 Open binaries and IDBs through `idalib_open` after the MCP client connects.

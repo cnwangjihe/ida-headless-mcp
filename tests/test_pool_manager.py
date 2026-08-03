@@ -1302,6 +1302,18 @@ class TestPoolServerDispatch(unittest.TestCase):
 
         pool.discover_tools.assert_called_once_with()
 
+    def test_tools_list_uses_startup_discovery_cache(self):
+        mcp, pool = self._make_mcp_and_pool()
+        initial_tools = pool.discover_tools.return_value
+        self.build_dispatch(mcp, pool, initial_tools=initial_tools)
+        request = {"jsonrpc": "2.0", "method": "tools/list", "id": 1}
+
+        response = mcp.registry.dispatch(request)
+
+        names = {tool["name"] for tool in response["result"]["tools"]}
+        self.assertIn("get_functions", names)
+        pool.discover_tools.assert_not_called()
+
     # --- dispatch protocol pass-through ---
 
     def test_initialize_passes_through(self):
