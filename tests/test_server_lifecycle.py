@@ -48,6 +48,7 @@ class PoolServerLifecycleTests(unittest.TestCase):
 
         pool_cls.assert_called_once_with(runtime_dir=None, idalib_args=[])
         mcp_cls.assert_called_once_with("ida-pro-mcp", resources_enabled=False)
+        self.assertEqual(mcp.http_session_ttl_seconds, 3600)
         pool.discover_tools.assert_called_once_with()
         build_dispatch.assert_called_once_with(
             mcp,

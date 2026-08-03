@@ -283,10 +283,8 @@ class StreamableHttpTransportSpecTests(unittest.TestCase):
         )
         self.server.http_session_ttl_seconds = 1
         with self.server._http_sessions_lock:
-            version, _last_accessed = self.server._http_sessions[session_id]
-            self.server._http_sessions[session_id] = (
-                version,
-                time.monotonic() - 2,
+            self.server._http_sessions[session_id].last_accessed = (
+                time.monotonic() - 2
             )
 
         status, _headers, _data = self._post(
@@ -328,6 +326,66 @@ class StreamableHttpTransportSpecTests(unittest.TestCase):
             closed,
             [("http:first", "capacity_evicted")],
         )
+
+    def test_capacity_allows_temporary_overflow_when_all_entries_active(self):
+        closed = []
+        self.server.transport_session_closed = (
+            lambda context_id, reason: closed.append((context_id, reason))
+        )
+        self.server.http_session_max_entries = 2
+        self.server.register_http_session("first")
+        self.server.register_http_session("second")
+        self.assertTrue(self.server.begin_transport_request("http:first"))
+        self.assertTrue(self.server.begin_transport_request("http:second"))
+
+        self.server.register_http_session("third")
+
+        with self.server._http_sessions_lock:
+            self.assertEqual(len(self.server._http_sessions), 3)
+        self.assertEqual(closed, [])
+
+        self.server.end_transport_request("http:first")
+        self.server.touch_http_session("first")
+
+        with self.server._http_sessions_lock:
+            self.assertEqual(len(self.server._http_sessions), 2)
+            self.assertIn("first", self.server._http_sessions)
+            self.assertIn("second", self.server._http_sessions)
+            self.assertNotIn("third", self.server._http_sessions)
+        self.assertEqual(closed, [("http:third", "capacity_evicted")])
+        self.server.end_transport_request("http:second")
+
+    def test_idle_ttl_zero_disables_expiration(self):
+        self.server.http_session_ttl_seconds = 0
+        self.server.register_http_session("persistent")
+        with self.server._http_sessions_lock:
+            self.server._http_sessions["persistent"].last_accessed = 0
+
+        self.server.reap_http_sessions()
+
+        self.assertTrue(self.server.has_http_session("persistent"))
+
+    def test_background_reaper_expires_idle_session_without_new_request(self):
+        import threading
+
+        self.server.stop()
+        self.server = McpServer("ida-pro-mcp")
+        self.server.require_streamable_http_session = True
+        self.server.http_session_ttl_seconds = 0.1
+        closed = []
+        closed_event = threading.Event()
+
+        def on_closed(context_id, reason):
+            closed.append((context_id, reason))
+            closed_event.set()
+
+        self.server.transport_session_closed = on_closed
+        self.server.register_http_session("idle")
+        self.server.serve("127.0.0.1", 0, background=True)
+
+        self.assertTrue(closed_event.wait(2))
+        self.assertEqual(closed, [("http:idle", "idle_timeout")])
+        self.assertFalse(self.server.has_http_session("idle"))
 
 
 if __name__ == "__main__":

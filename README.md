@@ -67,7 +67,7 @@ pipe. The same lifecycle is used on Windows, Linux, and macOS.
   IDB is saved and its backend process is stopped.
 - Pool-owned session IDs are derived from the file name plus a stable path
   digest; callers must use the ID returned by `idalib_open`.
-- There is no LRU eviction and no global default session.
+- There is no LRU eviction of IDA sessions and no global default IDA session.
 
 ## Prerequisites
 
@@ -126,6 +126,11 @@ uv run idalib-pool \
   --transport http://127.0.0.1:8750 \
   --auth-token "replace-with-a-secret"
 
+# Expire idle Streamable HTTP sessions after 30 minutes (0 disables expiry)
+uv run idalib-pool \
+  --transport http://127.0.0.1:8750 \
+  --http-session-ttl 1800
+
 # Disable tools marked unsafe; unsafe tools are enabled by default
 uv run idalib-pool --safe
 
@@ -144,6 +149,14 @@ loaded or initialized. The temporary validation backend is then closed; it is
 not retained as an idle or prewarmed instance.
 
 `IDA_MCP_AUTH_TOKEN` is equivalent to `--auth-token`.
+
+The Streamable HTTP logical-session registry has a separate, fixed default
+capacity of 1024 entries. It removes the least-recently-used inactive MCP
+session when full. Active requests are never evicted; if every candidate is
+active, the registry temporarily exceeds the limit and converges after
+requests finish. The default idle TTL is 3600 seconds. Idle expiration and
+capacity eviction affect MCP client contexts, not the set of IDA sessions
+directly.
 
 Open binaries and IDBs through `idalib_open` after the MCP client connects.
 This ensures every created session has an owning reference and transport

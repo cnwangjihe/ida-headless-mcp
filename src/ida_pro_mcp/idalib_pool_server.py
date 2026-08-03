@@ -993,7 +993,16 @@ def main():
         default=os.environ.get("IDA_MCP_AUTH_TOKEN"),
         help="Bearer token for HTTP authentication (or set IDA_MCP_AUTH_TOKEN)",
     )
+    parser.add_argument(
+        "--http-session-ttl", type=float, default=60 * 60,
+        help=(
+            "Idle Streamable HTTP session lifetime in seconds "
+            "(default: 3600; 0 disables idle expiration)"
+        ),
+    )
     args = parser.parse_args()
+    if args.http_session_ttl < 0:
+        parser.error("--http-session-ttl must be non-negative")
 
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=log_level)
@@ -1015,6 +1024,7 @@ def main():
 
     mcp = McpServer("ida-pro-mcp", resources_enabled=False)
     mcp.require_streamable_http_session = True
+    mcp.http_session_ttl_seconds = args.http_session_ttl
     if args.auth_token:
         mcp.auth_token = args.auth_token
     output_cache = (

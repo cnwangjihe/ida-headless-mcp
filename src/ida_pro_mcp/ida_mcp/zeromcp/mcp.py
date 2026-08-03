@@ -11,6 +11,8 @@ import zlib
 import inspect
 import threading
 import traceback
+from collections import OrderedDict
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer, HTTPServer
 from typing import Any, Callable, Union, Annotated, BinaryIO, Literal, NotRequired, get_origin, get_args, get_type_hints, is_typeddict
 from types import UnionType
@@ -121,6 +123,12 @@ class _HttpBodyError(Exception):
         super().__init__(message)
         self.status = status
         self.message = message
+
+
+@dataclass
+class _HttpSession:
+    protocol_version: str
+    last_accessed: float
 
 
 class McpHttpRequestHandler(BaseHTTPRequestHandler):
@@ -656,13 +664,18 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
                     self.send_error(404, "MCP session not found")
                     return
 
-        if is_response:
-            self._send_empty_response(202, mcp_session_id=mcp_session_id)
-            return
-
         context_id = f"http:{mcp_session_id}" if mcp_session_id else "http:anonymous"
         if not self.mcp_server.begin_transport_request(context_id):
             self.send_error(404, "MCP session not found")
+            return
+
+        if is_response:
+            try:
+                self._send_empty_response(202, mcp_session_id=mcp_session_id)
+            finally:
+                self.mcp_server.end_transport_request(context_id)
+                if mcp_session_id is not None:
+                    self.mcp_server.touch_http_session(mcp_session_id)
             return
 
         try:
@@ -701,6 +714,8 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
                 send_response(200, json.dumps(response).encode("utf-8"))
         finally:
             self.mcp_server.end_transport_request(context_id)
+            if mcp_session_id is not None:
+                self.mcp_server.touch_http_session(mcp_session_id)
 
 class McpServer:
     def __init__(
@@ -729,12 +744,14 @@ class McpServer:
         self._running = False
         self._sse_connections: dict[str, _McpSseConnection] = {}
         self._sse_connections_lock = threading.Lock()
-        self._http_sessions: dict[str, tuple[str, float]] = {}
+        self._http_sessions: dict[str, _HttpSession] = {}
         self._http_sessions_lock = threading.Lock()
+        self._http_reaper_stop = threading.Event()
+        self._http_reaper_thread: threading.Thread | None = None
         self._transport_sessions_lock = threading.Lock()
         self._transport_active_requests: dict[str, int] = {}
         self._transport_closing: dict[str, TransportSessionCloseReason] = {}
-        self._terminated_transport_sessions: set[str] = set()
+        self._terminated_transport_sessions: OrderedDict[str, None] = OrderedDict()
         self.transport_session_closed: (
             Callable[[str, TransportSessionCloseReason], None] | None
         ) = None
@@ -818,6 +835,7 @@ class McpServer:
 
         # Only start thread after successful bind
         self._running = True
+        self._start_http_session_reaper()
 
         if unix_socket:
             _log(f"[MCP] Server started on unix:{unix_socket}")
@@ -846,6 +864,7 @@ class McpServer:
             return
 
         self._running = False
+        self._stop_http_session_reaper()
 
         # Close all SSE connections
         with self._sse_connections_lock:
@@ -949,7 +968,7 @@ class McpServer:
             if self._transport_active_requests.get(context_id, 0) > 0:
                 return
             self._transport_closing.pop(context_id, None)
-            self._terminated_transport_sessions.discard(context_id)
+            self._terminated_transport_sessions.pop(context_id, None)
 
     def begin_transport_request(self, context_id: str) -> bool:
         """Track an in-flight request unless the logical session is closing."""
@@ -974,7 +993,7 @@ class McpServer:
                 self._transport_active_requests.pop(context_id, None)
                 callback_reason = self._transport_closing.pop(context_id, None)
                 if callback_reason is not None:
-                    self._terminated_transport_sessions.add(context_id)
+                    self._mark_transport_session_terminated_locked(context_id)
         if callback_reason is not None:
             self._notify_transport_session_closed(context_id, callback_reason)
 
@@ -994,11 +1013,19 @@ class McpServer:
             if self._transport_active_requests.get(context_id, 0) > 0:
                 self._transport_closing[context_id] = reason
             else:
-                self._terminated_transport_sessions.add(context_id)
+                self._mark_transport_session_terminated_locked(context_id)
                 notify_now = True
         if notify_now:
             self._notify_transport_session_closed(context_id, reason)
         return True
+
+    def _mark_transport_session_terminated_locked(self, context_id: str) -> None:
+        """Keep a bounded tombstone cache to suppress duplicate close events."""
+        self._terminated_transport_sessions[context_id] = None
+        self._terminated_transport_sessions.move_to_end(context_id)
+        max_tombstones = max(1024, self.http_session_max_entries * 2)
+        while len(self._terminated_transport_sessions) > max_tombstones:
+            self._terminated_transport_sessions.popitem(last=False)
 
     def _notify_transport_session_closed(
         self,
@@ -1019,42 +1046,25 @@ class McpServer:
         session_id: str,
         protocol_version: str = LATEST_MCP_PROTOCOL_VERSION,
     ) -> None:
-        evicted: list[str] = []
         with self._http_sessions_lock:
             expired = self._prune_http_sessions_locked()
+            evicted: list[str] = []
             if session_id not in self._http_sessions:
                 max_entries = max(1, self.http_session_max_entries)
-                while len(self._http_sessions) >= max_entries:
-                    oldest = min(
-                        self._http_sessions,
-                        key=lambda key: self._http_sessions[key][1],
-                    )
-                    self._http_sessions.pop(oldest, None)
-                    evicted.append(oldest)
-            self._http_sessions[session_id] = (
-                protocol_version,
-                time.monotonic(),
+                evicted = self._evict_http_sessions_locked(max_entries - 1)
+            self._http_sessions[session_id] = _HttpSession(
+                protocol_version=protocol_version,
+                last_accessed=time.monotonic(),
             )
-        for expired_id in expired:
-            self.terminate_transport_session(
-                f"http:{expired_id}", "idle_timeout"
-            )
-        for evicted_id in evicted:
-            self.terminate_transport_session(
-                f"http:{evicted_id}", "capacity_evicted"
-            )
+        self._report_http_sessions_terminated(expired, "idle_timeout")
+        self._report_http_sessions_terminated(evicted, "capacity_evicted")
         self.open_transport_session(f"http:{session_id}")
 
     def has_http_session(self, session_id: str) -> bool:
         with self._http_sessions_lock:
             expired = self._prune_http_sessions_locked()
             session = self._http_sessions.get(session_id)
-            if session is not None:
-                self._http_sessions[session_id] = (session[0], time.monotonic())
-        for expired_id in expired:
-            self.terminate_transport_session(
-                f"http:{expired_id}", "idle_timeout"
-            )
+        self._report_http_sessions_terminated(expired, "idle_timeout")
         return session is not None
 
     def get_http_session_protocol_version(self, session_id: str | None) -> str | None:
@@ -1063,13 +1073,21 @@ class McpServer:
         with self._http_sessions_lock:
             expired = self._prune_http_sessions_locked()
             session = self._http_sessions.get(session_id)
-            if session is not None:
-                self._http_sessions[session_id] = (session[0], time.monotonic())
-        for expired_id in expired:
-            self.terminate_transport_session(
-                f"http:{expired_id}", "idle_timeout"
+        self._report_http_sessions_terminated(expired, "idle_timeout")
+        return session.protocol_version if session is not None else None
+
+    def touch_http_session(self, session_id: str) -> None:
+        """Record completed activity and converge any capacity overflow."""
+        with self._http_sessions_lock:
+            session = self._http_sessions.get(session_id)
+            if session is None:
+                return
+            session.last_accessed = time.monotonic()
+            evicted = self._evict_http_sessions_locked(
+                max(1, self.http_session_max_entries),
+                protected={session_id},
             )
-        return session[0] if session is not None else None
+        self._report_http_sessions_terminated(evicted, "capacity_evicted")
 
     def remove_http_session(self, session_id: str) -> bool:
         """Remove a Streamable HTTP session without firing its callback."""
@@ -1083,12 +1101,92 @@ class McpServer:
         cutoff = time.monotonic() - ttl
         expired = [
             session_id
-            for session_id, (_version, last_accessed) in self._http_sessions.items()
-            if last_accessed < cutoff
+            for session_id, session in self._http_sessions.items()
+            if (
+                session.last_accessed < cutoff
+                and not self._is_transport_session_active(f"http:{session_id}")
+            )
         ]
         for session_id in expired:
             self._http_sessions.pop(session_id, None)
         return expired
+
+    def _evict_http_sessions_locked(
+        self,
+        target_size: int,
+        *,
+        protected: set[str] | None = None,
+    ) -> list[str]:
+        """Evict inactive LRU entries; overflow is allowed if all are active."""
+        protected = protected or set()
+        evicted: list[str] = []
+        while len(self._http_sessions) > target_size:
+            candidates = [
+                session_id
+                for session_id in self._http_sessions
+                if (
+                    session_id not in protected
+                    and not self._is_transport_session_active(
+                        f"http:{session_id}"
+                    )
+                )
+            ]
+            if not candidates:
+                break
+            oldest = min(
+                candidates,
+                key=lambda key: self._http_sessions[key].last_accessed,
+            )
+            self._http_sessions.pop(oldest, None)
+            evicted.append(oldest)
+        return evicted
+
+    def _is_transport_session_active(self, context_id: str) -> bool:
+        with self._transport_sessions_lock:
+            return self._transport_active_requests.get(context_id, 0) > 0
+
+    def _report_http_sessions_terminated(
+        self,
+        session_ids: list[str],
+        reason: TransportSessionCloseReason,
+    ) -> None:
+        for session_id in session_ids:
+            self.terminate_transport_session(f"http:{session_id}", reason)
+
+    def reap_http_sessions(self) -> None:
+        """Expire idle sessions and reduce inactive capacity overflow."""
+        with self._http_sessions_lock:
+            expired = self._prune_http_sessions_locked()
+            evicted = self._evict_http_sessions_locked(
+                max(1, self.http_session_max_entries)
+            )
+        self._report_http_sessions_terminated(expired, "idle_timeout")
+        self._report_http_sessions_terminated(evicted, "capacity_evicted")
+
+    def _start_http_session_reaper(self) -> None:
+        self._http_reaper_stop = threading.Event()
+
+        def reap_loop() -> None:
+            while self._running:
+                ttl = self.http_session_ttl_seconds
+                interval = 30.0 if ttl <= 0 else min(30.0, max(0.1, ttl / 4))
+                if self._http_reaper_stop.wait(interval):
+                    return
+                self.reap_http_sessions()
+
+        self._http_reaper_thread = threading.Thread(
+            target=reap_loop,
+            name=f"{self.name}-http-session-reaper",
+            daemon=True,
+        )
+        self._http_reaper_thread.start()
+
+    def _stop_http_session_reaper(self) -> None:
+        self._http_reaper_stop.set()
+        thread = self._http_reaper_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+        self._http_reaper_thread = None
 
     def cors_localhost(self, origin: str) -> bool:
         """Allow CORS requests from localhost on ANY port."""
