@@ -727,7 +727,7 @@ def imports_query(
 
 @tool
 @idasync
-def idb_save(
+def idalib_save(
     path: Annotated[str, "Optional destination path (default: current IDB path)"] = "",
 ) -> dict:
     """Save active IDB to disk, optionally to a provided path."""

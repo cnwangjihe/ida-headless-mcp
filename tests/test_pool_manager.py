@@ -1079,7 +1079,7 @@ class TestPoolServerDispatch(unittest.TestCase):
         self.assertTrue(result.get("ok"))
         pool.resolve_session_instance.assert_called_once_with("s1")
 
-    def test_save_maps_to_idb_save_for_external_session(self):
+    def test_save_uses_canonical_tool_for_external_session(self):
         mcp, pool = self._make_mcp_and_pool()
         pool.sr.create("ext1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0, is_external=True)
         pool.sr.bind_context("sse:agent-a", "ext1")
@@ -1101,7 +1101,7 @@ class TestPoolServerDispatch(unittest.TestCase):
         result = resp["result"]["structuredContent"]
         self.assertTrue(result.get("ok"))
         pool.forward_tool_call.assert_called_once_with(
-            inst, "idb_save", {"path": "/tmp/a.elf.i64"}
+            inst, "idalib_save", {"path": "/tmp/a.elf.i64"}
         )
 
     def test_save_no_session_returns_error(self):
@@ -1255,6 +1255,8 @@ class TestPoolServerDispatch(unittest.TestCase):
              "inputSchema": {"type": "object", "properties": {}}},
             {"name": "idalib_close", "description": "old backend desc",
              "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "idalib_save", "description": "backend save",
+             "inputSchema": {"type": "object", "properties": {}}},
             {"name": "list_funcs", "description": "list functions",
              "inputSchema": {"type": "object", "properties": {}}},
         ]
@@ -1271,6 +1273,10 @@ class TestPoolServerDispatch(unittest.TestCase):
         # idalib_close should expose force param
         close_props = tools_by_name["idalib_close"]["inputSchema"]["properties"]
         self.assertIn("force", close_props)
+        # canonical save tool should appear exactly once
+        tool_names = [t["name"] for t in resp["result"]["tools"]]
+        self.assertEqual(tool_names.count("idalib_save"), 1)
+        self.assertNotIn("idb_save", tool_names)
         # non-management tool should get session_id injected
         self.assertIn("session_id", tools_by_name["list_funcs"]["inputSchema"]["properties"])
 

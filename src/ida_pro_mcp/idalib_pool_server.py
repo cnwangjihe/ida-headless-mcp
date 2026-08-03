@@ -687,8 +687,6 @@ def build_dispatch(
             _sess, inst = pool.resolve_session_instance(sid)
         except (KeyError, RuntimeError) as e:
             return {"error": str(e)}
-        if getattr(inst, "is_external", False) is True:
-            return pool.forward_tool_call(inst, "idb_save", arguments)
         return pool.forward_tool_call(inst, "idalib_save", arguments)
 
     def _handle_idalib_health(arguments: dict) -> dict:

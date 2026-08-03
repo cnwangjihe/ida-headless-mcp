@@ -96,23 +96,6 @@ def idalib_close(
 
 
 @tool
-def idalib_save(
-    path: Annotated[str, "Destination path (default: current IDB path)"] = "",
-) -> dict:
-    """Save the current database to disk."""
-    try:
-        save_path = path.strip() if path else ""
-        if not save_path:
-            save_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
-        if not save_path:
-            return {"ok": False, "error": "Could not resolve IDB path"}
-        ok = bool(ida_loader.save_database(save_path, 0))
-        return {"ok": ok, "path": save_path, "error": None if ok else "save failed"}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-@tool
 def idalib_health() -> dict:
     """Health/ready probe."""
     try:
