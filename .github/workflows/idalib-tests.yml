@@ -1,5 +1,8 @@
 name: idalib-tests
 on:
+  push:
+  pull_request:
+  pull_request_target:
   workflow_dispatch:
 
 jobs:
@@ -9,6 +12,7 @@ jobs:
     # require manual approval via the external-pr environment.
     if: |
       github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
       (
         github.event_name == 'pull_request_target' &&
         github.event.pull_request.head.repo.full_name != github.repository
@@ -34,3 +38,37 @@ jobs:
         run: |
           uv run ida-mcp-test tests/crackme03.elf -q
           uv run ida-mcp-test tests/typed_fixture.elf -q
+
+  cross-platform-pool-tests:
+    if: |
+      github.event_name == 'push' ||
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install pure-Python test dependencies
+        run: python -m pip install websockets==16.0
+
+      - name: Run cross-platform pool tests
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m unittest discover -s tests -p "test_backend_ipc.py"
+          python -m unittest discover -s tests -p "test_backend_bootstrap.py"
+          python -m unittest discover -s tests -p "test_pool_manager.py"
+          python -m unittest discover -s tests -p "test_pool_websocket_bridge.py"
+          python -m unittest discover -s tests -p "test_pool_websocket_server.py"
