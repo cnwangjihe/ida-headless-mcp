@@ -76,10 +76,17 @@ class PoolClient:
         if "error" in resp:
             return {"error": resp["error"].get("message", str(resp["error"]))}
         result = resp.get("result", {})
+        content = result.get("content", [])
+        if result.get("isError"):
+            message = (
+                content[0].get("text", "Tool call failed")
+                if content
+                else "Tool call failed"
+            )
+            return {"error": message}
         sc = result.get("structuredContent")
         if sc:
             return sc
-        content = result.get("content", [])
         if content and content[0].get("type") == "text":
             try:
                 return json.loads(content[0]["text"])
@@ -90,6 +97,24 @@ class PoolClient:
     def tools_list(self) -> list[dict]:
         resp = self.request("tools/list")
         return resp.get("result", {}).get("tools", [])
+
+
+class TestPoolClient(unittest.TestCase):
+    def test_tool_call_preserves_mcp_tool_errors(self):
+        client = PoolClient("127.0.0.1", 1)
+        client.request = lambda method, params: {
+            "jsonrpc": "2.0",
+            "result": {
+                "content": [{"type": "text", "text": "No session bound"}],
+                "isError": True,
+            },
+            "id": 1,
+        }
+
+        self.assertEqual(
+            client.tool_call("list_funcs"),
+            {"error": "No session bound"},
+        )
 
 
 @unittest.skipIf(SKIP_REASON, SKIP_REASON)
