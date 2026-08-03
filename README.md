@@ -30,7 +30,8 @@ MCP client ── stdio/HTTP/SSE ───────────┐
                             │ context/session router │
                             └───────┬────────┬───────┘
                                     │        │
-                           Unix socket       │ WebSocket /pool/ws
+                     inherited RPC/control  │ WebSocket /pool/ws
+                              Pipes         │
                                     │        │
                               ┌─────▼───┐ ┌──▼──────────────┐
                               │ idalib  │ │ IDA GUI plugin  │
@@ -43,6 +44,11 @@ short-lived internal backend that is stopped immediately after discovery.
 Every newly created local session starts its own dedicated backend process; the
 pool does not keep idle backends for reuse. An IDA GUI plugin can instead
 register its currently open IDB as an externally managed session.
+
+Local backends are started with Python's cross-platform `spawn` context. RPC
+and cancellation/shutdown use separate inherited `multiprocessing` pipes, so
+the internal channel exposes no TCP port, Unix-socket path, or public named
+pipe. The same lifecycle is used on Windows, Linux, and macOS.
 
 ### Session behavior
 
@@ -76,6 +82,12 @@ Example:
 
 ```sh
 export IDADIR=/path/to/ida-pro
+```
+
+PowerShell:
+
+```powershell
+$env:IDADIR = "C:\Program Files\IDA Professional 9.1"
 ```
 
 ## Installation
@@ -113,8 +125,8 @@ uv run idalib-pool \
 # Disable tools marked unsafe; unsafe tools are enabled by default
 uv run idalib-pool --safe
 
-# Use a specific directory for backend Unix sockets and logs
-uv run idalib-pool --socket-dir /tmp/ida-mcp-sockets
+# Use a specific directory for backend logs
+uv run idalib-pool --runtime-dir ./ida-mcp-runtime
 ```
 
 `IDA_MCP_AUTH_TOKEN` is equivalent to `--auth-token`.

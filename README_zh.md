@@ -30,7 +30,8 @@ MCP Client ── stdio/HTTP/SSE ───────────┐
                             │ context/session router │
                             └───────┬────────┬───────┘
                                     │        │
-                           Unix socket       │ WebSocket /pool/ws
+                      继承的 RPC/control     │ WebSocket /pool/ws
+                              Pipes         │
                                     │        │
                               ┌─────▼───┐ ┌──▼──────────────┐
                               │ idalib  │ │ IDA GUI Plugin │
@@ -42,6 +43,10 @@ Pool 主进程不会导入 `idapro`。它使用一次性内部 backend 发现工
 发现完成后立即终止该 backend。每个新建的本地会话都会启动自己的独立
 backend，Pool 不会保留空闲 backend 供后续复用。IDA GUI Plugin 也可以把当前
 打开的 IDB 注册成由 GUI 外部管理的会话。
+
+本地 backend 使用 Python 跨平台的 `spawn` context 启动。RPC 与取消/关闭命令
+分别使用两条继承的 `multiprocessing` Pipe，因此内部通道不会开放 TCP 端口、
+Unix socket 路径或公开的命名管道。Windows、Linux 与 macOS 使用同一套生命周期。
 
 ### 会话行为
 
@@ -74,6 +79,12 @@ backend，Pool 不会保留空闲 backend 供后续复用。IDA GUI Plugin 也�
 
 ```sh
 export IDADIR=/path/to/ida-pro
+```
+
+PowerShell：
+
+```powershell
+$env:IDADIR = "C:\Program Files\IDA Professional 9.1"
 ```
 
 ## 安装
@@ -111,8 +122,8 @@ uv run idalib-pool \
 # 禁用 unsafe 工具；默认会启用这些工具
 uv run idalib-pool --safe
 
-# 指定内部 backend 的 Unix socket 和日志目录
-uv run idalib-pool --socket-dir /tmp/ida-mcp-sockets
+# 指定 backend 日志目录
+uv run idalib-pool --runtime-dir ./ida-mcp-runtime
 ```
 
 环境变量 `IDA_MCP_AUTH_TOKEN` 与 `--auth-token` 等效。

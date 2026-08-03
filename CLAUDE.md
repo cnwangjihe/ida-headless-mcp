@@ -22,7 +22,11 @@ Main components:
 - `src/ida_pro_mcp/idalib_pool_manager.py`: backend lifecycle, session
   registry, path deduplication, context bindings, and reference counts.
 - `src/ida_pro_mcp/idalib_server.py`: internal idalib backend. One process
-  holds at most one active IDB and communicates over a Unix socket.
+  holds at most one active IDB and serves requests over inherited pipes.
+- `src/ida_pro_mcp/backend_ipc.py`: cross-platform JSON message protocol over
+  `multiprocessing.Connection`, including the independent control channel.
+- `src/ida_pro_mcp/backend_bootstrap.py`: minimal `spawn` target that redirects
+  per-backend logs before importing `idapro`.
 - `src/ida_pro_mcp/pool_websocket.py`: request/response bridge for externally
   registered GUI Plugin sessions.
 - `src/ida_pro_mcp/ida_mcp.py`: IDA Plugin loader and native menu UI for local
@@ -129,6 +133,8 @@ Pure-Python/unit transport and pool tests live in top-level `tests/`:
 
 ```bash
 PYTHONPATH=src uv run python -m unittest \
+  tests.test_backend_ipc \
+  tests.test_backend_bootstrap \
   tests.test_pool_manager \
   tests.test_pool_websocket_bridge \
   tests.test_pool_websocket_server \
@@ -138,6 +144,10 @@ PYTHONPATH=src uv run python -m unittest \
 
 `tests/test_pool_integration.py` starts real idalib backend processes and must
 be treated as an integration test.
+
+The GitHub Actions pure-Python pool job runs on both Ubuntu and Windows. It
+must keep exercising a real `spawn` process and inherited pipes without
+requiring an IDA installation.
 
 IDA-facing tests live under `src/ida_pro_mcp/ida_mcp/tests/` and are registered
 with `@test`:
