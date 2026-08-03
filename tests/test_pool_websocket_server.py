@@ -238,7 +238,7 @@ class TestPoolWebSocketServer(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
 
-        with connect(f"ws://127.0.0.1:{port}/pool/ws", proxy=None) as ws:
+        with connect(f"ws://127.0.0.1:{port}/pool/ws") as ws:
             ws.send(
                 json.dumps(
                     {
@@ -279,7 +279,7 @@ class TestPoolWebSocketServer(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
 
-        with connect(f"ws://127.0.0.1:{port}/pool/ws", proxy=None) as ws:
+        with connect(f"ws://127.0.0.1:{port}/pool/ws") as ws:
             ws.send(
                 json.dumps(
                     {

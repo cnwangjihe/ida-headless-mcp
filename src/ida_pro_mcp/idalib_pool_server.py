@@ -235,7 +235,6 @@ def _accept_pool_websocket(handler) -> WebSocketConnection | None:
     return WebSocketConnection(
         handler.request,
         ServerProtocol(state=OPEN, max_size=POOL_WEBSOCKET_MAX_SIZE),
-        ping_interval=None,
     )
 
 # --------------------------------------------------------------------------
