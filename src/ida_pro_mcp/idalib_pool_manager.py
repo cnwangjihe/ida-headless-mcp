@@ -134,11 +134,9 @@ class InstanceInfo:
             return self.ws_bridge is not None and self.ws_bridge.alive
         if self.process is None:
             return False
-        if hasattr(self.process, "poll"):
-            return self.process.poll() is None
         try:
             return self.process.is_alive()
-        except ValueError:
+        except (AssertionError, ValueError):
             return False
 
 

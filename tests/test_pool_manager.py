@@ -1,7 +1,7 @@
 """Tests for idalib_pool_manager — SessionRegistry, PoolManager, and pool server dispatch.
 
 These tests exercise the pure-Python session/context/refcount logic without
-requiring idapro or running idalib_server subprocesses.
+requiring idapro or running real idalib backend processes.
 """
 
 import json
@@ -1436,7 +1436,7 @@ class TestPoolManager(unittest.TestCase):
     def test_discover_tools_uses_short_lived_instance(self):
         pool = self._make_pool()
         process = MagicMock()
-        process.poll.return_value = None
+        process.is_alive.return_value = True
         inst = InstanceInfo(0, process)
         tools = [{"name": "list_funcs", "inputSchema": {"type": "object"}}]
         pool.im.spawn.return_value = inst
@@ -1452,7 +1452,7 @@ class TestPoolManager(unittest.TestCase):
     def test_discover_tools_stops_instance_on_error(self):
         pool = self._make_pool()
         process = MagicMock()
-        process.poll.return_value = None
+        process.is_alive.return_value = True
         inst = InstanceInfo(0, process)
         pool.im.spawn.return_value = inst
         pool.im.forward_tools_list.side_effect = RuntimeError("discovery failed")
@@ -1519,7 +1519,7 @@ class TestPoolManager(unittest.TestCase):
     def test_cancel_local_instance_uses_control_pipe(self):
         pool = self._make_pool()
         process = MagicMock()
-        process.poll.return_value = None
+        process.is_alive.return_value = True
         inst = InstanceInfo(0, process)
         pool.im.send_control.return_value = True
 
@@ -1691,7 +1691,7 @@ class TestPoolManager(unittest.TestCase):
     def test_open_session_error_terminates_new_instance(self):
         pool = self._make_pool()
         process = MagicMock()
-        process.poll.return_value = None
+        process.is_alive.return_value = True
         inst = InstanceInfo(0, process)
         pool.im.spawn.return_value = inst
         pool.im.forward_tool_call.return_value = {"error": "open failed"}
@@ -1705,7 +1705,7 @@ class TestPoolManager(unittest.TestCase):
     def test_open_registration_error_terminates_new_instance(self):
         pool = self._make_pool()
         process = MagicMock()
-        process.poll.return_value = None
+        process.is_alive.return_value = True
         inst = InstanceInfo(0, process)
         pool.im.instances = [inst]
         pool.im.spawn.return_value = inst
@@ -1724,7 +1724,7 @@ class TestPoolManager(unittest.TestCase):
 class TestPoolManagerConcurrency(unittest.TestCase):
     def _live_instance(self, index: int, session_id: str | None = None):
         process = MagicMock()
-        process.poll.return_value = None
+        process.is_alive.return_value = True
         return InstanceInfo(
             index=index,
             process=process,
@@ -2215,7 +2215,7 @@ class TestInstanceInfoExternal(unittest.TestCase):
 
     def test_is_not_external_without_bridge(self):
         proc = MagicMock()
-        proc.poll.return_value = None
+        proc.is_alive.return_value = True
         inst = InstanceInfo(index=0, process=proc)
         self.assertFalse(inst.is_external)
         self.assertTrue(inst.is_alive())
