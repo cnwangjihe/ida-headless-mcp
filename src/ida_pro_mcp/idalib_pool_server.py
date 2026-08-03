@@ -259,8 +259,6 @@ IDALIB_MANAGEMENT_TOOLS = set(IDALIB_MANAGEMENT_TOOL_ORDER)
 _LOCAL_PROTOCOL_METHOD_RESULTS: dict[str, dict] = {
     "ping": {},
     "prompts/list": {"prompts": []},
-    "resources/list": {"resources": []},
-    "resources/templates/list": {"resourceTemplates": []},
 }
 
 # --------------------------------------------------------------------------
@@ -826,6 +824,11 @@ def build_dispatch(
         if method == "tools/list":
             return _handle_tools_list(request_obj)
 
+        if method.startswith("resources/"):
+            return _error_response(
+                request_id, -32601, f"Method '{method}' not found"
+            )
+
         if method in _LOCAL_PROTOCOL_METHOD_RESULTS:
             return {
                 "jsonrpc": "2.0",
@@ -1031,7 +1034,7 @@ def main():
         idalib_args=idalib_args,
     )
 
-    mcp = McpServer("ida-pro-mcp")
+    mcp = McpServer("ida-pro-mcp", resources_enabled=False)
     mcp.require_streamable_http_session = True
     if args.auth_token:
         mcp.auth_token = args.auth_token

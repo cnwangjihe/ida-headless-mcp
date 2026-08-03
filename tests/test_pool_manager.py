@@ -352,7 +352,7 @@ class TestPoolServerDispatch(unittest.TestCase):
         self.pool_server = idalib_pool_server
 
     def _make_mcp_and_pool(self):
-        mcp = self.McpServer("test")
+        mcp = self.McpServer("test", resources_enabled=False)
         pool = MagicMock(spec=PoolManager)
         pool._lock = threading.Lock()
         pool.sr = SessionRegistry()
@@ -855,43 +855,34 @@ class TestPoolServerDispatch(unittest.TestCase):
         result = resp["result"]["structuredContent"]
         self.assertIn("error", result)
 
-    def test_resource_routing_uses_context(self):
+    def test_resource_methods_are_not_supported(self):
         mcp, pool = self._make_mcp_and_pool()
         pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
         pool.sr.bind_context("sse:agent-a", "s1")
-        mock_inst = MagicMock(spec=InstanceInfo)
-        pool.resolve_session_instance.return_value = (pool.sr.get("s1"), mock_inst)
-        pool.forward_raw.return_value = {
-            "jsonrpc": "2.0",
-            "result": {"contents": []},
-            "id": 1,
-        }
         self.build_dispatch(mcp, pool)
 
-        req = {
-            "jsonrpc": "2.0",
-            "method": "resources/read",
-            "params": {"uri": "ida://info"},
-            "id": 1,
-        }
-        resp = self._dispatch(mcp, req, transport_session_id="sse:agent-a")
+        methods = (
+            "resources/list",
+            "resources/templates/list",
+            "resources/read",
+        )
+        for request_id, method in enumerate(methods, start=1):
+            with self.subTest(method=method):
+                params = {"uri": "ida://info"} if method == "resources/read" else None
+                req = {
+                    "jsonrpc": "2.0",
+                    "method": method,
+                    "params": params,
+                    "id": request_id,
+                }
+                resp = self._dispatch(
+                    mcp, req, transport_session_id="sse:agent-a"
+                )
 
-        self.assertNotIn("error", resp)
-        pool.resolve_session_instance.assert_called_once_with("s1")
+                self.assertEqual(resp["error"]["code"], -32601)
 
-    def test_resource_routing_no_session_returns_error(self):
-        mcp, pool = self._make_mcp_and_pool()
-        self.build_dispatch(mcp, pool)
-
-        req = {
-            "jsonrpc": "2.0",
-            "method": "resources/read",
-            "params": {"uri": "ida://info"},
-            "id": 1,
-        }
-        resp = self._dispatch(mcp, req, transport_session_id="sse:agent-a")
-
-        self.assertIn("error", resp)
+        pool.resolve_session_instance.assert_not_called()
+        pool.forward_raw.assert_not_called()
 
     # --- open edge cases ---
 
@@ -1339,6 +1330,7 @@ class TestPoolServerDispatch(unittest.TestCase):
         resp = mcp.registry.dispatch(req)
         self.assertIn("result", resp)
         self.assertIn("serverInfo", resp["result"])
+        self.assertNotIn("resources", resp["result"]["capabilities"])
 
     def test_notification_passes_through(self):
         mcp, pool = self._make_mcp_and_pool()
@@ -1359,8 +1351,6 @@ class TestPoolServerDispatch(unittest.TestCase):
         expected = {
             "ping": {},
             "prompts/list": {"prompts": []},
-            "resources/list": {"resources": []},
-            "resources/templates/list": {"resourceTemplates": []},
         }
 
         for idx, (method, result) in enumerate(expected.items(), start=1):

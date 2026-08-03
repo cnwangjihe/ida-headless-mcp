@@ -663,9 +663,17 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             send_response(200, json.dumps(response).encode("utf-8"))
 
 class McpServer:
-    def __init__(self, name: str, version = "1.0.0", *, extensions: dict[str, set[str]] | None = None):
+    def __init__(
+        self,
+        name: str,
+        version="1.0.0",
+        *,
+        extensions: dict[str, set[str]] | None = None,
+        resources_enabled: bool = True,
+    ):
         self.name = name
         self.version = version
+        self.resources_enabled = resources_enabled
         self.cors_allowed_origins: Callable[[str], bool] | list[str] | str | None = self.cors_localhost
         self.post_body_limit = 10 * 1024 * 1024  # 10MB
         self.http_session_ttl_seconds = 60 * 60
@@ -694,9 +702,12 @@ class McpServer:
         self.registry.methods["initialize"] = self._mcp_initialize
         self.registry.methods["tools/list"] = self._mcp_tools_list
         self.registry.methods["tools/call"] = self._mcp_tools_call
-        self.registry.methods["resources/list"] = self._mcp_resources_list
-        self.registry.methods["resources/templates/list"] = self._mcp_resource_templates_list
-        self.registry.methods["resources/read"] = self._mcp_resources_read
+        if self.resources_enabled:
+            self.registry.methods.update({
+                "resources/list": self._mcp_resources_list,
+                "resources/templates/list": self._mcp_resource_templates_list,
+                "resources/read": self._mcp_resources_read,
+            })
         self.registry.methods["prompts/list"] = self._mcp_prompts_list
         self.registry.methods["prompts/get"] = self._mcp_prompts_get
         self.registry.methods["notifications/initialized"] = self._mcp_notifications_initialized
@@ -925,16 +936,15 @@ class McpServer:
 
     def _mcp_initialize(self, protocolVersion: str, capabilities: dict, clientInfo: dict, _meta: dict | None = None) -> dict:
         """MCP initialize method"""
+        server_capabilities = {
+            "tools": {},
+            "prompts": {},
+        }
+        if self.resources_enabled:
+            server_capabilities["resources"] = {}
         return {
             "protocolVersion": getattr(self._protocol_version, "data", protocolVersion),
-            "capabilities": {
-                "tools": {},
-                "resources": {
-                    "subscribe": False,
-                    "listChanged": False,
-                },
-                "prompts": {},
-            },
+            "capabilities": server_capabilities,
             "serverInfo": {
                 "name": self.name,
                 "version": self.version,
