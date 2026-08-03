@@ -103,12 +103,12 @@ class TestPoolIntegration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.port = _find_free_port()
-        cls.socket_dir = tempfile.mkdtemp(prefix="idalib-pool-test-")
+        cls.runtime_dir = tempfile.mkdtemp(prefix="idalib-pool-test-")
 
         cmd = [
             sys.executable, "-m", "ida_pro_mcp.idalib_pool_server",
             "--transport", f"http://127.0.0.1:{cls.port}",
-            "--socket-dir", cls.socket_dir,
+            "--runtime-dir", cls.runtime_dir,
         ]
         env = {**os.environ, "IDADIR": IDADIR}
         cls.pool_proc = subprocess.Popen(

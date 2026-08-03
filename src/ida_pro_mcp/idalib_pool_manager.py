@@ -1,8 +1,8 @@
-"""idalib Pool Manager — manages a pool of idalib_server subprocess instances.
+"""idalib Pool Manager — manages dedicated idalib backend processes.
 
-Each instance is an independent idalib_server process communicating over a
-Unix domain socket.  The pool enforces a 1-instance-per-session model: every
-instance holds at most one active IDB at a time.
+Each instance is an independent process communicating through inherited
+multiprocessing pipes.  The pool enforces a 1-instance-per-session model:
+every instance holds at most one active IDB at a time.
 
 Key invariants
 --------------
@@ -113,7 +113,6 @@ class SessionInfo:
 @dataclass
 class InstanceInfo:
     index: int
-    socket_path: str
     process: Any | None
     rpc_connection: Any | None = None
     control_connection: Any | None = None
@@ -144,21 +143,21 @@ class InstanceInfo:
 
 
 # ---------------------------------------------------------------------------
-# Instance Manager — subprocess lifecycle + HTTP forwarding
+# Instance Manager — process lifecycle + IPC forwarding
 # ---------------------------------------------------------------------------
 
 class InstanceManager:
-    """Manages idalib_server subprocesses and communicates over Unix sockets."""
+    """Manage spawned idalib backends and their inherited IPC channels."""
 
     def __init__(
         self,
-        socket_dir: str,
+        runtime_dir: str,
         idalib_args: list[str] | None = None,
         *,
         mp_context=None,
         worker_target=None,
     ):
-        self.socket_dir = socket_dir
+        self.runtime_dir = runtime_dir
         self.idalib_args = idalib_args or []
         self._mp_context = mp_context or multiprocessing.get_context("spawn")
         self._worker_target = worker_target or run_backend_process
@@ -170,7 +169,7 @@ class InstanceManager:
         with self._lock:
             idx = self._next_index
             self._next_index += 1
-        log_path = os.path.join(self.socket_dir, f"{idx}.log")
+        log_path = os.path.join(self.runtime_dir, f"{idx}.log")
         parent_rpc, child_rpc = self._mp_context.Pipe(duplex=True)
         child_control, parent_control = self._mp_context.Pipe(duplex=False)
         proc = self._mp_context.Process(
@@ -191,7 +190,6 @@ class InstanceManager:
         child_control.close()
         inst = InstanceInfo(
             index=idx,
-            socket_path="",
             process=proc,
             rpc_connection=parent_rpc,
             control_connection=parent_control,
@@ -215,7 +213,6 @@ class InstanceManager:
             self._next_index += 1
         inst = InstanceInfo(
             index=idx,
-            socket_path="",
             process=None,
             ws_bridge=ws_bridge,
         )
@@ -331,7 +328,7 @@ class InstanceManager:
             )
         logger.info("Instance %d ready (pid %d)", inst.index, inst.process.pid)
 
-    # --- HTTP forwarding ---
+    # --- IPC forwarding ---
 
     def forward_tool_call(
         self, inst: InstanceInfo, tool_name: str, arguments: dict
@@ -544,13 +541,13 @@ class PoolManager:
 
     def __init__(
         self,
-        socket_dir: str | None = None,
+        runtime_dir: str | None = None,
         idalib_args: list[str] | None = None,
     ):
-        socket_dir = socket_dir or tempfile.mkdtemp(prefix="idalib-pool-")
-        os.makedirs(socket_dir, exist_ok=True)
+        runtime_dir = runtime_dir or tempfile.mkdtemp(prefix="idalib-pool-")
+        os.makedirs(runtime_dir, exist_ok=True)
 
-        self.im = InstanceManager(socket_dir, idalib_args)
+        self.im = InstanceManager(runtime_dir, idalib_args)
         self.sr = SessionRegistry()
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)

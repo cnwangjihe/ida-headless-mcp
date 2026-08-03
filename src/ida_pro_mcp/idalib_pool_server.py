@@ -1,8 +1,8 @@
 """idalib Pool Proxy — MCP server that manages a pool of idalib instances.
 
 This process does NOT import ``idapro``.  It speaks MCP over stdio, Streamable
-HTTP, or SSE and forwards IDA tool calls to backend idalib_server sub-processes
-connected via Unix domain sockets.
+HTTP, or SSE and forwards IDA tool calls to spawned backend processes through
+inherited multiprocessing pipes.
 
 Each MCP transport session (SSE connection or Streamable HTTP session) gets
 its own context binding, so multiple agents sharing one endpoint can work on
@@ -984,8 +984,8 @@ def main():
         help="Transport: 'stdio' (default) or a URL (e.g. http://127.0.0.1:8750)",
     )
     parser.add_argument(
-        "--socket-dir", type=str, default=None,
-        help="Directory for instance Unix sockets (default: auto temp dir)",
+        "--runtime-dir", type=str, default=None,
+        help="Directory for backend logs (default: auto temp dir)",
     )
     safety = parser.add_mutually_exclusive_group()
     safety.add_argument(
@@ -1012,7 +1012,7 @@ def main():
         idalib_args.append("--safe")
 
     pool = PoolManager(
-        socket_dir=args.socket_dir,
+        runtime_dir=args.runtime_dir,
         idalib_args=idalib_args,
     )
 

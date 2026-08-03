@@ -1085,7 +1085,7 @@ class TestPoolServerDispatch(unittest.TestCase):
         pool.sr.bind_context("sse:agent-a", "ext1")
         bridge = MagicMock()
         bridge.alive = True
-        inst = InstanceInfo(index=0, socket_path="", process=None, ws_bridge=bridge)
+        inst = InstanceInfo(index=0, process=None, ws_bridge=bridge)
         pool.resolve_session_instance.return_value = (pool.sr.get("ext1"), inst)
         pool.forward_tool_call.return_value = {"ok": True, "path": "/tmp/a.elf.i64"}
         self.build_dispatch(mcp, pool)
@@ -1146,7 +1146,7 @@ class TestPoolServerDispatch(unittest.TestCase):
         pool.sr.bind_context("sse:agent-a", "ext1")
         bridge = MagicMock()
         bridge.alive = True
-        inst = InstanceInfo(index=0, socket_path="", process=None, ws_bridge=bridge)
+        inst = InstanceInfo(index=0, process=None, ws_bridge=bridge)
         pool.resolve_session_instance.return_value = (pool.sr.get("ext1"), inst)
         pool.forward_tool_call.return_value = {"status": "ok", "module": "a.elf"}
         self.build_dispatch(mcp, pool)
@@ -1207,7 +1207,7 @@ class TestPoolServerDispatch(unittest.TestCase):
         pool.sr.bind_context("sse:agent-a", "ext1")
         bridge = MagicMock()
         bridge.alive = True
-        inst = InstanceInfo(index=0, socket_path="", process=None, ws_bridge=bridge)
+        inst = InstanceInfo(index=0, process=None, ws_bridge=bridge)
         pool.resolve_session_instance.return_value = (pool.sr.get("ext1"), inst)
         pool.forward_tool_call.return_value = {"ok": True}
         self.build_dispatch(mcp, pool)
@@ -1426,7 +1426,7 @@ class TestPoolServerDispatch(unittest.TestCase):
 class TestPoolManager(unittest.TestCase):
 
     def _make_pool(self):
-        pool = PoolManager(socket_dir="/tmp/fake-pool")
+        pool = PoolManager(runtime_dir="/tmp/fake-pool")
         pool.im = MagicMock(spec=InstanceManager)
         pool.im.instances = []
         pool.im.snapshot.side_effect = lambda: list(pool.im.instances)
@@ -1437,7 +1437,7 @@ class TestPoolManager(unittest.TestCase):
         pool = self._make_pool()
         process = MagicMock()
         process.poll.return_value = None
-        inst = InstanceInfo(0, "/tmp/0.sock", process)
+        inst = InstanceInfo(0, process)
         tools = [{"name": "list_funcs", "inputSchema": {"type": "object"}}]
         pool.im.spawn.return_value = inst
         pool.im.forward_tools_list.return_value = tools
@@ -1453,7 +1453,7 @@ class TestPoolManager(unittest.TestCase):
         pool = self._make_pool()
         process = MagicMock()
         process.poll.return_value = None
-        inst = InstanceInfo(0, "/tmp/0.sock", process)
+        inst = InstanceInfo(0, process)
         pool.im.spawn.return_value = inst
         pool.im.forward_tools_list.side_effect = RuntimeError("discovery failed")
 
@@ -1520,7 +1520,7 @@ class TestPoolManager(unittest.TestCase):
         pool = self._make_pool()
         process = MagicMock()
         process.poll.return_value = None
-        inst = InstanceInfo(0, "/tmp/0.sock", process)
+        inst = InstanceInfo(0, process)
         pool.im.send_control.return_value = True
 
         delivered = pool.cancel_instance_request(
@@ -1535,7 +1535,7 @@ class TestPoolManager(unittest.TestCase):
         pool = self._make_pool()
         bridge = MagicMock()
         bridge.alive = True
-        inst = InstanceInfo(0, "", None, ws_bridge=bridge)
+        inst = InstanceInfo(0, None, ws_bridge=bridge)
         notification = {
             "jsonrpc": "2.0",
             "method": "notifications/cancelled",
@@ -1562,7 +1562,7 @@ class TestPoolManager(unittest.TestCase):
         pool.sr.create("ext1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0, is_external=True)
         bridge = MagicMock()
         bridge.alive = True
-        inst = InstanceInfo(index=0, socket_path="", process=None, session_id="ext1", ws_bridge=bridge)
+        inst = InstanceInfo(index=0, process=None, session_id="ext1", ws_bridge=bridge)
         pool.im.instances = [inst]
 
         pool.shutdown_all()
@@ -1574,8 +1574,7 @@ class TestPoolManager(unittest.TestCase):
         pool = self._make_pool()
         pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
         inst = InstanceInfo(
-            index=0, socket_path="/tmp/0.sock",
-            process=MagicMock(), session_id="s1",
+            index=0, process=MagicMock(), session_id="s1",
         )
         pool.im.instances = [inst]
         pool.im.forward_tool_call.side_effect = [
@@ -1595,8 +1594,7 @@ class TestPoolManager(unittest.TestCase):
         pool = self._make_pool()
         pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
         inst = InstanceInfo(
-            index=0, socket_path="/tmp/0.sock",
-            process=MagicMock(), session_id="s1",
+            index=0, process=MagicMock(), session_id="s1",
         )
         pool.im.instances = [inst]
         pool.im.forward_tool_call.return_value = {"ok": False, "error": "disk full"}
@@ -1614,8 +1612,7 @@ class TestPoolManager(unittest.TestCase):
         pool = self._make_pool()
         pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", instance_index=0)
         inst = InstanceInfo(
-            index=0, socket_path="/tmp/0.sock",
-            process=MagicMock(), session_id="s1",
+            index=0, process=MagicMock(), session_id="s1",
         )
         pool.im.instances = [inst]
         pool.im.forward_tool_call.side_effect = BrokenPipeError("socket closed")
@@ -1695,7 +1692,7 @@ class TestPoolManager(unittest.TestCase):
         pool = self._make_pool()
         process = MagicMock()
         process.poll.return_value = None
-        inst = InstanceInfo(0, "/tmp/0.sock", process)
+        inst = InstanceInfo(0, process)
         pool.im.spawn.return_value = inst
         pool.im.forward_tool_call.return_value = {"error": "open failed"}
 
@@ -1709,7 +1706,7 @@ class TestPoolManager(unittest.TestCase):
         pool = self._make_pool()
         process = MagicMock()
         process.poll.return_value = None
-        inst = InstanceInfo(0, "/tmp/0.sock", process)
+        inst = InstanceInfo(0, process)
         pool.im.instances = [inst]
         pool.im.spawn.return_value = inst
         pool.im.forward_tool_call.return_value = {"success": True}
@@ -1730,13 +1727,12 @@ class TestPoolManagerConcurrency(unittest.TestCase):
         process.poll.return_value = None
         return InstanceInfo(
             index=index,
-            socket_path=f"/tmp/{index}.sock",
             process=process,
             session_id=session_id,
         )
 
     def test_concurrent_opens_spawn_dedicated_instances(self):
-        pool = PoolManager(socket_dir="/tmp/fake-pool")
+        pool = PoolManager(runtime_dir="/tmp/fake-pool")
         first = self._live_instance(0)
         second = self._live_instance(1)
 
@@ -1788,7 +1784,7 @@ class TestPoolManagerConcurrency(unittest.TestCase):
         self.assertEqual(pool.im.spawn.call_count, 2)
 
     def test_concurrent_open_of_same_path_reuses_completed_session(self):
-        pool = PoolManager(socket_dir="/tmp/fake-pool")
+        pool = PoolManager(runtime_dir="/tmp/fake-pool")
         inst = self._live_instance(0)
         pool.im.spawn = MagicMock(side_effect=lambda: (
             pool.im.instances.append(inst) or inst
@@ -1834,7 +1830,7 @@ class TestPoolManagerConcurrency(unittest.TestCase):
         pool.im.spawn.assert_called_once_with()
 
     def test_concurrent_close_only_closes_instance_once(self):
-        pool = PoolManager(socket_dir="/tmp/fake-pool")
+        pool = PoolManager(runtime_dir="/tmp/fake-pool")
         inst = self._live_instance(0, "s1")
         pool.im.instances = [inst]
         pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.elf.i64", 0)
@@ -1868,7 +1864,7 @@ class TestPoolManagerConcurrency(unittest.TestCase):
         pool.im.kill.assert_called_once_with(inst)
 
     def test_shutdown_rejects_new_operations_and_waits_for_inflight(self):
-        pool = PoolManager(socket_dir="/tmp/fake-pool")
+        pool = PoolManager(runtime_dir="/tmp/fake-pool")
         inst = self._live_instance(0)
         pool.im.instances = [inst]
 
@@ -1910,7 +1906,7 @@ class TestPoolManagerConcurrency(unittest.TestCase):
         self.assertEqual(pool._state, pool._STOPPED)
 
     def test_conflict_rollback_does_not_hold_pool_lock(self):
-        pool = PoolManager(socket_dir="/tmp/fake-pool")
+        pool = PoolManager(runtime_dir="/tmp/fake-pool")
         pool.sr.create(
             "existing", "/tmp/canonical.elf", "/tmp/canonical.elf.i64", 99
         )
@@ -2087,7 +2083,7 @@ class TestExternalRegistration(unittest.TestCase):
     """Tests for external IDA plugin registration via WebSocket bridge."""
 
     def _make_pool(self):
-        return PoolManager(socket_dir="/tmp/fake-pool")
+        return PoolManager(runtime_dir="/tmp/fake-pool")
 
     def test_register_external_creates_session(self):
         pool = self._make_pool()
@@ -2213,21 +2209,21 @@ class TestInstanceInfoExternal(unittest.TestCase):
     def test_is_external_with_ws_bridge(self):
         bridge = MagicMock()
         bridge.alive = True
-        inst = InstanceInfo(index=0, socket_path="", process=None, ws_bridge=bridge)
+        inst = InstanceInfo(index=0, process=None, ws_bridge=bridge)
         self.assertTrue(inst.is_external)
         self.assertTrue(inst.is_alive())
 
     def test_is_not_external_without_bridge(self):
         proc = MagicMock()
         proc.poll.return_value = None
-        inst = InstanceInfo(index=0, socket_path="/tmp/0.sock", process=proc)
+        inst = InstanceInfo(index=0, process=proc)
         self.assertFalse(inst.is_external)
         self.assertTrue(inst.is_alive())
 
     def test_external_dead_when_bridge_dead(self):
         bridge = MagicMock()
         bridge.alive = False
-        inst = InstanceInfo(index=0, socket_path="", process=None, ws_bridge=bridge)
+        inst = InstanceInfo(index=0, process=None, ws_bridge=bridge)
         self.assertFalse(inst.is_alive())
 
 
@@ -2266,9 +2262,9 @@ class TestInstanceManager(unittest.TestCase):
             self._spawn_context()
         )
         worker_target = MagicMock()
-        with tempfile.TemporaryDirectory() as socket_dir:
+        with tempfile.TemporaryDirectory() as runtime_dir:
             im = InstanceManager(
-                socket_dir,
+                runtime_dir,
                 ["--safe"],
                 mp_context=context,
                 worker_target=worker_target,
@@ -2292,8 +2288,8 @@ class TestInstanceManager(unittest.TestCase):
             self._spawn_context()
         )
         process.is_alive.side_effect = [True, True, False, False, False]
-        with tempfile.TemporaryDirectory() as socket_dir:
-            im = InstanceManager(socket_dir, mp_context=context)
+        with tempfile.TemporaryDirectory() as runtime_dir:
+            im = InstanceManager(runtime_dir, mp_context=context)
             with patch.object(
                 InstanceManager,
                 "_wait_for_ready",
@@ -2313,7 +2309,6 @@ class TestInstanceManager(unittest.TestCase):
         )
         inst = InstanceInfo(
             index=0,
-            socket_path="",
             process=process,
             rpc_connection=parent_rpc,
             control_connection=parent_control,
@@ -2334,7 +2329,6 @@ class TestInstanceManager(unittest.TestCase):
         )
         inst = InstanceInfo(
             index=0,
-            socket_path="",
             process=process,
             rpc_connection=parent_rpc,
             control_connection=parent_control,
@@ -2362,7 +2356,6 @@ class TestInstanceManager(unittest.TestCase):
         )
         inst = InstanceInfo(
             index=0,
-            socket_path="",
             process=process,
             rpc_connection=parent_rpc,
             control_connection=parent_control,

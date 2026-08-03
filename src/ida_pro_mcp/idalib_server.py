@@ -1,15 +1,13 @@
 """idalib backend — single-IDB headless MCP server.
 
 This process is spawned by the pool manager.  It opens at most one IDB
-at a time and exposes IDA MCP tools over an HTTP Unix socket.
+at a time and serves IDA MCP tools over inherited multiprocessing pipes.
 Multi-session orchestration lives in the pool layer; this backend is
 intentionally simple.
 """
 
-import argparse
 import logging
 import os
-import signal
 from typing import Annotated, Optional
 
 import idapro
@@ -209,64 +207,3 @@ def run_ipc_backend(
     finally:
         logger.info("Shutting down...")
         _close_current_database()
-
-
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="idalib backend — single-IDB headless MCP server"
-    )
-    parser.add_argument(
-        "--verbose", "-v", action="store_true", help="Show debug messages"
-    )
-    safety = parser.add_mutually_exclusive_group()
-    safety.add_argument(
-        "--safe", action="store_true",
-        help="Disable tools marked as unsafe (unsafe tools are enabled by default)",
-    )
-    safety.add_argument(
-        "--unsafe", dest="safe", action="store_false", help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--unix-socket", type=str, required=True,
-        help="Unix domain socket used by the pool manager",
-    )
-    args = parser.parse_args()
-
-    if args.verbose:
-        log_level = logging.DEBUG
-        idapro.enable_console_messages(True)
-    else:
-        log_level = logging.INFO
-        idapro.enable_console_messages(False)
-
-    logging.basicConfig(level=log_level)
-
-    if args.safe:
-        MCP_SERVER.disabled_tools.update(MCP_UNSAFE)
-
-    def request_shutdown(signum, frame):
-        logger.info("Shutdown requested")
-        raise SystemExit(0)
-
-    signal.signal(signal.SIGINT, request_shutdown)
-    signal.signal(signal.SIGTERM, request_shutdown)
-    if hasattr(signal, "SIGUSR1"):
-        def request_cancel(signum, frame):
-            cancelled = cancel_all_pending_requests()
-            logger.info("Cancellation requested for %d active call(s)", cancelled)
-
-        signal.signal(signal.SIGUSR1, request_cancel)
-
-    try:
-        MCP_SERVER.serve(unix_socket=args.unix_socket, background=False)
-    finally:
-        logger.info("Shutting down...")
-        _close_current_database()
-
-
-if __name__ == "__main__":
-    main()
