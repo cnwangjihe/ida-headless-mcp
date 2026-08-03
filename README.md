@@ -117,6 +117,10 @@ uv run idalib-pool
 # Streamable HTTP at /mcp and legacy SSE at /sse
 uv run idalib-pool --transport http://127.0.0.1:8750
 
+# Explicit IDA location; overrides IDADIR for this pool process
+uv run idalib-pool --ida-dir "/path/to/ida-pro" \
+  --transport http://127.0.0.1:8750
+
 # Require a bearer token on HTTP, SSE, and GUI pool WebSocket requests
 uv run idalib-pool \
   --transport http://127.0.0.1:8750 \
@@ -128,6 +132,11 @@ uv run idalib-pool --safe
 # Use a specific directory for backend logs
 uv run idalib-pool --runtime-dir ./ida-mcp-runtime
 ```
+
+`--ida-dir` has priority over `IDADIR`. If the option is omitted, the existing
+environment-variable and idapro configuration-file discovery continue to work.
+On PowerShell, quote paths containing spaces, for example
+`--ida-dir "C:\Program Files\IDA Professional 9.1"`.
 
 `IDA_MCP_AUTH_TOKEN` is equivalent to `--auth-token`.
 

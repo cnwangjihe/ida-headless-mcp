@@ -68,6 +68,14 @@ POOL_WEBSOCKET_MAX_SIZE = 64 * 1024 * 1024
 POOL_OUTPUT_CACHE_MAX_SIZE = 100
 
 
+def configure_ida_directory(ida_dir: str | None) -> str | None:
+    """Apply an explicit IDA install directory for subsequently spawned workers."""
+    if ida_dir is not None:
+        ida_dir = os.path.abspath(os.path.expanduser(ida_dir))
+        os.environ["IDADIR"] = ida_dir
+    return os.environ.get("IDADIR")
+
+
 class PoolOutputCache:
     """Pool-owned cache for complete tool results received from backends."""
 
@@ -987,6 +995,10 @@ def main():
         "--runtime-dir", type=str, default=None,
         help="Directory for backend logs (default: auto temp dir)",
     )
+    parser.add_argument(
+        "--ida-dir", type=str, default=None,
+        help="IDA installation directory (overrides IDADIR for spawned backends)",
+    )
     safety = parser.add_mutually_exclusive_group()
     safety.add_argument(
         "--safe", action="store_true",
@@ -1004,6 +1016,10 @@ def main():
 
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=log_level)
+
+    ida_dir = configure_ida_directory(args.ida_dir)
+    if ida_dir:
+        logger.info("Using IDA installation: %s", ida_dir)
 
     idalib_args: list[str] = []
     if args.verbose:

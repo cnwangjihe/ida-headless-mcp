@@ -1,3 +1,4 @@
+import os
 import sys
 import unittest
 from unittest.mock import MagicMock, patch
@@ -14,6 +15,22 @@ else:
 
 
 class PoolServerLifecycleTests(unittest.TestCase):
+    def test_explicit_ida_directory_overrides_environment(self):
+        with patch.dict(os.environ, {"IDADIR": "/environment/ida"}):
+            configured = idalib_pool_server.configure_ida_directory(
+                "/explicit/ida"
+            )
+
+            self.assertEqual(configured, os.path.abspath("/explicit/ida"))
+            self.assertEqual(os.environ["IDADIR"], configured)
+
+    def test_ida_directory_falls_back_to_environment(self):
+        with patch.dict(os.environ, {"IDADIR": "/environment/ida"}):
+            configured = idalib_pool_server.configure_ida_directory(None)
+
+            self.assertEqual(configured, "/environment/ida")
+            self.assertEqual(os.environ["IDADIR"], "/environment/ida")
+
     @patch.object(idalib_pool_server.signal, "signal")
     @patch.object(idalib_pool_server, "build_dispatch")
     @patch.object(idalib_pool_server, "McpServer")

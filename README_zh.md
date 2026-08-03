@@ -114,6 +114,10 @@ uv run idalib-pool
 # Streamable HTTP 使用 /mcp，兼容的 SSE 使用 /sse
 uv run idalib-pool --transport http://127.0.0.1:8750
 
+# 显式指定 IDA；仅对此 pool 进程覆盖 IDADIR
+uv run idalib-pool --ida-dir "/path/to/ida-pro" \
+  --transport http://127.0.0.1:8750
+
 # 对 HTTP、SSE 和 GUI Pool WebSocket 请求启用 Bearer Token
 uv run idalib-pool \
   --transport http://127.0.0.1:8750 \
@@ -125,6 +129,10 @@ uv run idalib-pool --safe
 # 指定 backend 日志目录
 uv run idalib-pool --runtime-dir ./ida-mcp-runtime
 ```
+
+`--ida-dir` 的优先级高于 `IDADIR`。未传该参数时，原有环境变量和 idapro
+配置文件自动发现方式保持不变。PowerShell 中包含空格的路径需要加引号，例如
+`--ida-dir "C:\Program Files\IDA Professional 9.1"`。
 
 环境变量 `IDA_MCP_AUTH_TOKEN` 与 `--auth-token` 等效。
 
