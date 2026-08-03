@@ -1,13 +1,12 @@
 """Integration tests for idalib pool — runs real idalib instances.
 
 Requires IDADIR to be set to a valid IDA Pro installation.
-Spawns actual idalib_server subprocesses and tests multi-agent routing
-through the pool proxy.
+Spawns actual idalib backend processes and tests multi-agent routing through
+the pool proxy.
 """
 
 import json
 import os
-import signal
 import socket
 import subprocess
 import sys
@@ -138,7 +137,7 @@ class TestPoolIntegration(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         if cls.pool_proc and cls.pool_proc.poll() is None:
-            cls.pool_proc.send_signal(signal.SIGTERM)
+            cls.pool_proc.terminate()
             try:
                 cls.pool_proc.wait(timeout=15)
             except subprocess.TimeoutExpired:
