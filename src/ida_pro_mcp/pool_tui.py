@@ -23,6 +23,17 @@ from ida_pro_mcp.admin_events import AdminEvent, AdminEventBus
 
 logger = logging.getLogger("ida_mcp.tui")
 
+TUI_COMMANDS = (
+    "help",
+    "show",
+    "save",
+    "close",
+    "disconnect",
+    "unregister",
+    "clear",
+    "quit",
+)
+
 
 class BufferedLogHandler(logging.Handler):
     """A bounded logging handler which may be drained from the UI thread."""
@@ -326,6 +337,12 @@ class PoolTuiApp(App[None]):
         self._command_history: list[str] = []
         self._history_index = 0
         self._busy_targets: set[TreeTarget] = set()
+        self._completion_candidates: tuple[str, ...] = ()
+        self._completion_index = -1
+        self._completion_head = ""
+        self._completion_tail = ""
+        self._completion_value: str | None = None
+        self._completion_cursor = 0
 
     def compose(self) -> ComposeResult:
         yield SessionTree("Sessions", id="session-tree")
@@ -391,6 +408,7 @@ class PoolTuiApp(App[None]):
             log.write(record)
 
     def on_input_submitted(self, message: Input.Submitted) -> None:
+        self._reset_completion()
         command_line = message.value.strip()
         message.input.value = ""
         if not command_line:
@@ -403,7 +421,15 @@ class PoolTuiApp(App[None]):
 
     def on_key(self, event: events.Key) -> None:
         command_input = self.query_one("#command-input", Input)
-        if not command_input.has_focus or event.key not in {"up", "down"}:
+        if not command_input.has_focus:
+            return
+        if event.key == "tab":
+            event.stop()
+            event.prevent_default()
+            self._complete_command(command_input)
+            return
+        self._reset_completion()
+        if event.key not in {"up", "down"}:
             return
         if not self._command_history:
             return
@@ -422,6 +448,123 @@ class PoolTuiApp(App[None]):
                 else ""
             )
         command_input.cursor_position = len(command_input.value)
+
+    def _complete_command(self, command_input: Input) -> None:
+        if (
+            self._completion_candidates
+            and command_input.value == self._completion_value
+            and command_input.cursor_position == self._completion_cursor
+        ):
+            self._completion_index = (
+                self._completion_index + 1
+            ) % len(self._completion_candidates)
+            self._apply_completion_candidate(command_input)
+            return
+
+        self._reset_completion()
+        value = command_input.value
+        cursor = command_input.cursor_position
+        token_start = cursor
+        while token_start > 0 and not value[token_start - 1].isspace():
+            token_start -= 1
+        token = value[token_start:cursor]
+        preceding = value[:token_start].split()
+        candidates = tuple(
+            candidate
+            for candidate in self._completion_options(preceding)
+            if candidate.casefold().startswith(token.casefold())
+        )
+        if not candidates:
+            return
+
+        head = value[:token_start]
+        tail = value[cursor:]
+        if len(candidates) == 1:
+            completed = candidates[0]
+            if not tail and (not completed or not completed[-1].isspace()):
+                completed += " "
+            command_input.value = f"{head}{completed}{tail}"
+            command_input.cursor_position = len(head) + len(completed)
+            return
+
+        folded = [candidate.casefold() for candidate in candidates]
+        common_length = 0
+        for characters in zip(*folded):
+            if len(set(characters)) != 1:
+                break
+            common_length += 1
+        if common_length > len(token):
+            common_prefix = candidates[0][:common_length]
+            command_input.value = f"{head}{common_prefix}{tail}"
+            command_input.cursor_position = len(head) + len(common_prefix)
+            return
+
+        self._completion_candidates = candidates
+        self._completion_index = 0
+        self._completion_head = head
+        self._completion_tail = tail
+        self._apply_completion_candidate(command_input)
+
+    def _completion_options(self, preceding: list[str]) -> tuple[str, ...]:
+        if not preceding:
+            return TUI_COMMANDS
+        command = preceding[0].casefold()
+        if len(preceding) > 1:
+            return ()
+        if command == "help":
+            return TUI_COMMANDS
+
+        agent_ids = self.model.agent_ids()
+        agents = tuple(
+            sorted(
+                alias
+                for entity_id, alias in self.aliases.agent_items()
+                if entity_id in agent_ids
+            )
+        )
+        databases = tuple(
+            sorted(
+                (alias, self.model.databases[entity_id])
+                for entity_id, alias in self.aliases.database_items()
+                if entity_id in self.model.databases
+            )
+        )
+        if command == "disconnect":
+            return agents
+        if command == "show":
+            return agents + tuple(alias for alias, _database in databases)
+        if command == "save":
+            return tuple(alias for alias, _database in databases)
+        if command == "close":
+            return tuple(
+                alias
+                for alias, database in databases
+                if not database.get("is_external")
+            )
+        if command == "unregister":
+            return tuple(
+                alias
+                for alias, database in databases
+                if database.get("is_external")
+            )
+        return ()
+
+    def _apply_completion_candidate(self, command_input: Input) -> None:
+        candidate = self._completion_candidates[self._completion_index]
+        self._completion_value = (
+            f"{self._completion_head}{candidate}{self._completion_tail}"
+        )
+        self._completion_cursor = len(self._completion_head) + len(candidate)
+        command_input.value = self._completion_value
+        command_input.cursor_position = self._completion_cursor
+
+    def _reset_completion(self) -> None:
+        self._completion_candidates = ()
+        self._completion_index = -1
+        self._completion_head = ""
+        self._completion_tail = ""
+        self._completion_value = None
+        self._completion_cursor = 0
 
     def execute_command(self, command_line: str) -> None:
         try:

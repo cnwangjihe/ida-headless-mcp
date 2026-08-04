@@ -173,6 +173,9 @@ database 归入 `Unattached / Closing IDBs` 分支。Agent 存活和空闲时间
 | `clear` | 清空当前日志区域。 |
 | `quit` | 停止 listener 并关闭 Pool，同时保存本地 IDB。 |
 
+按 Tab 可以补全命令和当前操作适用的 `Axx`/`Dxx` 目标。存在多个匹配时会先扩展
+公共前缀，继续按 Tab 可循环选择候选项。
+
 关系视图由进程内生命周期事件增量更新，不会轮询 MCP Server 或 Pool。每分钟的
 UI timer 只用于刷新存活和空闲时间文本。
 

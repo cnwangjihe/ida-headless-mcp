@@ -191,6 +191,10 @@ and the bottom line accepts administration commands.
 | `clear` | Clear the visible log pane. |
 | `quit` | Stop the listener and shut down the pool, saving local IDBs. |
 
+Press Tab to complete commands and context-appropriate `Axx`/`Dxx` targets.
+Common prefixes are expanded first; repeated Tab presses cycle ambiguous
+matches.
+
 The relationship view is updated by in-process lifecycle events rather than
 polling the MCP server or pool. A one-minute UI timer only refreshes the
 displayed age and idle durations.

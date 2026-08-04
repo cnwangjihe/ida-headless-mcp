@@ -429,6 +429,68 @@ class PoolTuiCommandTests(unittest.IsolatedAsyncioTestCase):
                 1,
             )
 
+    async def test_tab_completes_commands_and_context_appropriate_targets(self):
+        app = PoolTuiApp(AdminEventBus(), BufferedLogHandler())
+
+        async with app.run_test(size=(120, 35)) as pilot:
+            command_input = app.query_one("#command-input", Input)
+            command_input.value = "disc"
+            command_input.cursor_position = len(command_input.value)
+            await pilot.press("tab")
+            self.assertEqual(command_input.value, "disconnect ")
+
+            app.apply_admin_event(
+                event(
+                    "mcp",
+                    "TransportOpened",
+                    1,
+                    "http:agent-a",
+                    state="OPEN",
+                )
+            )
+            app.apply_admin_event(self._database_event())
+            app.apply_admin_event(
+                event(
+                    "pool",
+                    "ExternalIdbRegistered",
+                    2,
+                    "database-gui",
+                    is_external=True,
+                    state="OPEN",
+                    refcount=1,
+                )
+            )
+
+            command_input.value = "disconnect A"
+            command_input.cursor_position = len(command_input.value)
+            await pilot.press("tab")
+            self.assertEqual(command_input.value, "disconnect A01 ")
+
+            command_input.value = "close D"
+            command_input.cursor_position = len(command_input.value)
+            await pilot.press("tab")
+            self.assertEqual(command_input.value, "close D01 ")
+
+            command_input.value = "unregister D"
+            command_input.cursor_position = len(command_input.value)
+            await pilot.press("tab")
+            self.assertEqual(command_input.value, "unregister D02 ")
+
+    async def test_tab_expands_common_prefix_then_cycles_candidates(self):
+        app = PoolTuiApp(AdminEventBus(), BufferedLogHandler())
+
+        async with app.run_test(size=(120, 35)) as pilot:
+            command_input = app.query_one("#command-input", Input)
+            command_input.value = "c"
+            command_input.cursor_position = 1
+
+            await pilot.press("tab")
+            self.assertEqual(command_input.value, "cl")
+            await pilot.press("tab")
+            self.assertEqual(command_input.value, "close")
+            await pilot.press("tab")
+            self.assertEqual(command_input.value, "clear")
+
     async def test_close_command_requires_confirmation(self):
         bus = AdminEventBus()
         pool = MagicMock()
