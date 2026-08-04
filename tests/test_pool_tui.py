@@ -195,6 +195,28 @@ class PresentationHelpersTests(unittest.TestCase):
 
 
 class PoolTuiAppTests(unittest.IsolatedAsyncioTestCase):
+    async def test_command_input_keeps_focus_when_other_panes_are_clicked(self):
+        app = PoolTuiApp(AdminEventBus(), BufferedLogHandler())
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            command_input = app.query_one("#command-input", Input)
+            tree = app.query_one("#session-tree", Tree)
+            log = app.query_one("#main-log", RichLog)
+            self.assertIs(app.screen.focused, command_input)
+            self.assertTrue(tree.root.is_expanded)
+
+            await pilot.click(tree, offset=(2, 1))
+            await pilot.pause()
+            self.assertFalse(tree.root.is_expanded)
+            self.assertIs(app.screen.focused, command_input)
+
+            await pilot.click(log, offset=(5, 2))
+            await pilot.pause()
+            self.assertIs(app.screen.focused, command_input)
+
+            await pilot.press("tab")
+            self.assertIs(app.screen.focused, command_input)
+
     async def test_event_bridge_starts_before_runtime_bootstrap(self):
         order = []
         bus = MagicMock()

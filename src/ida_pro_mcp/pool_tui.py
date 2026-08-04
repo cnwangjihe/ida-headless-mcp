@@ -220,6 +220,14 @@ def format_duration(seconds: float) -> str:
 TreeTarget = tuple[str, str]
 
 
+class SessionTree(Tree[TreeTarget], can_focus=False):
+    """Mouse-operable tree which never takes focus from the console."""
+
+
+class SessionLog(RichLog, can_focus=False):
+    """Scrollable log which never takes focus from the console."""
+
+
 class ConfirmActionScreen(ModalScreen[bool]):
     CSS = """
     ConfirmActionScreen {
@@ -320,8 +328,8 @@ class PoolTuiApp(App[None]):
         self._busy_targets: set[TreeTarget] = set()
 
     def compose(self) -> ComposeResult:
-        yield Tree[TreeTarget]("Sessions", id="session-tree")
-        yield RichLog(
+        yield SessionTree("Sessions", id="session-tree")
+        yield SessionLog(
             max_lines=2000,
             wrap=False,
             markup=False,
