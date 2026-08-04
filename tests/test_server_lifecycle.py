@@ -190,6 +190,7 @@ class PoolServerLifecycleTests(unittest.TestCase):
         pool.shutdown_all.assert_called_once_with()
 
     @patch.object(idalib_pool_server.signal, "signal")
+    @patch.object(idalib_pool_server, "_prepare_tui_process_spawning")
     @patch.object(idalib_pool_server, "replace_runtime_log_handler")
     @patch.object(idalib_pool_server, "build_pool_handler_class")
     @patch.object(idalib_pool_server, "PoolTuiRuntime")
@@ -208,6 +209,7 @@ class PoolServerLifecycleTests(unittest.TestCase):
         runtime_cls,
         build_handler,
         replace_handler,
+        prepare_spawning,
         signal_mock,
     ):
         pool = pool_cls.return_value
@@ -253,6 +255,7 @@ class PoolServerLifecycleTests(unittest.TestCase):
         )
         runtime.start.assert_called_once_with()
         runtime.stop.assert_called_once_with()
+        prepare_spawning.assert_called_once_with()
         self.assertIsNone(mcp.admin_event_sink)
         self.assertIsNone(pool.admin_event_sink)
 

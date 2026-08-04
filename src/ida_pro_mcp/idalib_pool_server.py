@@ -1092,6 +1092,20 @@ class PoolTuiRuntime:
                 self._thread.join()
 
 
+def _prepare_tui_process_spawning() -> None:
+    """Start POSIX resource tracking before Textual captures stderr.
+
+    Textual's stderr capture intentionally reports ``fileno() == -1``.  The
+    first multiprocessing spawn otherwise tries to preserve that invalid file
+    descriptor while starting Python's resource tracker.
+    """
+    if os.name != "posix":
+        return
+    from multiprocessing import resource_tracker
+
+    resource_tracker.ensure_running()
+
+
 def _parse_tui_transport(
     parser: argparse.ArgumentParser,
     transport: str,
@@ -1207,6 +1221,7 @@ def main():
 
     if args.tui:
         assert tui_transport_url is not None
+        _prepare_tui_process_spawning()
         event_bus = AdminEventBus()
         log_handler = BufferedLogHandler()
         mcp.admin_event_sink = event_bus.publish
