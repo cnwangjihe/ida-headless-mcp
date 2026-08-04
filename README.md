@@ -193,7 +193,9 @@ and the bottom line accepts administration commands.
 
 Press Tab to complete commands and context-appropriate `Axx`/`Dxx` targets.
 Common prefixes are expanded first; repeated Tab presses cycle ambiguous
-matches.
+matches. PageUp/PageDown scroll the log without leaving the command input.
+Confirmation dialogs support Tab/Shift+Tab or arrow-key selection, Enter/Space
+activation, `Y` to confirm, and `N` or Escape to cancel.
 
 The relationship view is updated by in-process lifecycle events rather than
 polling the MCP server or pool. A one-minute UI timer only refreshes the

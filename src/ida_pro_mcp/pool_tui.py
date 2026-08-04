@@ -262,7 +262,15 @@ class ConfirmActionScreen(ModalScreen[bool]):
     }
     """
 
-    BINDINGS = [("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        ("tab", "next_option", "Next option"),
+        ("shift+tab", "previous_option", "Previous option"),
+        ("left,up", "focus_cancel", "Cancel"),
+        ("right,down", "focus_confirm", "Confirm"),
+        ("enter,space", "activate_option", "Select"),
+        ("y", "confirm", "Confirm"),
+        ("n,escape", "cancel", "Cancel"),
+    ]
 
     def __init__(self, message: str) -> None:
         super().__init__()
@@ -283,6 +291,30 @@ class ConfirmActionScreen(ModalScreen[bool]):
 
     def action_cancel(self) -> None:
         self.dismiss(False)
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_focus_cancel(self) -> None:
+        self.query_one("#cancel", Button).focus()
+
+    def action_focus_confirm(self) -> None:
+        self.query_one("#confirm", Button).focus()
+
+    def action_next_option(self) -> None:
+        if getattr(self.focused, "id", None) == "cancel":
+            self.action_focus_confirm()
+        else:
+            self.action_focus_cancel()
+
+    def action_previous_option(self) -> None:
+        if getattr(self.focused, "id", None) == "confirm":
+            self.action_focus_cancel()
+        else:
+            self.action_focus_confirm()
+
+    def action_activate_option(self) -> None:
+        self.dismiss(getattr(self.focused, "id", None) == "confirm")
 
 
 class PoolTuiApp(App[None]):
@@ -421,7 +453,19 @@ class PoolTuiApp(App[None]):
 
     def on_key(self, event: events.Key) -> None:
         command_input = self.query_one("#command-input", Input)
-        if not command_input.has_focus:
+        if (
+            self.screen is not command_input.screen
+            or self.screen.focused is not command_input
+        ):
+            return
+        if event.key in {"pageup", "pagedown"}:
+            event.stop()
+            event.prevent_default()
+            log = self.query_one("#main-log", RichLog)
+            if event.key == "pageup":
+                log.scroll_page_up(animate=False)
+            else:
+                log.scroll_page_down(animate=False)
             return
         if event.key == "tab":
             event.stop()

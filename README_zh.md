@@ -174,7 +174,9 @@ database 归入 `Unattached / Closing IDBs` 分支。Agent 存活和空闲时间
 | `quit` | 停止 listener 并关闭 Pool，同时保存本地 IDB。 |
 
 按 Tab 可以补全命令和当前操作适用的 `Axx`/`Dxx` 目标。存在多个匹配时会先扩展
-公共前缀，继续按 Tab 可循环选择候选项。
+公共前缀，继续按 Tab 可循环选择候选项。PageUp/PageDown 可在不离开输入框的
+情况下滚动日志。确认框支持 Tab/Shift+Tab 或方向键选择、Enter/Space 激活、
+`Y` 确认，以及 `N` 或 Escape 取消。
 
 关系视图由进程内生命周期事件增量更新，不会轮询 MCP Server 或 Pool。每分钟的
 UI timer 只用于刷新存活和空闲时间文本。

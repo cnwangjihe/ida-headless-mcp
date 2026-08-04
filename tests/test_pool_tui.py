@@ -8,6 +8,7 @@ from textual.widgets import Input, RichLog, Tree
 from ida_pro_mcp.admin_events import AdminEvent, AdminEventBus
 from ida_pro_mcp.pool_tui import (
     BufferedLogHandler,
+    ConfirmActionScreen,
     DashboardModel,
     PoolTuiApp,
     StableAliases,
@@ -229,6 +230,30 @@ class PoolTuiAppTests(unittest.IsolatedAsyncioTestCase):
 
         async with app.run_test():
             self.assertEqual(order, ["events", "runtime"])
+
+    async def test_page_keys_scroll_log_without_moving_command_focus(self):
+        app = PoolTuiApp(AdminEventBus(), BufferedLogHandler())
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            command_input = app.query_one("#command-input", Input)
+            log = app.query_one("#main-log", RichLog)
+            for index in range(100):
+                log.write(f"line {index}")
+            await pilot.pause()
+            log.scroll_end(animate=False, immediate=True)
+            await pilot.pause()
+            bottom = log.scroll_y
+            self.assertGreater(bottom, 0)
+
+            await pilot.press("pageup")
+            await pilot.pause()
+            self.assertLess(log.scroll_y, bottom)
+            self.assertIs(app.screen.focused, command_input)
+
+            await pilot.press("pagedown")
+            await pilot.pause()
+            self.assertGreater(log.scroll_y, 0)
+            self.assertIs(app.screen.focused, command_input)
 
     async def test_tree_renders_agent_to_shared_database_relationship(self):
         bus = AdminEventBus()
@@ -511,6 +536,63 @@ class PoolTuiCommandTests(unittest.IsolatedAsyncioTestCase):
                 app._run_admin_action.assert_not_called()
 
                 await pilot.click("#confirm")
+                await pilot.pause()
+                app._run_admin_action.assert_called_once_with(
+                    "close", ("database", "database-a")
+                )
+            finally:
+                app._busy_targets.clear()
+
+    async def test_confirmation_is_fully_keyboard_operable(self):
+        app = PoolTuiApp(
+            AdminEventBus(),
+            BufferedLogHandler(),
+            mcp_server=MagicMock(),
+            pool_manager=MagicMock(),
+        )
+
+        async with app.run_test(size=(120, 35)) as pilot:
+            app.apply_admin_event(self._database_event())
+            app._run_admin_action = MagicMock()
+            try:
+                app.execute_command("close D01")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, ConfirmActionScreen)
+                self.assertEqual(app.screen.focused.id, "cancel")
+
+                await pilot.press("tab")
+                await pilot.pause()
+                self.assertEqual(app.screen.focused.id, "confirm")
+
+                await pilot.press("enter")
+                await pilot.pause()
+                app._run_admin_action.assert_called_once_with(
+                    "close", ("database", "database-a")
+                )
+            finally:
+                app._busy_targets.clear()
+
+    async def test_confirmation_supports_y_and_n_shortcuts(self):
+        app = PoolTuiApp(
+            AdminEventBus(),
+            BufferedLogHandler(),
+            mcp_server=MagicMock(),
+            pool_manager=MagicMock(),
+        )
+
+        async with app.run_test(size=(120, 35)) as pilot:
+            app.apply_admin_event(self._database_event())
+            app._run_admin_action = MagicMock()
+            try:
+                app.execute_command("close D01")
+                await pilot.pause()
+                await pilot.press("n")
+                await pilot.pause()
+                app._run_admin_action.assert_not_called()
+
+                app.execute_command("close D01")
+                await pilot.pause()
+                await pilot.press("y")
                 await pilot.pause()
                 app._run_admin_action.assert_called_once_with(
                     "close", ("database", "database-a")
