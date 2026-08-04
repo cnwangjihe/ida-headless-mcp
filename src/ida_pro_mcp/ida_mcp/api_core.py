@@ -1,6 +1,7 @@
 """Core API Functions - IDB metadata and basic queries"""
 
 import re
+import logging
 import time
 from typing import Annotated
 
@@ -35,6 +36,9 @@ from .utils import (
     pattern_filter,
 )
 
+
+logger = logging.getLogger("ida_mcp.ida.api")
+
 # Cached strings list: [(ea, text), ...]
 _strings_cache: list[tuple[int, str]] | None = None
 _server_started_at = time.time()
@@ -53,7 +57,11 @@ def init_caches():
     t0 = time.perf_counter()
     strings = _get_strings_cache()
     t1 = time.perf_counter()
-    print(f"[MCP] Cached {len(strings)} strings in {(t1 - t0) * 1000:.0f}ms")
+    logger.debug(
+        "Cached %d strings in %.0fms",
+        len(strings),
+        (t1 - t0) * 1000,
+    )
 
 
 # ============================================================================

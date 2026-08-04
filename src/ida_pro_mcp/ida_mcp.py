@@ -5,6 +5,7 @@ It loads the actual implementation from the ida_mcp package.
 """
 
 import json
+import logging
 import os
 import sys
 import threading
@@ -16,6 +17,44 @@ from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     from . import ida_mcp
+
+
+LOGGER_NAMESPACE = "ida_mcp"
+PLUGIN_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+PLUGIN_LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+_PLUGIN_HANDLER_MARKER = "_ida_mcp_plugin_handler"
+logger = logging.getLogger("ida_mcp.plugin")
+
+
+def configure_plugin_logging(verbose: bool = False) -> logging.Handler:
+    """Install one IDA-console handler for the MCP logger hierarchy."""
+    namespace_logger = logging.getLogger(LOGGER_NAMESPACE)
+    handler = next(
+        (
+            candidate
+            for candidate in namespace_logger.handlers
+            if getattr(candidate, _PLUGIN_HANDLER_MARKER, False)
+        ),
+        None,
+    )
+    if handler is None:
+        handler = logging.StreamHandler()
+        setattr(handler, _PLUGIN_HANDLER_MARKER, True)
+        namespace_logger.addHandler(handler)
+    handler.setLevel(logging.NOTSET)
+    handler.setFormatter(
+        logging.Formatter(PLUGIN_LOG_FORMAT, PLUGIN_LOG_DATE_FORMAT)
+    )
+    namespace_logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    namespace_logger.propagate = False
+    return handler
+
+
+def remove_plugin_logging_handler(handler: logging.Handler) -> None:
+    namespace_logger = logging.getLogger(LOGGER_NAMESPACE)
+    if handler in namespace_logger.handlers:
+        namespace_logger.removeHandler(handler)
+        handler.close()
 
 
 def ensure_plugin_dir_on_path():
@@ -47,6 +86,8 @@ RUN_LOCAL_SERVER_ACTION_ID = "mcp:run_local_server"
 RUN_LOCAL_SERVER_ACTION_LABEL = "Run Local MCP Server"
 SHUTDOWN_LOCAL_SERVER_ACTION_ID = "mcp:shutdown_local_server"
 SHUTDOWN_LOCAL_SERVER_ACTION_LABEL = "Shutdown Local MCP Server"
+VERBOSE_LOGGING_ACTION_ID = "mcp:verbose_logging"
+VERBOSE_LOGGING_ACTION_LABEL = "Verbose Logging"
 
 MCP_ACTION_IDS = [
     CONNECT_POOL_ACTION_ID,
@@ -54,6 +95,7 @@ MCP_ACTION_IDS = [
     CONFIG_ACTION_ID,
     RUN_LOCAL_SERVER_ACTION_ID,
     SHUTDOWN_LOCAL_SERVER_ACTION_ID,
+    VERBOSE_LOGGING_ACTION_ID,
 ]
 
 POOL_WEBSOCKET_MAX_SIZE = 64 * 1024 * 1024
@@ -98,13 +140,23 @@ class MCPConfigHandler(idaapi.action_handler_t):
             return 0
 
         if self.plugin.host == old_host and self.plugin.port == old_port:
-            print(f"[MCP] Configuration unchanged: {self.plugin.host}:{self.plugin.port}")
+            logger.debug(
+                "Configuration unchanged: %s:%s",
+                self.plugin.host,
+                self.plugin.port,
+            )
             return 1
 
-        print(f"[MCP] Configuration updated: {self.plugin.host}:{self.plugin.port}")
+        logger.debug(
+            "Configuration updated: %s:%s",
+            self.plugin.host,
+            self.plugin.port,
+        )
 
         if self.plugin.mcp is not None:
-            print("[MCP] Configuration will apply next time the local server starts")
+            logger.debug(
+                "Configuration will apply next time the local server starts"
+            )
         return 1
 
     def update(self, ctx):
@@ -294,6 +346,19 @@ class MCPShutdownLocalServerHandler(idaapi.action_handler_t):
         return action_state(self.plugin.mcp is not None)
 
 
+class MCPVerboseLoggingHandler(idaapi.action_handler_t):
+    def __init__(self, plugin: "MCP"):
+        idaapi.action_handler_t.__init__(self)
+        self.plugin = plugin
+
+    def activate(self, ctx):
+        self.plugin.set_verbose_logging(not self.plugin.verbose_logging)
+        return 1
+
+    def update(self, ctx):
+        return idaapi.AST_ENABLE_ALWAYS
+
+
 class MCP(idaapi.plugin_t):
     flags = idaapi.PLUGIN_KEEP | getattr(idaapi, "PLUGIN_HIDE", 0)
     comment = "MCP Plugin"
@@ -306,12 +371,15 @@ class MCP(idaapi.plugin_t):
     DEFAULT_PORT = 13337
 
     def init(self):
+        self.verbose_logging = False
+        self._logging_handler = configure_plugin_logging(False)
         hotkey = self.connect_hotkey
         if __import__("sys").platform == "darwin":
             hotkey = hotkey.replace("Alt", "Option")
 
-        print(
-            f"[MCP] Plugin loaded, use MCP -> Connect to Pool ({hotkey}) to connect to a pool"
+        logger.info(
+            "Plugin loaded; use MCP -> Connect to Pool (%s) to connect to a pool",
+            hotkey,
         )
         self.mcp: "ida_mcp.rpc.McpServer | None" = None
         self.host = self.DEFAULT_HOST
@@ -322,6 +390,7 @@ class MCP(idaapi.plugin_t):
         self._config_handler = MCPConfigHandler(self)
         self._run_local_server_handler = MCPRunLocalServerHandler(self)
         self._shutdown_local_server_handler = MCPShutdownLocalServerHandler(self)
+        self._verbose_logging_handler = MCPVerboseLoggingHandler(self)
 
         ida_kernwin.register_action(
             ida_kernwin.action_desc_t(
@@ -359,6 +428,14 @@ class MCP(idaapi.plugin_t):
                 self._shutdown_local_server_handler,
             )
         )
+        ida_kernwin.register_action(
+            ida_kernwin.action_desc_t(
+                VERBOSE_LOGGING_ACTION_ID,
+                VERBOSE_LOGGING_ACTION_LABEL,
+                self._verbose_logging_handler,
+                flags=ida_kernwin.ADF_CHECKABLE,
+            )
+        )
         self._ui_hooks = MCPUIHooks()
         self._ui_hooks.hook()
         self.update_menu_state()
@@ -368,6 +445,23 @@ class MCP(idaapi.plugin_t):
     def run(self, arg):
         return self.connect_pool()
 
+    def set_verbose_logging(self, enabled: bool) -> None:
+        self.verbose_logging = bool(enabled)
+        logging.getLogger(LOGGER_NAMESPACE).setLevel(
+            logging.DEBUG if self.verbose_logging else logging.INFO
+        )
+        try:
+            ida_kernwin.update_action_checked(
+                VERBOSE_LOGGING_ACTION_ID,
+                self.verbose_logging,
+            )
+        except Exception:
+            pass
+        logger.info(
+            "Verbose logging %s",
+            "enabled" if self.verbose_logging else "disabled",
+        )
+
     def update_menu_state(self):
         states = {
             CONNECT_POOL_ACTION_ID: self.pool_connector is None and self.mcp is None,
@@ -375,12 +469,20 @@ class MCP(idaapi.plugin_t):
             CONFIG_ACTION_ID: True,
             RUN_LOCAL_SERVER_ACTION_ID: self.mcp is None and self.pool_connector is None,
             SHUTDOWN_LOCAL_SERVER_ACTION_ID: self.mcp is not None,
+            VERBOSE_LOGGING_ACTION_ID: True,
         }
         for action_id, enabled in states.items():
             try:
                 ida_kernwin.update_action_state(action_id, action_state(enabled))
             except Exception:
                 pass
+        try:
+            ida_kernwin.update_action_checked(
+                VERBOSE_LOGGING_ACTION_ID,
+                self.verbose_logging,
+            )
+        except Exception:
+            pass
 
     def _load_local_server_config(self):
         try:
@@ -398,7 +500,7 @@ class MCP(idaapi.plugin_t):
             config_json_set("local_server_host", self.host)
             config_json_set("local_server_port", self.port)
         except Exception as e:
-            print(f"[MCP] Failed to save local server configuration: {e}")
+            logger.warning("Failed to save local server configuration: %s", e)
 
     def _prompt_local_server_config(self, title: str) -> bool:
         form = MCPConfigForm(self.host, self.port, title)
@@ -413,7 +515,7 @@ class MCP(idaapi.plugin_t):
         form.Free()
 
         if port < 1 or port > 65535:
-            print(f"[MCP] Invalid port: {port}")
+            logger.warning("Invalid port: %s", port)
             return False
 
         self.host = host
@@ -435,7 +537,7 @@ class MCP(idaapi.plugin_t):
             if self.pool_connector is not connector:
                 return 0
             self.pool_connector = None
-            print("[MCP] Pool server disconnected")
+            logger.info("Pool server disconnected")
             self.update_menu_state()
             return 1
 
@@ -443,10 +545,10 @@ class MCP(idaapi.plugin_t):
 
     def connect_pool(self):
         if self.pool_connector is not None:
-            print("[MCP] Already connected to pool")
+            logger.warning("Already connected to pool")
             return 0
         if self.mcp is not None:
-            print("[MCP] Stop the local MCP server before connecting to a pool")
+            logger.warning("Stop the local MCP server before connecting to a pool")
             return 0
 
         if TYPE_CHECKING:
@@ -492,7 +594,7 @@ class MCP(idaapi.plugin_t):
                 on_disconnect=self._handle_pool_disconnected,
             )
         except Exception as e:
-            print(f"[MCP] Pool connection failed: {e}")
+            logger.error("Pool connection failed: %s", e)
             return 0
 
         reg = connector.registration_response
@@ -514,14 +616,20 @@ class MCP(idaapi.plugin_t):
                         on_disconnect=self._handle_pool_disconnected,
                     )
                 except Exception as e:
-                    print(f"[MCP] Pool connection failed: {e}")
+                    logger.error("Pool connection failed: %s", e)
                     return 0
                 reg = connector.registration_response
                 if not reg.get("success"):
-                    print(f"[MCP] Pool registration failed: {reg.get('error', 'unknown')}")
+                    logger.error(
+                        "Pool registration failed: %s",
+                        reg.get("error", "unknown"),
+                    )
                     return 0
             else:
-                print(f"[MCP] Pool registration failed: {reg.get('error', 'unknown')}")
+                logger.error(
+                    "Pool registration failed: %s",
+                    reg.get("error", "unknown"),
+                )
                 return 0
 
         self.pool_connector = connector
@@ -529,13 +637,13 @@ class MCP(idaapi.plugin_t):
             self._handle_pool_disconnected(connector)
             return 0
         sid = reg["session"]["session_id"]
-        print(f"[MCP] Connected to pool at {pool_url} (session: {sid})")
+        logger.info("Connected to pool: url=%s session=%s", pool_url, sid)
         self.update_menu_state()
         return 1
 
     def disconnect_pool(self, *, confirm: bool):
         if self.pool_connector is None:
-            print("[MCP] Not connected to pool")
+            logger.warning("Not connected to pool")
             return 0
 
         agents = 0
@@ -553,16 +661,16 @@ class MCP(idaapi.plugin_t):
                 return 0
         self.pool_connector.disconnect()
         self.pool_connector = None
-        print("[MCP] Disconnected from pool")
+        logger.info("Disconnected from pool")
         self.update_menu_state()
         return 1
 
     def run_local_server(self):
         if self.pool_connector is not None:
-            print("[MCP] Disconnect from pool before running the local MCP server")
+            logger.warning("Disconnect from pool before running the local MCP server")
             return 0
         if self.mcp is not None:
-            print("[MCP] Local MCP server is already running")
+            logger.warning("Local MCP server is already running")
             return 0
         self._load_local_server_config()
         if not self._prompt_local_server_config("Run Local MCP Server"):
@@ -571,10 +679,10 @@ class MCP(idaapi.plugin_t):
 
     def start_local_server(self):
         if self.pool_connector is not None:
-            print("[MCP] Disconnect from pool before running the local MCP server")
+            logger.warning("Disconnect from pool before running the local MCP server")
             return 0
         if self.mcp:
-            print("[MCP] Local MCP server is already running")
+            logger.warning("Local MCP server is already running")
             return 0
 
         # HACK: ensure fresh load of ida_mcp package
@@ -590,7 +698,7 @@ class MCP(idaapi.plugin_t):
         try:
             init_caches()
         except Exception as e:
-            print(f"[MCP] Cache init failed: {e}")
+            logger.warning("Cache init failed: %s", e)
 
         try:
             set_download_base_url(
@@ -605,17 +713,17 @@ class MCP(idaapi.plugin_t):
             return 1
         except OSError as e:
             if e.errno in (48, 98, 10048):  # Address already in use
-                print(f"[MCP] Error: {self.host}:{self.port} is already in use")
+                logger.error("Local MCP address already in use: %s:%s", self.host, self.port)
                 return 0
             raise
 
     def stop_local_server(self):
         if self.mcp is None:
-            print("[MCP] Local MCP server is not running")
+            logger.warning("Local MCP server is not running")
             return 0
         self.mcp.stop()
         self.mcp = None
-        print("[MCP] Local MCP server stopped")
+        logger.info("Local MCP server stopped")
         self.update_menu_state()
         return 1
 
@@ -636,6 +744,8 @@ class MCP(idaapi.plugin_t):
             self.disconnect_pool(confirm=False)
         if self.mcp is not None:
             self.stop_local_server()
+        if hasattr(self, "_logging_handler"):
+            remove_plugin_logging_handler(self._logging_handler)
 
 
 def PLUGIN_ENTRY():

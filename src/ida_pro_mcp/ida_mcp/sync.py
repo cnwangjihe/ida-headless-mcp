@@ -43,7 +43,7 @@ class CancelledError(RequestCancelledError):
     pass
 
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ida_mcp.ida.sync")
 _TOOL_TIMEOUT_ENV = "IDA_MCP_TOOL_TIMEOUT_SEC"
 _DEFAULT_TOOL_TIMEOUT_SEC = 60.0
 _EXECUTE_SYNC_WAIT_GRACE_SEC = 5.0

@@ -1,4 +1,5 @@
 import json
+import logging
 from typing import TypeVar
 
 import ida_netnode
@@ -7,6 +8,7 @@ from .sync import idasync
 
 
 T = TypeVar("T")
+logger = logging.getLogger("ida_mcp.ida.config")
 
 
 @idasync
@@ -18,8 +20,11 @@ def config_json_get(key: str, default: T) -> T:
     try:
         return json.loads(json_blob)
     except Exception as e:
-        print(
-            f"[WARNING] Invalid JSON stored in netnode '{key}': '{json_blob}' from netnode: {e}"
+        logger.warning(
+            "Invalid JSON stored in netnode %r: %r: %s",
+            key,
+            json_blob,
+            e,
         )
         return default
 
