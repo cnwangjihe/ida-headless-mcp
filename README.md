@@ -180,6 +180,9 @@ shown under each holder, while databases without a holder are grouped under
 An active `idalib_open` is shown immediately under its requesting agent as
 `OPENING` with the full input path and elapsed time. It does not receive a
 database alias or count toward refcount until opening succeeds.
+While an MCP request is executing in IDA, its actual target database row is
+marked `BUSY <tool>`, including when an explicit `session_id` overrides the
+agent's current binding.
 The middle pane contains main pool-process logs at the selected `--log-level`,
 and the bottom line accepts administration commands.
 

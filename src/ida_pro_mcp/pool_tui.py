@@ -74,6 +74,7 @@ class DashboardModel:
     contexts: dict[str, dict[str, Any]] = field(default_factory=dict)
     databases: dict[str, dict[str, Any]] = field(default_factory=dict)
     openings: dict[str, dict[str, Any]] = field(default_factory=dict)
+    requests: dict[str, dict[str, Any]] = field(default_factory=dict)
     _revisions: dict[tuple[str, str], int] = field(default_factory=dict)
 
     def apply(self, event: AdminEvent) -> bool:
@@ -81,6 +82,8 @@ class DashboardModel:
             entity_type = "transport"
         elif event.kind in {"IdbOpenStarted", "IdbOpenFinished"}:
             entity_type = "opening"
+        elif event.kind in {"IdbRequestStarted", "IdbRequestFinished"}:
+            entity_type = "request"
         elif event.kind == "ContextMappingChanged":
             entity_type = "context"
         else:
@@ -108,6 +111,13 @@ class DashboardModel:
                 self.openings[event.entity_id] = dict(event.payload)
             return True
 
+        if entity_type == "request":
+            if event.kind == "IdbRequestFinished":
+                self.requests.pop(event.entity_id, None)
+            else:
+                self.requests[event.entity_id] = dict(event.payload)
+            return True
+
         if entity_type == "context":
             context = dict(event.payload)
             if (
@@ -121,6 +131,11 @@ class DashboardModel:
 
         if event.kind in {"IdbClosed", "ExternalIdbUnregistered"}:
             self.databases.pop(event.entity_id, None)
+            self.requests = {
+                operation_id: request
+                for operation_id, request in self.requests.items()
+                if request.get("session_id") != event.entity_id
+            }
         else:
             self.databases[event.entity_id] = dict(event.payload)
         return True
@@ -141,6 +156,11 @@ class DashboardModel:
             context_id
             for opening in self.openings.values()
             if (context_id := opening.get("context_id"))
+        )
+        context_ids.update(
+            context_id
+            for request in self.requests.values()
+            if (context_id := request.get("context_id"))
         )
         return context_ids
 
@@ -436,6 +456,8 @@ class PoolTuiApp(App[None]):
             "ContextMappingChanged",
             "IdbOpenStarted",
             "IdbOpenFinished",
+            "IdbRequestStarted",
+            "IdbRequestFinished",
         }:
             self.aliases.database(event.entity_id)
         self._rebuild_tree()
@@ -767,10 +789,27 @@ class PoolTuiApp(App[None]):
                 f"(age {format_duration(now - float(opening.get('started_at', now)))})"
                 for operation_id, opening in openings
             )
+            busy_requests = sorted(
+                (
+                    request
+                    for request in self.model.requests.values()
+                    if request.get("context_id") == entity_id
+                ),
+                key=lambda request: (
+                    str(request.get("session_id") or ""),
+                    str(request.get("operation_id") or ""),
+                ),
+            )
+            busy_details = ", ".join(
+                f"{self.aliases.database(str(request.get('session_id')))}:"
+                f"{request.get('operation') or 'request'}"
+                for request in busy_requests
+                if request.get("session_id") in self.model.databases
+            )
             logger.info(
                 "Agent %s\n  context: %s\n  client: %s %s\n  peer: %s\n"
                 "  state: %s\n  active requests: %s\n  opening: %s\n"
-                "  bound: %s\n  holds: %s",
+                "  busy IDBs: %s\n  bound: %s\n  holds: %s",
                 self.aliases.agent(entity_id),
                 entity_id,
                 transport.get("client_name") or "unknown",
@@ -779,12 +818,25 @@ class PoolTuiApp(App[None]):
                 transport.get("state") or "ORPHAN",
                 transport.get("active_requests", 0),
                 opening_details or "-",
+                busy_details or "-",
                 relation.get("bound_session_id") or "-",
                 ", ".join(relation.get("held_session_ids", [])) or "-",
             )
             return
 
         database = self.model.databases[entity_id]
+        now = time.monotonic()
+        busy_requests = sorted(
+            self.model.requests.items(),
+            key=lambda item: item[0],
+        )
+        busy_details = ", ".join(
+            f"{operation_id} {request.get('operation') or 'request'}"
+            f"@{request.get('context_id') or '-'} "
+            f"(age {format_duration(now - float(request.get('started_at', now)))})"
+            for operation_id, request in busy_requests
+            if request.get("session_id") == entity_id
+        )
         holders = sorted(
             context_id
             for context_id, relation in self.model.contexts.items()
@@ -793,7 +845,7 @@ class PoolTuiApp(App[None]):
         logger.info(
             "Database %s\n  session: %s\n  input: %s\n  idb: %s\n"
             "  type: %s\n  state: %s\n  refcount: %s\n  holders: %s\n"
-            "  instance: %s\n  pid: %s\n  backend log: %s",
+            "  busy: %s\n  instance: %s\n  pid: %s\n  backend log: %s",
             self.aliases.database(entity_id),
             entity_id,
             database.get("input_path") or "-",
@@ -802,6 +854,7 @@ class PoolTuiApp(App[None]):
             database.get("state") or "UNKNOWN",
             database.get("refcount", 0),
             ", ".join(holders) or "-",
+            busy_details or "-",
             database.get("instance_index", "-"),
             database.get("pid") or "-",
             database.get("log_path") or "-",
@@ -1095,4 +1148,23 @@ class PoolTuiApp(App[None]):
         state = database.get("state", "OPEN")
         refcount = database.get("refcount", 0)
         label.append(f" {filename} · {kind} · {state} · ref {refcount}")
+        busy_requests = sorted(
+            (
+                request
+                for request in self.model.requests.values()
+                if request.get("session_id") == session_id
+            ),
+            key=lambda request: str(request.get("operation_id") or ""),
+        )
+        if busy_requests:
+            operations = sorted(
+                {
+                    str(request.get("operation") or "request")
+                    for request in busy_requests
+                }
+            )
+            label.append(" · BUSY", style="bold yellow")
+            if len(busy_requests) > 1:
+                label.append(f"({len(busy_requests)})", style="bold yellow")
+            label.append(f" {','.join(operations[:2])}", style="yellow")
         return label

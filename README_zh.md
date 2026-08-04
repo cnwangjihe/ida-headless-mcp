@@ -161,8 +161,9 @@ database。共享 database 会分别显示在每个持有者下面；无持有�
 database 归入 `Unattached / Closing IDBs` 分支。Agent 存活和空闲时间按分钟
 粒度显示。正在执行的 `idalib_open` 会立即显示在发起请求的 agent 下方，包括
 `OPENING` 状态、完整输入路径和已耗时；打开成功前不会分配 database 别名，也不
-计入 refcount。中间区域显示主 Pool 进程在当前 `--log-level` 下的日志，底部单行
-是管理控制台。
+计入 refcount。MCP 请求在 IDA 中执行期间，实际目标 database 行会标记为
+`BUSY <tool>`；即使显式 `session_id` 覆盖了 agent 当前绑定，也会标记真实目标。
+中间区域显示主 Pool 进程在当前 `--log-level` 下的日志，底部单行是管理控制台。
 
 | 命令 | 行为 |
 |---|---|

@@ -153,6 +153,30 @@ class DashboardModelTests(unittest.TestCase):
         self.assertEqual(model.openings, {})
         self.assertFalse(model.apply(started))
 
+    def test_request_lifecycle_tracks_busy_target_and_cleans_on_close(self):
+        model = DashboardModel()
+        started = event(
+            "pool",
+            "IdbRequestStarted",
+            5,
+            "request:1234",
+            session_id="db-a",
+            context_id="http:agent-a",
+            operation="decompile",
+            started_at=100.0,
+        )
+
+        self.assertTrue(model.apply(started))
+        self.assertEqual(model.agent_ids(), {"http:agent-a"})
+        self.assertEqual(
+            model.requests["request:1234"]["session_id"],
+            "db-a",
+        )
+
+        model.apply(event("pool", "IdbClosed", 6, "db-a", state="CLOSED"))
+        self.assertEqual(model.requests, {})
+        self.assertFalse(model.apply(started))
+
 
 class PresentationHelpersTests(unittest.TestCase):
     def test_duration_is_minute_granularity(self):
@@ -450,6 +474,93 @@ class PoolTuiAppTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(len(agent.children), 1)
             self.assertIn("D01 router.i64", agent.children[0].label.plain)
+
+    async def test_tree_marks_the_target_database_busy(self):
+        app = PoolTuiApp(AdminEventBus(), BufferedLogHandler())
+
+        async with app.run_test(size=(140, 35)) as pilot:
+            now = __import__("time").monotonic()
+            app.apply_admin_event(
+                event(
+                    "mcp",
+                    "TransportOpened",
+                    1,
+                    "http:agent-a",
+                    transport="http",
+                    client_name="agent-a",
+                    state="OPEN",
+                    created_at=now,
+                    last_activity=now,
+                    active_requests=1,
+                )
+            )
+            app.apply_admin_event(
+                event(
+                    "pool",
+                    "IdbOpened",
+                    2,
+                    "database-a",
+                    filename="router.i64",
+                    state="OPEN",
+                    refcount=1,
+                )
+            )
+            app.apply_admin_event(
+                event(
+                    "pool",
+                    "ContextMappingChanged",
+                    3,
+                    "http:agent-a",
+                    bound_session_id="database-a",
+                    held_session_ids=["database-a"],
+                )
+            )
+            app.apply_admin_event(
+                event(
+                    "pool",
+                    "IdbRequestStarted",
+                    4,
+                    "request:1234",
+                    session_id="database-a",
+                    context_id="http:agent-a",
+                    operation="decompile",
+                    started_at=now,
+                )
+            )
+            await pilot.pause()
+
+            tree = app.query_one("#session-tree", Tree)
+            agent = next(
+                node
+                for node in tree.root.children
+                if node.data == ("agent", "http:agent-a")
+            )
+            database_label = agent.children[0].label.plain
+            self.assertIn("D01 router.i64", database_label)
+            self.assertIn("BUSY decompile", database_label)
+            self.assertEqual(app.aliases.database_items(), (("database-a", "D01"),))
+            with self.assertLogs("ida_mcp.tui", level="INFO") as captured:
+                app.execute_command("show D01")
+            self.assertIn("request:1234 decompile@http:agent-a", captured.output[0])
+
+            app.apply_admin_event(
+                event(
+                    "pool",
+                    "IdbRequestFinished",
+                    5,
+                    "request:1234",
+                    session_id="database-a",
+                    success=True,
+                )
+            )
+            await pilot.pause()
+
+            agent = next(
+                node
+                for node in tree.root.children
+                if node.data == ("agent", "http:agent-a")
+            )
+            self.assertNotIn("BUSY", agent.children[0].label.plain)
 
     async def test_tree_handles_expected_ten_agents_and_thirty_databases(self):
         bus = AdminEventBus()
