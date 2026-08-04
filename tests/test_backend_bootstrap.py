@@ -5,12 +5,14 @@ from ida_pro_mcp import backend_bootstrap
 
 
 class BackendBootstrapTests(unittest.TestCase):
+    @patch.object(backend_bootstrap, "configure_runtime_logging")
     @patch.object(backend_bootstrap.importlib, "import_module")
     @patch.object(backend_bootstrap, "_redirect_output")
     def test_redirects_output_before_importing_ida_backend(
         self,
         redirect_output,
         import_module,
+        configure_logging,
     ):
         events = []
         log_file = MagicMock()
@@ -23,6 +25,9 @@ class BackendBootstrapTests(unittest.TestCase):
         import_module.side_effect = lambda name: events.append(
             ("import", name)
         ) or idalib_server
+        configure_logging.side_effect = lambda level: events.append(
+            ("logging", level)
+        )
 
         backend_bootstrap.run_backend_process(
             rpc_connection,
@@ -35,6 +40,7 @@ class BackendBootstrapTests(unittest.TestCase):
             events,
             [
                 ("redirect", "/tmp/backend.log"),
+                ("logging", "info"),
                 ("import", "ida_pro_mcp.idalib_server"),
             ],
         )

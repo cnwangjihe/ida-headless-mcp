@@ -1,4 +1,5 @@
 import os
+import logging
 import sys
 import unittest
 from unittest.mock import MagicMock, patch
@@ -15,6 +16,23 @@ else:
 
 
 class PoolServerLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self._runtime_logger = logging.getLogger("ida_mcp")
+        self._runtime_logging_state = (
+            list(self._runtime_logger.handlers),
+            self._runtime_logger.level,
+            self._runtime_logger.propagate,
+        )
+
+    def tearDown(self):
+        handlers, level, propagate = self._runtime_logging_state
+        for handler in self._runtime_logger.handlers:
+            if handler not in handlers:
+                handler.close()
+        self._runtime_logger.handlers[:] = handlers
+        self._runtime_logger.setLevel(level)
+        self._runtime_logger.propagate = propagate
+
     def test_explicit_ida_directory_overrides_environment(self):
         with patch.dict(os.environ, {"IDADIR": "/environment/ida"}):
             configured = idalib_pool_server.configure_ida_directory(
@@ -92,12 +110,25 @@ class PoolServerLifecycleTests(unittest.TestCase):
 )
 class IdalibServerLifecycleTests(unittest.TestCase):
     def setUp(self):
+        self._runtime_logger = logging.getLogger("ida_mcp")
+        self._runtime_logging_state = (
+            list(self._runtime_logger.handlers),
+            self._runtime_logger.level,
+            self._runtime_logger.propagate,
+        )
         self.old_session_id = idalib_server._current_session_id
         self.old_input_path = idalib_server._current_input_path
         self.old_idb_path = idalib_server._current_idb_path
         self.old_disabled_tools = set(idalib_server.MCP_SERVER.disabled_tools)
 
     def tearDown(self):
+        handlers, level, propagate = self._runtime_logging_state
+        for handler in self._runtime_logger.handlers:
+            if handler not in handlers:
+                handler.close()
+        self._runtime_logger.handlers[:] = handlers
+        self._runtime_logger.setLevel(level)
+        self._runtime_logger.propagate = propagate
         idalib_server._current_session_id = self.old_session_id
         idalib_server._current_input_path = self.old_input_path
         idalib_server._current_idb_path = self.old_idb_path
