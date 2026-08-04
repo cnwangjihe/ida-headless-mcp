@@ -826,7 +826,8 @@ class TestPoolServerDispatch(unittest.TestCase):
         started = threading.Event()
         release = threading.Event()
 
-        def forward(_inst, request):
+        def forward(_inst, request, *, context_id=None):
+            self.assertEqual(context_id, "http:agent-a")
             started.set()
             self.assertTrue(release.wait(2))
             return {
@@ -1182,7 +1183,10 @@ class TestPoolServerDispatch(unittest.TestCase):
         result = resp["result"]["structuredContent"]
         self.assertTrue(result.get("ok"))
         pool.forward_tool_call.assert_called_once_with(
-            inst, "idalib_save", {"path": "/tmp/a.elf.i64"}
+            inst,
+            "idalib_save",
+            {"path": "/tmp/a.elf.i64"},
+            context_id="sse:agent-a",
         )
 
     def test_save_no_session_returns_error(self):
@@ -1244,7 +1248,12 @@ class TestPoolServerDispatch(unittest.TestCase):
         self.assertTrue(result.get("ready"))
         self.assertEqual(result["health"]["status"], "ok")
         self.assertTrue(result["session"]["is_external"])
-        pool.forward_tool_call.assert_called_once_with(inst, "server_health", {})
+        pool.forward_tool_call.assert_called_once_with(
+            inst,
+            "server_health",
+            {},
+            context_id="sse:agent-a",
+        )
 
     def test_health_no_session_returns_error(self):
         mcp, pool = self._make_mcp_and_pool()
@@ -1308,7 +1317,10 @@ class TestPoolServerDispatch(unittest.TestCase):
         self.assertTrue(result.get("ready"))
         self.assertTrue(result["session"]["is_external"])
         pool.forward_tool_call.assert_called_once_with(
-            inst, "server_warmup", {"build_caches": False}
+            inst,
+            "server_warmup",
+            {"build_caches": False},
+            context_id="sse:agent-a",
         )
 
     def test_warmup_no_session_returns_error(self):

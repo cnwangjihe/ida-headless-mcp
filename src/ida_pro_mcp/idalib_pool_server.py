@@ -571,7 +571,11 @@ def build_dispatch(
             with _active_forwards_lock:
                 _active_forwards[key] = (inst, token)
         try:
-            return pool.forward_raw(inst, request_obj)
+            return pool.forward_raw(
+                inst,
+                request_obj,
+                context_id=_get_transport_ctx(),
+            )
         finally:
             if key is not None:
                 with _active_forwards_lock:
@@ -666,7 +670,12 @@ def build_dispatch(
             _sess, inst = pool.acquire_session(ctx, sid)
         except (KeyError, RuntimeError) as e:
             return {"error": str(e)}
-        return pool.forward_tool_call(inst, "idalib_save", arguments)
+        return pool.forward_tool_call(
+            inst,
+            "idalib_save",
+            arguments,
+            context_id=ctx,
+        )
 
     def _handle_idalib_health(arguments: dict) -> dict:
         sid = arguments.pop("session_id", None)
@@ -682,13 +691,23 @@ def build_dispatch(
         except (KeyError, RuntimeError) as e:
             return {"ready": False, "error": str(e)}
         if getattr(inst, "is_external", False) is True:
-            health = pool.forward_tool_call(inst, "server_health", {})
+            health = pool.forward_tool_call(
+                inst,
+                "server_health",
+                {},
+                context_id=ctx,
+            )
             return {
                 "ready": bool(isinstance(health, dict) and health.get("status") == "ok"),
                 "session": sess.to_dict(refcount=pool.get_refcount(sid)),
                 "health": health,
             }
-        return pool.forward_tool_call(inst, "idalib_health", arguments)
+        return pool.forward_tool_call(
+            inst,
+            "idalib_health",
+            arguments,
+            context_id=ctx,
+        )
 
     def _handle_idalib_warmup(arguments: dict) -> dict:
         sid = arguments.pop("session_id", None)
@@ -704,13 +723,23 @@ def build_dispatch(
         except (KeyError, RuntimeError) as e:
             return {"ready": False, "error": str(e)}
         if getattr(inst, "is_external", False) is True:
-            warmup = pool.forward_tool_call(inst, "server_warmup", arguments)
+            warmup = pool.forward_tool_call(
+                inst,
+                "server_warmup",
+                arguments,
+                context_id=ctx,
+            )
             return {
                 "ready": bool(isinstance(warmup, dict) and warmup.get("ok")),
                 "session": sess.to_dict(refcount=pool.get_refcount(sid)),
                 "warmup": warmup,
             }
-        return pool.forward_tool_call(inst, "idalib_warmup", arguments)
+        return pool.forward_tool_call(
+            inst,
+            "idalib_warmup",
+            arguments,
+            context_id=ctx,
+        )
 
     _mgmt_handlers: dict[str, Any] = {
         "idalib_open": _handle_idalib_open,

@@ -315,6 +315,69 @@ class PoolAdministrationEventTests(unittest.TestCase):
         self.assertFalse(self.events[1].payload["success"])
         self.assertEqual(self.events[1].payload["error"], "invalid IDB")
 
+    def test_forward_emits_target_idb_request_lifecycle(self):
+        pool = self._make_pool()
+        process = MagicMock()
+        process.is_alive.return_value = True
+        inst = InstanceInfo(0, process, session_id="s1")
+        pool.im.instances.append(inst)
+        pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.i64", 0)
+
+        def forward(_inst, _request):
+            self.assertEqual(
+                [event.kind for event in self.events],
+                ["IdbRequestStarted"],
+            )
+            return {"jsonrpc": "2.0", "result": {}, "id": 42}
+
+        pool.im.forward_raw.side_effect = forward
+        result = pool.forward_raw(
+            inst,
+            {
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "decompile", "arguments": {}},
+                "id": 42,
+            },
+            context_id="http:agent-a",
+        )
+
+        self.assertEqual(result["id"], 42)
+        self.assertEqual(
+            [event.kind for event in self.events],
+            ["IdbRequestStarted", "IdbRequestFinished"],
+        )
+        started, finished = self.events
+        self.assertEqual(started.entity_id, finished.entity_id)
+        self.assertEqual(started.payload["session_id"], "s1")
+        self.assertEqual(started.payload["context_id"], "http:agent-a")
+        self.assertEqual(started.payload["operation"], "decompile")
+        self.assertEqual(started.payload["request_id"], 42)
+        self.assertTrue(finished.payload["success"])
+
+    def test_failed_forward_finishes_target_idb_request_lifecycle(self):
+        pool = self._make_pool()
+        process = MagicMock()
+        process.is_alive.return_value = True
+        inst = InstanceInfo(0, process, session_id="s1")
+        pool.im.instances.append(inst)
+        pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.i64", 0)
+        pool.im.forward_raw.side_effect = RuntimeError("backend stopped")
+
+        with self.assertRaisesRegex(RuntimeError, "backend stopped"):
+            pool.forward_raw(
+                inst,
+                {"method": "tools/call", "params": {"name": "decompile"}},
+                context_id="http:agent-a",
+            )
+
+        self.assertEqual(
+            [event.kind for event in self.events],
+            ["IdbRequestStarted", "IdbRequestFinished"],
+        )
+        self.assertFalse(self.events[-1].payload["success"])
+        self.assertEqual(self.events[-1].payload["error"], "backend stopped")
+
     def test_force_close_emits_one_batch_of_cleared_contexts(self):
         pool = self._make_pool()
         process = MagicMock()

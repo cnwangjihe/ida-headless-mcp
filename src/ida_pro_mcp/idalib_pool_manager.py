@@ -757,6 +757,37 @@ class PoolManager:
             )
         return self._make_admin_event_locked(kind, operation_id, payload)
 
+    def _request_event_locked(
+        self,
+        kind: str,
+        operation_id: str,
+        session_id: str,
+        context_id: str | None,
+        operation: str,
+        request_id: int | str | None,
+        started_at: float,
+        *,
+        error: str | None = None,
+    ) -> AdminEvent:
+        payload: dict[str, Any] = {
+            "operation_id": operation_id,
+            "session_id": session_id,
+            "context_id": context_id,
+            "operation": operation,
+            "request_id": request_id,
+            "state": "BUSY" if kind == "IdbRequestStarted" else "FINISHED",
+            "started_at": started_at,
+        }
+        if kind == "IdbRequestFinished":
+            payload.update(
+                {
+                    "success": error is None,
+                    "error": error,
+                    "finished_at": time.monotonic(),
+                }
+            )
+        return self._make_admin_event_locked(kind, operation_id, payload)
+
     def _emit_admin_events(self, events: list[AdminEvent]) -> None:
         sink = self.admin_event_sink
         if sink is None:
@@ -770,6 +801,58 @@ class PoolManager:
                     event.kind,
                     event.entity_id,
                 )
+
+    @contextmanager
+    def _idb_request_lifecycle(
+        self,
+        inst: InstanceInfo,
+        operation: str,
+        *,
+        context_id: str | None,
+        request_id: int | str | None,
+    ):
+        with self._lock:
+            session_id = inst.session_id
+            if session_id is None or self.sr.get(session_id) is None:
+                tracked = None
+            else:
+                operation_id = f"request:{secrets.token_hex(8)}"
+                started_at = time.monotonic()
+                tracked = (operation_id, session_id, started_at)
+                started_event = self._request_event_locked(
+                    "IdbRequestStarted",
+                    operation_id,
+                    session_id,
+                    context_id,
+                    operation,
+                    request_id,
+                    started_at,
+                )
+        if tracked is None:
+            yield
+            return
+
+        self._emit_admin_events([started_event])
+        error: str | None = None
+        try:
+            yield
+        except BaseException as exception:
+            error = str(exception)
+            raise
+        finally:
+            operation_id, session_id, started_at = tracked
+            with self._lock:
+                finished_event = self._request_event_locked(
+                    "IdbRequestFinished",
+                    operation_id,
+                    session_id,
+                    context_id,
+                    operation,
+                    request_id,
+                    started_at,
+                    error=error,
+                )
+            self._emit_admin_events([finished_event])
 
     def _reuse_session_locked(
         self,
@@ -1766,17 +1849,50 @@ class PoolManager:
 
         return self.im.send_control(inst, "cancel")
 
-    def forward_tool_call(self, inst: InstanceInfo, tool_name: str, arguments: dict) -> Any:
+    def forward_tool_call(
+        self,
+        inst: InstanceInfo,
+        tool_name: str,
+        arguments: dict,
+        *,
+        context_id: str | None = None,
+    ) -> Any:
         with self._operation():
             with inst.operation_lock:
                 self._ensure_instance_forwardable(inst)
-                return self.im.forward_tool_call(inst, tool_name, arguments)
+                with self._idb_request_lifecycle(
+                    inst,
+                    tool_name,
+                    context_id=context_id,
+                    request_id=None,
+                ):
+                    return self.im.forward_tool_call(inst, tool_name, arguments)
 
-    def forward_raw(self, inst: InstanceInfo, request: dict) -> dict:
+    def forward_raw(
+        self,
+        inst: InstanceInfo,
+        request: dict,
+        *,
+        context_id: str | None = None,
+    ) -> dict:
+        method = str(request.get("method") or "request")
+        if method == "tools/call":
+            params = request.get("params") or {}
+            operation = str(params.get("name") or method)
+        else:
+            operation = method
+        raw_request_id = request.get("id")
+        request_id = raw_request_id if isinstance(raw_request_id, (int, str)) else None
         with self._operation():
             with inst.operation_lock:
                 self._ensure_instance_forwardable(inst)
-                return self.im.forward_raw(inst, request)
+                with self._idb_request_lifecycle(
+                    inst,
+                    operation,
+                    context_id=context_id,
+                    request_id=request_id,
+                ):
+                    return self.im.forward_raw(inst, request)
 
     def _ensure_instance_forwardable(self, inst: InstanceInfo) -> None:
         with self._lock:
