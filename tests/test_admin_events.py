@@ -338,5 +338,87 @@ class PoolAdministrationEventTests(unittest.TestCase):
         self.assertEqual(self.events[1].payload["held_session_ids"], [])
 
 
+class PoolAdministrationSaveTests(unittest.TestCase):
+    def _make_session(self, *, external=False):
+        pool = PoolManager(runtime_dir="/tmp/fake-pool")
+        pool.im = MagicMock(spec=InstanceManager)
+        if external:
+            bridge = MagicMock()
+            bridge.alive = True
+            inst = InstanceInfo(
+                0,
+                None,
+                session_id="s1",
+                ws_bridge=bridge,
+            )
+        else:
+            process = MagicMock()
+            process.is_alive.return_value = True
+            inst = InstanceInfo(0, process, session_id="s1")
+        pool.im.find.return_value = inst
+        pool.sr.create(
+            "s1",
+            "/tmp/a.elf",
+            "/tmp/a.i64",
+            0,
+            is_external=external,
+        )
+        pool.sr.acquire_context_session("http:agent-a", "s1")
+        pool.sr.bind_context("http:agent-a", "s1")
+        return pool, inst
+
+    def test_save_local_session_preserves_context_lease(self):
+        pool, inst = self._make_session()
+        events = []
+        pool.admin_event_sink = events.append
+        pool.im.forward_tool_call.return_value = {
+            "ok": True,
+            "path": "/tmp/a.i64",
+            "error": None,
+        }
+
+        result = pool.save_session("s1")
+
+        self.assertTrue(result["success"])
+        pool.im.forward_tool_call.assert_called_once_with(
+            inst, "idalib_save", {}
+        )
+        self.assertEqual(pool.get_refcount("s1"), 1)
+        self.assertEqual(pool.get_context_session_id("http:agent-a"), "s1")
+        self.assertEqual([event.kind for event in events], ["IdbActivityChanged"])
+
+    def test_save_external_session_uses_same_operation_without_new_ref(self):
+        pool, inst = self._make_session(external=True)
+        pool.im.forward_tool_call.return_value = {
+            "ok": True,
+            "path": "/tmp/a.i64",
+            "error": None,
+        }
+
+        result = pool.save_session("s1")
+
+        self.assertTrue(result["success"])
+        pool.im.forward_tool_call.assert_called_once_with(
+            inst, "idalib_save", {}
+        )
+        self.assertEqual(pool.get_refcount("s1"), 2)
+
+    def test_save_failure_is_returned_without_touching_relationships(self):
+        pool, _inst = self._make_session()
+        original_access = pool.sr.get("s1").last_accessed
+        pool.im.forward_tool_call.return_value = {
+            "ok": False,
+            "path": "/tmp/a.i64",
+            "error": "disk full",
+        }
+
+        result = pool.save_session("s1")
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"], "disk full")
+        self.assertEqual(pool.sr.get("s1").last_accessed, original_access)
+        self.assertEqual(pool.get_refcount("s1"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1097,6 +1097,59 @@ class PoolManager:
         except PoolShuttingDownError as e:
             return {"success": False, "error": str(e)}
 
+    def save_session(self, session_id: str) -> dict:
+        """Save one live IDB without acquiring or changing a context lease."""
+        try:
+            with self._operation():
+                with self._lock:
+                    try:
+                        sess, inst = self._resolve_session_instance_locked(session_id)
+                    except (KeyError, RuntimeError) as e:
+                        message = str(e.args[0]) if isinstance(e, KeyError) else str(e)
+                        return {"success": False, "error": message}
+
+                event: AdminEvent | None = None
+                with inst.operation_lock:
+                    try:
+                        self._ensure_instance_forwardable(inst)
+                        save_result = self.im.forward_tool_call(
+                            inst, "idalib_save", {}
+                        )
+                    except Exception as e:
+                        return {
+                            "success": False,
+                            "session_id": session_id,
+                            "error": str(e),
+                        }
+
+                    if isinstance(save_result, dict) and (
+                        save_result.get("ok") is False
+                        or save_result.get("error")
+                    ):
+                        return {
+                            "success": False,
+                            "session_id": session_id,
+                            "error": save_result.get("error") or "Save failed",
+                            "result": save_result,
+                        }
+
+                    with self._lock:
+                        if self.sr.get(session_id) is sess:
+                            self.sr.touch(session_id)
+                            event = self._session_event_locked(
+                                "IdbActivityChanged", sess, inst
+                            )
+
+                self._emit_admin_events([event] if event is not None else [])
+                logger.info("IDA session saved: session=%s", session_id)
+                return {
+                    "success": True,
+                    "session_id": session_id,
+                    "result": save_result,
+                }
+        except PoolShuttingDownError as e:
+            return {"success": False, "error": str(e)}
+
     def _close_session(self, session_id: str) -> dict:
         events: list[AdminEvent] = []
         with self._lock:
