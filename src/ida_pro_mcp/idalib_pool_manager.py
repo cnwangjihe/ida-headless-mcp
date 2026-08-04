@@ -36,6 +36,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
+from ida_pro_mcp.admin_events import AdminEvent, AdminEventSink
 from ida_pro_mcp.backend_bootstrap import run_backend_process
 from ida_pro_mcp.backend_ipc import (
     BackendIpcError,
@@ -120,6 +121,7 @@ class InstanceInfo:
     session_id: str | None = None
     ws_bridge: Any | None = None  # ExternalInstanceBridge for external instances
     closing: bool = False
+    log_path: str | None = None
     operation_lock: threading.RLock = field(
         default_factory=threading.RLock, repr=False
     )
@@ -192,6 +194,7 @@ class InstanceManager:
             process=proc,
             rpc_connection=parent_rpc,
             control_connection=parent_control,
+            log_path=log_path,
         )
         with self._lock:
             self.instances.append(inst)
@@ -617,6 +620,8 @@ class PoolManager:
         self._active_operations = 0
         self._opening_inputs: dict[str, int] = {}
         self._reserved_session_ids: set[str] = set()
+        self._admin_event_revision = 0
+        self.admin_event_sink: AdminEventSink | None = None
 
     @contextmanager
     def _operation(self):
@@ -638,6 +643,124 @@ class PoolManager:
             session_id = f"{session_id}_{secrets.token_hex(3)}"
         self._reserved_session_ids.add(session_id)
         return session_id
+
+    def _make_admin_event_locked(
+        self,
+        kind: str,
+        entity_id: str,
+        payload: dict[str, Any],
+    ) -> AdminEvent:
+        self._admin_event_revision += 1
+        return AdminEvent(
+            source="pool",
+            kind=kind,
+            revision=self._admin_event_revision,
+            entity_id=entity_id,
+            payload=payload,
+        )
+
+    def _session_event_locked(
+        self,
+        kind: str,
+        sess: SessionInfo,
+        inst: InstanceInfo | None = None,
+        *,
+        state: str | None = None,
+    ) -> AdminEvent:
+        if inst is None:
+            inst = self.im.find(sess.instance_index)
+        if state is None:
+            if inst is None or not inst.is_alive():
+                state = "DEAD"
+            elif inst.closing:
+                state = "CLOSING"
+            else:
+                state = "OPEN"
+        holders = sorted(self.sr._session_contexts.get(sess.session_id, set()))
+        bound_contexts = sorted(
+            context_id
+            for context_id, session_id in self.sr._context_bindings.items()
+            if session_id == sess.session_id
+        )
+        process = inst.process if inst is not None else None
+        return self._make_admin_event_locked(
+            kind,
+            sess.session_id,
+            {
+                "session_id": sess.session_id,
+                "input_path": sess.input_path,
+                "idb_path": sess.idb_path,
+                "filename": _path_basename(sess.idb_path or sess.input_path),
+                "instance_index": sess.instance_index,
+                "is_external": sess.is_external,
+                "state": state,
+                "created_at": sess.created_at,
+                "last_activity": sess.last_accessed,
+                "refcount": self.sr.get_refcount(sess.session_id),
+                "holder_context_ids": holders,
+                "bound_context_ids": bound_contexts,
+                "pid": getattr(process, "pid", None),
+                "log_path": inst.log_path if inst is not None else None,
+            },
+        )
+
+    def _context_event_locked(self, context_id: str) -> AdminEvent:
+        held_session_ids = sorted(self.sr.get_context_sessions(context_id))
+        affected_refcounts = {
+            session_id: self.sr.get_refcount(session_id)
+            for session_id in held_session_ids
+        }
+        return self._make_admin_event_locked(
+            "ContextMappingChanged",
+            context_id,
+            {
+                "context_id": context_id,
+                "bound_session_id": self.sr.get_context_session_id(context_id),
+                "held_session_ids": held_session_ids,
+                "affected_session_refcounts": affected_refcounts,
+            },
+        )
+
+    def _emit_admin_events(self, events: list[AdminEvent]) -> None:
+        sink = self.admin_event_sink
+        if sink is None:
+            return
+        for event in events:
+            try:
+                sink(event)
+            except Exception:
+                logger.exception(
+                    "Pool administration event sink failed: kind=%s entity=%s",
+                    event.kind,
+                    event.entity_id,
+                )
+
+    def _reuse_session_locked(
+        self,
+        session_id: str,
+        context_id: str | None,
+        message: str,
+    ) -> tuple[dict, list[AdminEvent]]:
+        sess = self.sr.get(session_id)
+        if sess is None:
+            raise KeyError(f"Session not found: {session_id}")
+        self.sr.touch(session_id)
+        if context_id:
+            self.sr.acquire_context_session(context_id, session_id)
+            self.sr.bind_context(context_id, session_id)
+        refcount = self.sr.get_refcount(session_id)
+        events = [self._session_event_locked("IdbActivityChanged", sess)]
+        if context_id:
+            events.append(self._context_event_locked(context_id))
+        return (
+            {
+                "success": True,
+                "existing": True,
+                "session": sess.to_dict(refcount=refcount),
+                "message": message,
+            },
+            events,
+        )
 
     # ------------------------------------------------------------------
     # High-level operations
@@ -774,6 +897,7 @@ class PoolManager:
     ) -> dict:
         resolved = _normalize_path(binary_path)
         is_idb = resolved.endswith((".idb", ".i64"))
+        reused: tuple[dict, list[AdminEvent]] | None = None
 
         with self._condition:
             while True:
@@ -791,27 +915,12 @@ class PoolManager:
                         if inst is not None and inst.closing is True:
                             self._condition.wait()
                             continue
-                        self.sr.touch(existing_sid)
-                        sess = self.sr.get(existing_sid)
-                        if context_id:
-                            self.sr.acquire_context_session(context_id, existing_sid)
-                            self.sr.bind_context(context_id, existing_sid)
-                        logger.info(
-                            "IDA session reused: session=%s context=%s input=%s "
-                            "refcount=%d",
+                        reused = self._reuse_session_locked(
                             existing_sid,
                             context_id,
-                            sess.input_path,
-                            self.sr.get_refcount(existing_sid),
+                            f"IDB already open as session '{existing_sid}'.",
                         )
-                        return {
-                            "success": True,
-                            "existing": True,
-                            "session": sess.to_dict(
-                                refcount=self.sr.get_refcount(existing_sid)
-                            ),
-                            "message": f"IDB already open as session '{existing_sid}'.",
-                        }
+                        break
                 else:
                     matching_sids = self.sr.find_by_input_path(resolved)
                     if matching_sids:
@@ -824,35 +933,34 @@ class PoolManager:
                         if inst is not None and inst.closing is True:
                             self._condition.wait()
                             continue
-                        self.sr.touch(existing_sid)
-                        sess = self.sr.get(existing_sid)
-                        if context_id:
-                            self.sr.acquire_context_session(context_id, existing_sid)
-                            self.sr.bind_context(context_id, existing_sid)
-                        logger.info(
-                            "IDA session reused: session=%s context=%s input=%s "
-                            "refcount=%d",
+                        reused = self._reuse_session_locked(
                             existing_sid,
                             context_id,
-                            sess.input_path,
-                            self.sr.get_refcount(existing_sid),
+                            f"Binary already open as session '{existing_sid}'.",
                         )
-                        return {
-                            "success": True,
-                            "existing": True,
-                            "session": sess.to_dict(
-                                refcount=self.sr.get_refcount(existing_sid)
-                            ),
-                            "message": (
-                                f"Binary already open as session '{existing_sid}'."
-                            ),
-                        }
+                        break
+
+                if reused is not None:
+                    break
 
                 session_id = self._reserve_session_id_locked(resolved, resolved)
                 self._opening_inputs[resolved] = (
                     self._opening_inputs.get(resolved, 0) + 1
                 )
                 break
+
+        if reused is not None:
+            result, events = reused
+            session = result["session"]
+            logger.info(
+                "IDA session reused: session=%s context=%s input=%s refcount=%d",
+                session["session_id"],
+                context_id,
+                session["input_path"],
+                session["refcount"],
+            )
+            self._emit_admin_events(events)
+            return result
 
         inst: InstanceInfo | None = None
         try:
@@ -922,6 +1030,9 @@ class PoolManager:
                     if context_id:
                         self.sr.acquire_context_session(context_id, session_id)
                         self.sr.bind_context(context_id, session_id)
+                    events = [self._session_event_locked("IdbOpened", sess, inst)]
+                    if context_id:
+                        events.append(self._context_event_locked(context_id))
 
             if conflict_sid is not None:
                 try:
@@ -942,6 +1053,8 @@ class PoolManager:
                         "for the same binary."
                     ),
                 }
+
+            self._emit_admin_events(events)
 
             logger.info(
                 "IDA session opened: session=%s context=%s input=%s idb=%s "
@@ -985,21 +1098,47 @@ class PoolManager:
             return {"success": False, "error": str(e)}
 
     def _close_session(self, session_id: str) -> dict:
+        events: list[AdminEvent] = []
         with self._lock:
             sess = self.sr.get(session_id)
             if sess is None:
                 return {"success": False, "error": f"Session not found: {session_id}"}
             inst = self.im.find(sess.instance_index)
             if inst is None:
+                affected_contexts = set(
+                    self.sr._session_contexts.get(session_id, set())
+                )
+                affected_contexts.update(
+                    context_id
+                    for context_id, bound_session_id
+                    in self.sr._context_bindings.items()
+                    if bound_session_id == session_id
+                )
                 self.sr.remove(session_id)
-                return {"success": True, "closed": True, "message": f"Session cleaned up: {session_id}"}
-            if inst.closing:
+                events.append(
+                    self._session_event_locked(
+                        "IdbClosed", sess, state="CLOSED"
+                    )
+                )
+                events.extend(
+                    self._context_event_locked(context_id)
+                    for context_id in sorted(affected_contexts)
+                )
+                result = {
+                    "success": True,
+                    "closed": True,
+                    "message": f"Session cleaned up: {session_id}",
+                }
+                should_finish = False
+            else:
+                should_finish = True
+            if should_finish and inst.closing:
                 return {
                     "success": False,
                     "closed": False,
                     "error": f"Session is already closing: {session_id}",
                 }
-            if sess.is_external:
+            if should_finish and sess.is_external:
                 return {
                     "success": False,
                     "closed": False,
@@ -1008,10 +1147,27 @@ class PoolManager:
                         "The session owner must disconnect from the pool."
                     ),
                 }
-            self.sr.clear_session_contexts(session_id)
-            self.sr._unbind_session_everywhere(session_id)
-            inst.closing = True
+            if should_finish:
+                affected_contexts = self.sr.clear_session_contexts(session_id)
+                affected_contexts.update(
+                    context_id
+                    for context_id, bound_session_id
+                    in self.sr._context_bindings.items()
+                    if bound_session_id == session_id
+                )
+                self.sr._unbind_session_everywhere(session_id)
+                inst.closing = True
+                events.append(
+                    self._session_event_locked("IdbClosing", sess, inst)
+                )
+                events.extend(
+                    self._context_event_locked(context_id)
+                    for context_id in sorted(affected_contexts)
+                )
 
+        self._emit_admin_events(events)
+        if not should_finish:
+            return result
         return self._finish_close_session(sess, inst)
 
     def _finish_close_session(
@@ -1034,8 +1190,12 @@ class PoolManager:
         with self._lock:
             self.sr.remove(session_id)
             inst.session_id = None
+            closed_event = self._session_event_locked(
+                "IdbClosed", sess, inst, state="CLOSED"
+            )
             self._condition.notify_all()
 
+        self._emit_admin_events([closed_event])
         self.im.kill(inst)
 
         logger.info(
@@ -1070,12 +1230,21 @@ class PoolManager:
                     self.sr.get_refcount(session_id),
                     bind,
                 )
-                return sess, inst
+                events = [
+                    self._session_event_locked(
+                        "IdbActivityChanged", sess, inst
+                    ),
+                    self._context_event_locked(context_id),
+                ]
+            self._emit_admin_events(events)
+            return sess, inst
 
     def release_session(self, context_id: str, session_id: str) -> dict:
         """Release a context-owned lease and close an unreferenced local IDB."""
         try:
             with self._operation():
+                events: list[AdminEvent] = []
+                pending_close: tuple[SessionInfo, InstanceInfo] | None = None
                 with self._lock:
                     sess = self.sr.get(session_id)
                     if sess is None:
@@ -1097,6 +1266,7 @@ class PoolManager:
                     if self.sr.get_context_session_id(context_id) == session_id:
                         self.sr.unbind_context(context_id)
                     new_rc = self.sr.get_refcount(session_id)
+                    events.append(self._context_event_locked(context_id))
                     if sess.is_external or new_rc > 0:
                         logger.info(
                             "IDA session lease released: session=%s context=%s "
@@ -1106,7 +1276,12 @@ class PoolManager:
                             new_rc,
                             sess.is_external,
                         )
-                        return {
+                        events.append(
+                            self._session_event_locked(
+                                "IdbActivityChanged", sess
+                            )
+                        )
+                        result = {
                             "success": True,
                             "closed": False,
                             "refcount": new_rc,
@@ -1117,29 +1292,53 @@ class PoolManager:
                                 f"still has {new_rc} reference(s)."
                             ),
                         }
-                    inst = self.im.find(sess.instance_index)
-                    if inst is None:
-                        self.sr.remove(session_id)
-                        self._condition.notify_all()
-                        logger.info(
-                            "IDA session cleaned up without instance: "
-                            "session=%s context=%s",
-                            session_id,
-                            context_id,
-                        )
-                        return {
-                            "success": True,
-                            "closed": True,
-                            "message": f"Session cleaned up: {session_id}",
-                        }
-                    if inst.closing:
-                        return {
-                            "success": False,
-                            "closed": False,
-                            "error": f"Session is already closing: {session_id}",
-                        }
-                    inst.closing = True
-                return self._finish_close_session(sess, inst)
+                    else:
+                        inst = self.im.find(sess.instance_index)
+                        if inst is None:
+                            self.sr.remove(session_id)
+                            events.append(
+                                self._session_event_locked(
+                                    "IdbClosed", sess, state="CLOSED"
+                                )
+                            )
+                            self._condition.notify_all()
+                            logger.info(
+                                "IDA session cleaned up without instance: "
+                                "session=%s context=%s",
+                                session_id,
+                                context_id,
+                            )
+                            result = {
+                                "success": True,
+                                "closed": True,
+                                "message": f"Session cleaned up: {session_id}",
+                            }
+                        elif inst.closing:
+                            events.append(
+                                self._session_event_locked(
+                                    "IdbActivityChanged", sess, inst
+                                )
+                            )
+                            result = {
+                                "success": False,
+                                "closed": False,
+                                "error": (
+                                    f"Session is already closing: {session_id}"
+                                ),
+                            }
+                        else:
+                            inst.closing = True
+                            events.append(
+                                self._session_event_locked(
+                                    "IdbClosing", sess, inst
+                                )
+                            )
+                            pending_close = (sess, inst)
+                            result = {}
+                self._emit_admin_events(events)
+                if pending_close is not None:
+                    return self._finish_close_session(*pending_close)
+                return result
         except PoolShuttingDownError as e:
             return {"success": False, "closed": False, "error": str(e)}
 
@@ -1151,9 +1350,11 @@ class PoolManager:
                 released_sessions: list[str] = []
                 retained_sessions: list[str] = []
                 cleaned_sessions: list[str] = []
+                events: list[AdminEvent] = []
 
                 with self._lock:
                     session_ids = self.sr.release_context(context_id)
+                    events.append(self._context_event_locked(context_id))
                     for session_id in session_ids:
                         sess = self.sr.get(session_id)
                         if sess is None:
@@ -1161,19 +1362,38 @@ class PoolManager:
                         released_sessions.append(session_id)
                         if sess.is_external or self.sr.get_refcount(session_id) > 0:
                             retained_sessions.append(session_id)
+                            events.append(
+                                self._session_event_locked(
+                                    "IdbActivityChanged", sess
+                                )
+                            )
                             continue
                         inst = self.im.find(sess.instance_index)
                         if inst is None:
                             self.sr.remove(session_id)
                             cleaned_sessions.append(session_id)
+                            events.append(
+                                self._session_event_locked(
+                                    "IdbClosed", sess, state="CLOSED"
+                                )
+                            )
                             continue
                         if inst.closing:
+                            events.append(
+                                self._session_event_locked(
+                                    "IdbActivityChanged", sess, inst
+                                )
+                            )
                             continue
                         inst.closing = True
                         pending_close.append((sess, inst))
+                        events.append(
+                            self._session_event_locked("IdbClosing", sess, inst)
+                        )
                     if cleaned_sessions:
                         self._condition.notify_all()
 
+                self._emit_admin_events(events)
                 closed_sessions = list(cleaned_sessions)
                 close_errors: dict[str, str] = {}
                 for sess, inst in pending_close:
@@ -1267,7 +1487,11 @@ class PoolManager:
                 is_external=True,
             )
             inst.session_id = session_id
+            event = self._session_event_locked(
+                "ExternalIdbRegistered", sess, inst
+            )
 
+        self._emit_admin_events([event])
         logger.info(
             "External IDA session registered: session=%s input=%s idb=%s "
             "instance=%d",
@@ -1296,11 +1520,29 @@ class PoolManager:
             if not sess or not sess.is_external:
                 return {"success": False, "error": "External session not found"}
             agents = max(0, self.sr.get_refcount(session_id) - 1)
+            affected_contexts = set(
+                self.sr._session_contexts.get(session_id, set())
+            )
+            affected_contexts.update(
+                context_id
+                for context_id, bound_session_id in self.sr._context_bindings.items()
+                if bound_session_id == session_id
+            )
             self.sr.remove(session_id)
             inst = self.im.find(sess.instance_index)
             if inst:
                 inst.closing = True
                 inst.session_id = None
+            events = [
+                self._session_event_locked(
+                    "ExternalIdbUnregistered", sess, inst, state="CLOSED"
+                )
+            ]
+            events.extend(
+                self._context_event_locked(context_id)
+                for context_id in sorted(affected_contexts)
+            )
+        self._emit_admin_events(events)
         if inst:
             with inst.operation_lock:
                 self.im.kill(inst)
@@ -1322,7 +1564,11 @@ class PoolManager:
         with self._lock:
             sess, inst = self._resolve_session_instance_locked(session_id)
             self.sr.touch(session_id)
-            return sess, inst
+            event = self._session_event_locked(
+                "IdbActivityChanged", sess, inst
+            )
+        self._emit_admin_events([event])
+        return sess, inst
 
     def _resolve_session_instance_locked(
         self, session_id: str
@@ -1355,10 +1601,15 @@ class PoolManager:
     def bind_context(self, context_id: str, session_id: str) -> None:
         with self._lock:
             self.sr.bind_context(context_id, session_id)
+            event = self._context_event_locked(context_id)
+        self._emit_admin_events([event])
 
     def unbind_context(self, context_id: str) -> str | None:
         with self._lock:
-            return self.sr.unbind_context(context_id)
+            session_id = self.sr.unbind_context(context_id)
+            event = self._context_event_locked(context_id)
+        self._emit_admin_events([event])
+        return session_id
 
     def get_context_session_id(self, context_id: str) -> str | None:
         with self._lock:

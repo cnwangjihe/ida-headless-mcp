@@ -2,6 +2,11 @@ import unittest
 from unittest.mock import MagicMock
 
 from ida_pro_mcp import idalib_pool_server
+from ida_pro_mcp.idalib_pool_manager import (
+    InstanceInfo,
+    InstanceManager,
+    PoolManager,
+)
 
 
 McpServer = idalib_pool_server._mcp_mod.McpServer
@@ -179,6 +184,158 @@ class TransportAdministrationDisconnectTests(unittest.TestCase):
         result = self.server.disconnect_transport_session("stdio:default")
         self.assertFalse(result["success"])
         self.assertIn("Only HTTP and SSE", result["error"])
+
+
+class PoolAdministrationEventTests(unittest.TestCase):
+    def _make_pool(self):
+        pool = PoolManager(runtime_dir="/tmp/fake-pool")
+        pool.im = MagicMock(spec=InstanceManager)
+        pool.im.instances = []
+        pool.im.snapshot.side_effect = lambda: list(pool.im.instances)
+        pool.im.contains.side_effect = lambda inst: inst in pool.im.instances
+        pool.admin_event_sink = self.events.append
+        return pool
+
+    def setUp(self):
+        self.events = []
+
+    def test_acquire_and_release_context_emit_complete_relationships(self):
+        pool = self._make_pool()
+        process = MagicMock()
+        process.is_alive.return_value = True
+        process.pid = 4242
+        inst = InstanceInfo(
+            0,
+            process,
+            session_id="s1",
+            log_path="/tmp/fake-pool/0.log",
+        )
+        pool.im.find.return_value = inst
+        pool.im.forward_tool_call.return_value = {"success": True}
+        pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.i64", 0)
+
+        pool.acquire_session("http:agent-a", "s1", bind=True)
+
+        self.assertEqual(
+            [event.kind for event in self.events],
+            ["IdbActivityChanged", "ContextMappingChanged"],
+        )
+        idb = self.events[0].payload
+        self.assertEqual(idb["holder_context_ids"], ["http:agent-a"])
+        self.assertEqual(idb["refcount"], 1)
+        self.assertEqual(idb["pid"], 4242)
+        self.assertEqual(idb["log_path"], "/tmp/fake-pool/0.log")
+        context = self.events[1].payload
+        self.assertEqual(context["bound_session_id"], "s1")
+        self.assertEqual(context["held_session_ids"], ["s1"])
+
+        self.events.clear()
+        result = pool.release_context("http:agent-a")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(
+            [event.kind for event in self.events],
+            ["ContextMappingChanged", "IdbClosing", "IdbClosed"],
+        )
+        self.assertEqual(self.events[0].payload["held_session_ids"], [])
+        self.assertEqual(self.events[1].payload["refcount"], 0)
+        self.assertEqual(self.events[-1].payload["state"], "CLOSED")
+
+    def test_open_and_reuse_emit_idb_and_context_updates(self):
+        pool = self._make_pool()
+        process = MagicMock()
+        process.is_alive.return_value = True
+        inst = InstanceInfo(0, process)
+        pool.im.spawn.return_value = inst
+        pool.im.find.return_value = inst
+        pool.im.forward_tool_call.return_value = {
+            "success": True,
+            "session": {
+                "input_path": "/tmp/a.elf",
+                "idb_path": "/tmp/a.i64",
+            },
+        }
+
+        first = pool.open_session("/tmp/a.elf", context_id="http:agent-a")
+
+        self.assertTrue(first["success"])
+        self.assertEqual(
+            [event.kind for event in self.events],
+            ["IdbOpened", "ContextMappingChanged"],
+        )
+        session_id = first["session"]["session_id"]
+        self.assertEqual(self.events[0].entity_id, session_id)
+        self.assertEqual(self.events[0].payload["refcount"], 1)
+
+        self.events.clear()
+        reused = pool.open_session("/tmp/a.elf", context_id="http:agent-a")
+
+        self.assertTrue(reused["existing"])
+        self.assertEqual(
+            [event.kind for event in self.events],
+            ["IdbActivityChanged", "ContextMappingChanged"],
+        )
+
+    def test_force_close_emits_one_batch_of_cleared_contexts(self):
+        pool = self._make_pool()
+        process = MagicMock()
+        process.is_alive.return_value = True
+        inst = InstanceInfo(0, process, session_id="s1")
+        pool.im.find.return_value = inst
+        pool.im.forward_tool_call.return_value = {"success": True}
+        pool.sr.create("s1", "/tmp/a.elf", "/tmp/a.i64", 0)
+        for context_id in ("http:agent-a", "http:agent-b"):
+            pool.sr.acquire_context_session(context_id, "s1")
+            pool.sr.bind_context(context_id, "s1")
+
+        result = pool.close_session("s1")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(
+            [event.kind for event in self.events],
+            [
+                "IdbClosing",
+                "ContextMappingChanged",
+                "ContextMappingChanged",
+                "IdbClosed",
+            ],
+        )
+        context_events = self.events[1:3]
+        self.assertEqual(
+            {event.entity_id for event in context_events},
+            {"http:agent-a", "http:agent-b"},
+        )
+        self.assertTrue(
+            all(event.payload["held_session_ids"] == [] for event in context_events)
+        )
+
+    def test_external_registration_and_unregistration_emit_owner_state(self):
+        pool = PoolManager(runtime_dir="/tmp/fake-pool")
+        pool.admin_event_sink = self.events.append
+        bridge = MagicMock()
+        bridge.alive = True
+
+        result = pool.register_external(
+            bridge, "/tmp/gui.elf", "/tmp/gui.i64"
+        )
+        session_id = result["session"]["session_id"]
+
+        self.assertEqual(self.events[-1].kind, "ExternalIdbRegistered")
+        self.assertTrue(self.events[-1].payload["is_external"])
+        self.assertEqual(self.events[-1].payload["refcount"], 1)
+
+        pool.sr.acquire_context_session("http:agent-a", session_id)
+        pool.sr.bind_context("http:agent-a", session_id)
+        self.events.clear()
+        result = pool.unregister_external(session_id)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(
+            [event.kind for event in self.events],
+            ["ExternalIdbUnregistered", "ContextMappingChanged"],
+        )
+        self.assertEqual(self.events[0].payload["state"], "CLOSED")
+        self.assertEqual(self.events[1].payload["held_session_ids"], [])
 
 
 if __name__ == "__main__":
