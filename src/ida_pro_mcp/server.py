@@ -23,6 +23,8 @@ try:
 except ImportError:
     from installer import list_available_clients, print_mcp_config, run_install_command, set_ida_rpc
 
+from ida_pro_mcp.logging_config import LOG_LEVEL_NAMES, configure_runtime_logging
+
 IDA_HOST = "127.0.0.1"
 IDA_PORT = 13337
 logger = logging.getLogger("ida_mcp.proxy")
@@ -169,7 +171,15 @@ def main():
         default=os.environ.get("IDA_MCP_AUTH_TOKEN"),
         help="Bearer token for HTTP authentication (or set IDA_MCP_AUTH_TOKEN)",
     )
+    parser.add_argument(
+        "--log-level",
+        type=str.lower,
+        choices=LOG_LEVEL_NAMES,
+        default="info",
+        help="Runtime log level (default: info)",
+    )
     args = parser.parse_args()
+    configure_runtime_logging(args.log_level)
 
     # Handle --list-clients independently
     if args.list_clients:

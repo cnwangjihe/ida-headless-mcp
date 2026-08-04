@@ -46,7 +46,10 @@ class PoolServerLifecycleTests(unittest.TestCase):
         with patch.object(sys, "argv", ["idalib-pool"]):
             idalib_pool_server.main()
 
-        pool_cls.assert_called_once_with(runtime_dir=None, idalib_args=[])
+        pool_cls.assert_called_once_with(
+            runtime_dir=None,
+            idalib_args=["--log-level", "info"],
+        )
         mcp_cls.assert_called_once_with("ida-pro-mcp", resources_enabled=False)
         self.assertEqual(mcp.http_session_ttl_seconds, 3600)
         pool.discover_tools.assert_called_once_with()
@@ -117,7 +120,10 @@ class IdalibServerLifecycleTests(unittest.TestCase):
     def test_ipc_server_return_saves_and_closes_database(self):
         with (
             patch.object(idalib_server, "BackendIpcServer") as server_cls,
-            patch.object(idalib_server.idapro, "enable_console_messages"),
+            patch.object(
+                idalib_server.idapro,
+                "enable_console_messages",
+            ) as enable_console_messages,
             patch.object(idalib_server.idapro, "close_database") as close_database,
             patch.object(
                 idalib_server.ida_loader,
@@ -141,6 +147,7 @@ class IdalibServerLifecycleTests(unittest.TestCase):
             )
 
             server_cls.return_value.serve.assert_called_once()
+            enable_console_messages.assert_called_once_with(False)
             save_database.assert_called_once_with("/tmp/test.i64", 0)
             close_database.assert_called_once_with()
             self.assertIsNone(idalib_server._current_session_id)
@@ -159,7 +166,7 @@ class IdalibServerLifecycleTests(unittest.TestCase):
             idalib_server.run_ipc_backend(
                 rpc_connection,
                 control_connection,
-                idalib_args=["--verbose", "--safe"],
+                idalib_args=["--log-level", "debug", "--safe"],
             )
 
             enable_console_messages.assert_called_once_with(True)

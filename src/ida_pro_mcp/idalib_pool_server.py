@@ -59,6 +59,10 @@ from websockets.sync.connection import Connection as WebSocketConnection  # noqa
 from websockets.sync.server import ServerProtocol  # noqa: E402
 
 from ida_pro_mcp.idalib_pool_manager import PoolManager  # noqa: E402
+from ida_pro_mcp.logging_config import (  # noqa: E402
+    LOG_LEVEL_NAMES,
+    configure_runtime_logging,
+)
 from ida_pro_mcp.pool_websocket import ExternalInstanceBridge  # noqa: E402
 
 logger = logging.getLogger("ida_mcp.pool")
@@ -990,7 +994,11 @@ def main():
         description="MCP proxy server managing a pool of idalib instances"
     )
     parser.add_argument(
-        "--verbose", "-v", action="store_true", help="Show debug messages"
+        "--log-level",
+        type=str.lower,
+        choices=LOG_LEVEL_NAMES,
+        default="info",
+        help="Runtime log level (default: info)",
     )
     parser.add_argument(
         "--transport", type=str, default="stdio",
@@ -1028,16 +1036,13 @@ def main():
     if args.http_session_ttl < 0:
         parser.error("--http-session-ttl must be non-negative")
 
-    log_level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(level=log_level)
+    configure_runtime_logging(args.log_level)
 
     ida_dir = configure_ida_directory(args.ida_dir)
     if ida_dir:
         logger.debug("Using IDA installation: %s", ida_dir)
 
-    idalib_args: list[str] = []
-    if args.verbose:
-        idalib_args.append("--verbose")
+    idalib_args: list[str] = ["--log-level", args.log_level]
     if args.safe:
         idalib_args.append("--safe")
 

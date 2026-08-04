@@ -21,6 +21,10 @@ from ida_pro_mcp.ida_mcp.rpc import tool
 from ida_pro_mcp.ida_mcp.zeromcp.jsonrpc import cancel_all_pending_requests
 from ida_pro_mcp.ida_mcp.zeromcp.mcp import LATEST_MCP_PROTOCOL_VERSION
 from ida_pro_mcp.backend_ipc import BackendIpcServer
+from ida_pro_mcp.logging_config import (
+    configure_runtime_logging,
+    normalize_log_level,
+)
 
 logger = logging.getLogger("ida_mcp.backend")
 
@@ -165,17 +169,28 @@ def run_ipc_backend(
     idalib_args: list[str],
 ) -> None:
     """Run the single-IDB backend over inherited multiprocessing pipes."""
-    unknown_args = set(idalib_args) - {"--verbose", "-v", "--safe", "--unsafe"}
-    if unknown_args:
-        raise ValueError(f"Unsupported backend arguments: {sorted(unknown_args)}")
-    verbose = "--verbose" in idalib_args or "-v" in idalib_args
-    safe = "--safe" in idalib_args and "--unsafe" not in idalib_args
+    log_level = "info"
+    safe = False
+    index = 0
+    while index < len(idalib_args):
+        argument = idalib_args[index]
+        if argument == "--log-level":
+            index += 1
+            if index >= len(idalib_args):
+                raise ValueError("--log-level requires a value")
+            log_level = normalize_log_level(idalib_args[index])
+        elif argument.startswith("--log-level="):
+            log_level = normalize_log_level(argument.split("=", 1)[1])
+        elif argument == "--safe":
+            safe = True
+        elif argument == "--unsafe":
+            safe = False
+        else:
+            raise ValueError(f"Unsupported backend argument: {argument}")
+        index += 1
 
-    idapro.enable_console_messages(verbose)
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        force=True,
-    )
+    configure_runtime_logging(log_level)
+    idapro.enable_console_messages(log_level == "debug")
     if safe:
         MCP_SERVER.disabled_tools.update(MCP_UNSAFE)
 

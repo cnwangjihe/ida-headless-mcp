@@ -47,6 +47,26 @@ class BackendBootstrapTests(unittest.TestCase):
         control_connection.close.assert_called_once_with()
         log_file.flush.assert_called_once_with()
 
+    @patch.object(backend_bootstrap, "configure_runtime_logging")
+    @patch.object(backend_bootstrap.importlib, "import_module")
+    @patch.object(backend_bootstrap, "_redirect_output")
+    def test_configures_requested_log_level_before_backend_import(
+        self,
+        redirect_output,
+        import_module,
+        configure_logging,
+    ):
+        redirect_output.return_value = MagicMock()
+
+        backend_bootstrap.run_backend_process(
+            MagicMock(),
+            MagicMock(),
+            "/tmp/backend.log",
+            ["--log-level", "debug"],
+        )
+
+        configure_logging.assert_called_once_with("debug")
+
 
 if __name__ == "__main__":
     unittest.main()

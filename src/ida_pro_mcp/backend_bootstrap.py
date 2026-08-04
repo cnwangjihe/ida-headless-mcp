@@ -8,11 +8,18 @@ backend module so native and Python diagnostics cannot corrupt pool stdio.
 from __future__ import annotations
 
 import importlib
+import logging
 import os
 import sys
-import traceback
 
 from ida_pro_mcp.backend_ipc import make_message, send_message
+from ida_pro_mcp.logging_config import (
+    configure_runtime_logging,
+    log_level_from_args,
+)
+
+
+logger = logging.getLogger("ida_mcp.backend.bootstrap")
 
 
 def _redirect_output(log_path: str):
@@ -43,6 +50,7 @@ def run_backend_process(
 ) -> None:
     """Spawn entry point used by ``multiprocessing.Process``."""
     log_file = _redirect_output(log_path)
+    configure_runtime_logging(log_level_from_args(idalib_args))
     try:
         idalib_server = importlib.import_module("ida_pro_mcp.idalib_server")
 
@@ -59,7 +67,7 @@ def run_backend_process(
             )
         except Exception:
             pass
-        traceback.print_exc()
+        logger.exception("IDA backend process failed during startup or execution")
         raise
     finally:
         rpc_connection.close()
