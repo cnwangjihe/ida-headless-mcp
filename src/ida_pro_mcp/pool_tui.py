@@ -475,6 +475,21 @@ class PoolTuiApp(App[None]):
         if target in self._busy_targets:
             self._console_error(f"Target is already busy: {arguments[0]}")
             return
+        if target[0] == "database":
+            is_external = bool(
+                self.model.databases[target[1]].get("is_external")
+            )
+            if command == "close" and is_external:
+                self._console_error(
+                    "External GUI databases cannot be force-closed; "
+                    "use 'unregister'"
+                )
+                return
+            if command == "unregister" and not is_external:
+                self._console_error(
+                    "Local databases cannot be unregistered; use 'close'"
+                )
+                return
         if command == "save":
             self._start_admin_action(command, target)
             return

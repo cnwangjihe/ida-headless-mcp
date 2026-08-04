@@ -364,11 +364,11 @@ class PoolTuiAppTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PoolTuiCommandTests(unittest.IsolatedAsyncioTestCase):
-    def _database_event(self, *, external=False):
+    def _database_event(self, *, external=False, revision=1):
         return event(
             "pool",
             "ExternalIdbRegistered" if external else "IdbOpened",
-            1,
+            revision,
             "database-a",
             session_id="database-a",
             filename="sample.i64",
@@ -433,6 +433,38 @@ class PoolTuiCommandTests(unittest.IsolatedAsyncioTestCase):
                 )
             finally:
                 app._busy_targets.clear()
+
+    async def test_database_ownership_restricts_destructive_commands(self):
+        bus = AdminEventBus()
+        app = PoolTuiApp(
+            bus,
+            BufferedLogHandler(),
+            mcp_server=MagicMock(),
+            pool_manager=MagicMock(),
+        )
+
+        async with app.run_test(size=(120, 35)):
+            app.apply_admin_event(self._database_event(external=True))
+            app.push_screen = MagicMock()
+            with self.assertLogs("ida_mcp.tui", level="ERROR") as captured:
+                app.execute_command("close D01")
+            self.assertIn("cannot be force-closed", captured.output[0])
+            app.push_screen.assert_not_called()
+
+            app.apply_admin_event(
+                event(
+                    "pool",
+                    "ExternalIdbUnregistered",
+                    2,
+                    "database-a",
+                    state="CLOSED",
+                )
+            )
+            app.apply_admin_event(self._database_event(revision=3))
+            with self.assertLogs("ida_mcp.tui", level="ERROR") as captured:
+                app.execute_command("unregister D01")
+            self.assertIn("cannot be unregistered", captured.output[0])
+            app.push_screen.assert_not_called()
 
     async def test_disconnect_orphan_falls_back_to_context_release(self):
         bus = AdminEventBus()
