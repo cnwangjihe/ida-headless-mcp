@@ -1,6 +1,4 @@
-import io
 import unittest
-from contextlib import redirect_stderr
 
 from ida_pro_mcp import idalib_pool_server
 
@@ -53,16 +51,16 @@ class McpToolSafetyTests(unittest.TestCase):
         def unexpected_failure() -> dict:
             raise RuntimeError("private traceback marker")
 
-        stderr = io.StringIO()
-        with redirect_stderr(stderr):
+        with self.assertLogs("ida_mcp.rpc", level="ERROR") as captured:
             result = self.server._mcp_tools_call("unexpected_failure")
 
         text = result["content"][0]["text"]
         self.assertTrue(result["isError"])
         self.assertIn("Internal error (reference:", text)
         self.assertNotIn("private traceback marker", text)
-        self.assertIn("private traceback marker", stderr.getvalue())
-        self.assertIn("Traceback", stderr.getvalue())
+        logs = "\n".join(captured.output)
+        self.assertIn("private traceback marker", logs)
+        self.assertIn("Traceback", logs)
 
 
 if __name__ == "__main__":

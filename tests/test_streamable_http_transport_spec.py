@@ -19,7 +19,6 @@ McpServer = mcp_mod.McpServer
 
 class StreamableHttpTransportSpecTests(unittest.TestCase):
     def setUp(self):
-        jsonrpc_mod._LOG_REQUESTS = False
         self.server = McpServer("ida-pro-mcp")
         self.server.require_streamable_http_session = True
         self.server.serve("127.0.0.1", 0, background=True)

@@ -1,15 +1,15 @@
 import json
 import inspect
-import os
+import logging
 import secrets
-import sys
 import threading
 import time
-import traceback
 from typing import Any, Callable, get_type_hints, get_origin, get_args, Union, TypedDict, TypeAlias, NotRequired, is_typeddict
 from types import UnionType
 
 JsonRpcId: TypeAlias = str | int | float | None
+
+logger = logging.getLogger("ida_mcp.rpc")
 
 # Thread-local storage for current request context (ID + cancel event)
 _current_request = threading.local()
@@ -68,29 +68,7 @@ def cancel_all_pending_requests() -> int:
         return len(events)
 
 
-def _parse_bool_env(name: str, default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    value = value.strip().lower()
-    if value in ("1", "true", "yes", "on"):
-        return True
-    if value in ("0", "false", "no", "off"):
-        return False
-    return default
-
-
-_LOG_REQUESTS = _parse_bool_env("IDA_MCP_LOG_REQUESTS", True)
-_LOG_SKIP_METHODS = {
-    m.strip()
-    for m in os.getenv("IDA_MCP_LOG_SKIP_METHODS", "tools/call").split(",")
-    if m.strip()
-}
 JsonRpcParams: TypeAlias = dict[str, Any] | list[Any] | None
-
-
-def _log(message: str) -> None:
-    print(message, file=sys.stderr)
 
 class JsonRpcRequest(TypedDict):
     jsonrpc: str
@@ -151,12 +129,12 @@ class JsonRpcRegistry:
         is_notification = "id" not in request
         params: JsonRpcParams = request.get("params")
 
-        log_method = _LOG_REQUESTS and method not in _LOG_SKIP_METHODS
+        log_method = logger.isEnabledFor(logging.DEBUG)
         if log_method:
             params_str = json.dumps(params, default=str)
             if len(params_str) > 200:
                 params_str = params_str[:200] + "..."
-            _log(f"[MCP] >> {method}({params_str})")
+            logger.debug(">> %s(%s)", method, params_str)
 
         # Set current request ID in thread-local for cancellation tracking
         _current_request.id = request_id
@@ -168,7 +146,7 @@ class JsonRpcRegistry:
                 result_str = json.dumps(result, default=str)
                 if len(result_str) > 200:
                     result_str = result_str[:200] + "..."
-                _log(f"[MCP] << {method} ({elapsed_ms:.1f}ms) {result_str}")
+                logger.debug("<< %s (%.1fms) %s", method, elapsed_ms, result_str)
             if is_notification:
                 return None
             return {
@@ -179,7 +157,9 @@ class JsonRpcRegistry:
         except JsonRpcException as e:
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             if log_method:
-                _log(f"[MCP] << {method} ({elapsed_ms:.1f}ms) ERROR: {e.message}")
+                logger.debug(
+                    "<< %s (%.1fms) ERROR: %s", method, elapsed_ms, e.message
+                )
             if is_notification:
                 return None
             return self._error(request_id, e.code, e.message, e.data)
@@ -187,14 +167,14 @@ class JsonRpcRegistry:
             # LSP error code -32800: Request cancelled
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             if log_method:
-                _log(f"[MCP] << {method} ({elapsed_ms:.1f}ms) CANCELLED")
+                logger.debug("<< %s (%.1fms) CANCELLED", method, elapsed_ms)
             if is_notification:
                 return None
             return self._error(request_id, -32800, str(e) or "Request cancelled")
         except Exception as e:
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             if log_method:
-                _log(f"[MCP] << {method} ({elapsed_ms:.1f}ms) EXCEPTION: {e}")
+                logger.debug("<< %s (%.1fms) EXCEPTION: %s", method, elapsed_ms, e)
             if is_notification:
                 return None
             error = self.map_exception(e)
@@ -204,11 +184,12 @@ class JsonRpcRegistry:
 
     def map_exception(self, e: Exception) -> JsonRpcError:
         reference = secrets.token_hex(6)
-        _log(
-            f"[MCP] Internal error [{reference}]: "
-            f"{type(e).__name__}: {e}"
+        logger.exception(
+            "Internal error [%s]: %s: %s",
+            reference,
+            type(e).__name__,
+            e,
         )
-        traceback.print_exception(type(e), e, e.__traceback__, file=sys.stderr)
         return {
             "code": -32603,
             "message": f"Internal error (reference: {reference})",

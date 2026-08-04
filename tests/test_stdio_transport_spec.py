@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -12,14 +13,7 @@ McpServer = mcp_mod.McpServer
 
 
 class StdioTransportSpecTests(unittest.TestCase):
-    def setUp(self):
-        self._log_requests = jsonrpc_mod._LOG_REQUESTS
-        jsonrpc_mod._LOG_REQUESTS = True
-
-    def tearDown(self):
-        jsonrpc_mod._LOG_REQUESTS = self._log_requests
-
-    def _run_stdio(self, messages):
+    def _run_stdio(self, messages, *, log_level=logging.DEBUG):
         stdin = io.BytesIO(
             b"".join(
                 json.dumps(message).encode("utf-8") + b"\n"
@@ -31,17 +25,22 @@ class StdioTransportSpecTests(unittest.TestCase):
         process_stderr = io.StringIO()
 
         server = McpServer("ida-pro-mcp")
-        with redirect_stdout(process_stdout), redirect_stderr(process_stderr):
+        with (
+            self.assertLogs("ida_mcp", level=log_level) as captured,
+            redirect_stdout(process_stdout),
+            redirect_stderr(process_stderr),
+        ):
             server.stdio(stdin=stdin, stdout=transport_stdout)
 
         return (
             transport_stdout.getvalue(),
             process_stdout.getvalue(),
             process_stderr.getvalue(),
+            "\n".join(captured.output),
         )
 
     def test_stdio_stdout_contains_only_jsonrpc_messages(self):
-        transport_stdout, process_stdout, process_stderr = self._run_stdio([
+        transport_stdout, process_stdout, process_stderr, logs = self._run_stdio([
             {
                 "jsonrpc": "2.0",
                 "method": "initialize",
@@ -55,7 +54,9 @@ class StdioTransportSpecTests(unittest.TestCase):
         ])
 
         self.assertEqual(process_stdout, "")
-        self.assertIn("[MCP] >> initialize", process_stderr)
+        self.assertEqual(process_stderr, "")
+        self.assertIn(">> initialize", logs)
+        self.assertIn("<< initialize", logs)
 
         lines = transport_stdout.decode("utf-8").splitlines()
         self.assertEqual(len(lines), 1)
@@ -63,6 +64,18 @@ class StdioTransportSpecTests(unittest.TestCase):
         self.assertEqual(response["jsonrpc"], "2.0")
         self.assertEqual(response["id"], 1)
         self.assertEqual(response["result"]["protocolVersion"], "2025-11-25")
+
+    def test_info_logging_hides_request_and_response_payloads(self):
+        _transport, _stdout, stderr, logs = self._run_stdio(
+            [{"jsonrpc": "2.0", "method": "ping", "id": 1}],
+            log_level=logging.INFO,
+        )
+
+        self.assertEqual(stderr, "")
+        self.assertIn("MCP transport session opened", logs)
+        self.assertIn("MCP transport session closed", logs)
+        self.assertNotIn(">> ping", logs)
+        self.assertNotIn("<< ping", logs)
 
     def test_stdio_eof_reports_transport_session_closed(self):
         server = McpServer("ida-pro-mcp")
@@ -96,10 +109,10 @@ class StdioTransportSpecTests(unittest.TestCase):
 
         self.assertEqual(closed, [("http:test", "client_terminated")])
 
-    def test_stdio_cancel_notification_logs_to_stderr(self):
+    def test_stdio_cancel_notification_logs_at_debug(self):
         jsonrpc_mod.register_pending_request("req-1", "stdio:default")
         try:
-            transport_stdout, process_stdout, process_stderr = self._run_stdio([
+            transport_stdout, process_stdout, process_stderr, logs = self._run_stdio([
                 {
                     "jsonrpc": "2.0",
                     "method": "notifications/cancelled",
@@ -114,7 +127,8 @@ class StdioTransportSpecTests(unittest.TestCase):
 
         self.assertEqual(transport_stdout, b"")
         self.assertEqual(process_stdout, "")
-        self.assertIn("Cancelled request req-1", process_stderr)
+        self.assertEqual(process_stderr, "")
+        self.assertIn("Cancelled request req-1", logs)
 
     def test_pending_request_ids_are_isolated_by_transport_context(self):
         first = jsonrpc_mod.register_pending_request(1, "http:first")

@@ -9,8 +9,8 @@ import uuid
 import json
 import zlib
 import inspect
+import logging
 import threading
-import traceback
 from collections import OrderedDict
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer, HTTPServer
@@ -20,6 +20,8 @@ from urllib.parse import urlparse, parse_qs
 from io import BufferedIOBase
 
 from .jsonrpc import JsonRpcRegistry, JsonRpcError, JsonRpcException, get_current_request_id, register_pending_request, unregister_pending_request, cancel_request
+
+logger = logging.getLogger("ida_mcp.transport")
 
 LATEST_MCP_PROTOCOL_VERSION = "2025-11-25"
 DEFAULT_HTTP_PROTOCOL_VERSION = "2025-03-26"
@@ -37,10 +39,6 @@ TransportSessionCloseReason = Literal[
     "server_stopped",
     "eof",
 ]
-
-
-def _log(message: str) -> None:
-    print(message, file=sys.stderr)
 
 
 class McpToolError(Exception):
@@ -751,6 +749,7 @@ class McpServer:
         self._transport_sessions_lock = threading.Lock()
         self._transport_active_requests: dict[str, int] = {}
         self._transport_closing: dict[str, TransportSessionCloseReason] = {}
+        self._open_transport_sessions: set[str] = set()
         self._terminated_transport_sessions: OrderedDict[str, None] = OrderedDict()
         self.transport_session_closed: (
             Callable[[str, TransportSessionCloseReason], None] | None
@@ -792,7 +791,7 @@ class McpServer:
 
     def serve(self, host: str = "", port: int = 0, *, unix_socket: str | None = None, background = True, request_handler = McpHttpRequestHandler):
         if self._running:
-            _log("[MCP] Server is already running")
+            logger.warning("MCP server is already running")
             return
 
         # Create server with deferred binding
@@ -838,18 +837,22 @@ class McpServer:
         self._start_http_session_reaper()
 
         if unix_socket:
-            _log(f"[MCP] Server started on unix:{unix_socket}")
+            logger.info("MCP server started on unix:%s", unix_socket)
         else:
-            _log("[MCP] Server started:")
-            _log(f"  Streamable HTTP: http://{host}:{port}/mcp")
-            _log(f"  SSE: http://{host}:{port}/sse")
+            logger.info(
+                "MCP server started: streamable_http=http://%s:%s/mcp "
+                "sse=http://%s:%s/sse",
+                host,
+                port,
+                host,
+                port,
+            )
 
         def serve_forever():
             try:
                 self._http_server.serve_forever() # type: ignore
-            except Exception as e:
-                _log(f"[MCP] Server error: {e}")
-                traceback.print_exc()
+            except Exception:
+                logger.exception("MCP server failed")
             finally:
                 self._running = False
 
@@ -896,7 +899,7 @@ class McpServer:
             self._server_thread.join()
             self._server_thread = None
 
-        _log("[MCP] Server stopped")
+        logger.info("MCP server stopped")
 
     def stdio(self, stdin: BinaryIO | None = None, stdout: BinaryIO | None = None):
         stdin = stdin or sys.stdin.buffer
@@ -965,10 +968,12 @@ class McpServer:
     def open_transport_session(self, context_id: str) -> None:
         """Mark a transport context as live, allowing deliberate ID reuse."""
         with self._transport_sessions_lock:
-            if self._transport_active_requests.get(context_id, 0) > 0:
+            if context_id in self._open_transport_sessions:
                 return
             self._transport_closing.pop(context_id, None)
             self._terminated_transport_sessions.pop(context_id, None)
+            self._open_transport_sessions.add(context_id)
+        logger.info("MCP transport session opened: context=%s", context_id)
 
     def begin_transport_request(self, context_id: str) -> bool:
         """Track an in-flight request unless the logical session is closing."""
@@ -1021,6 +1026,7 @@ class McpServer:
 
     def _mark_transport_session_terminated_locked(self, context_id: str) -> None:
         """Keep a bounded tombstone cache to suppress duplicate close events."""
+        self._open_transport_sessions.discard(context_id)
         self._terminated_transport_sessions[context_id] = None
         self._terminated_transport_sessions.move_to_end(context_id)
         max_tombstones = max(1024, self.http_session_max_entries * 2)
@@ -1032,14 +1038,22 @@ class McpServer:
         context_id: str,
         reason: TransportSessionCloseReason,
     ) -> None:
+        logger.info(
+            "MCP transport session closed: context=%s reason=%s",
+            context_id,
+            reason,
+        )
         callback = self.transport_session_closed
         if callback is None:
             return
         try:
             callback(context_id, reason)
-        except Exception as e:
-            _log(f"[MCP] Transport session close callback failed: {e}")
-            traceback.print_exc()
+        except Exception:
+            logger.exception(
+                "Transport session close callback failed: context=%s reason=%s",
+                context_id,
+                reason,
+            )
 
     def register_http_session(
         self,
@@ -1297,7 +1311,9 @@ class McpServer:
     def _mcp_notifications_cancelled(self, requestId: int | str, reason: str | None = None) -> None:
         """MCP notifications/cancelled - cancel an in-flight request"""
         if cancel_request(requestId, self.get_current_transport_session_id()):
-            _log(f"[MCP] Cancelled request {requestId}: {reason or 'no reason'}")
+            logger.debug(
+                "Cancelled request %s: %s", requestId, reason or "no reason"
+            )
         # Notifications don't return a response
 
     def _mcp_resources_list(self, _meta: dict | None = None) -> dict:
