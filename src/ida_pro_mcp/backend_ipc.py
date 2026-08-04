@@ -15,7 +15,7 @@ from collections.abc import Callable
 from multiprocessing.connection import wait
 from typing import Any, Protocol
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ida_mcp.backend.ipc")
 
 IPC_PROTOCOL_VERSION = 1
 
@@ -194,7 +194,7 @@ class BackendIpcServer:
     def _cancel_pending(self) -> None:
         try:
             cancelled = self.cancel_pending()
-            logger.info("Cancelled %d pending backend request(s)", cancelled)
+            logger.debug("Cancelled %d pending backend request(s)", cancelled)
         except Exception:
             logger.exception("Failed to cancel pending backend requests")
 

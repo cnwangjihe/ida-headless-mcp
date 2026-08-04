@@ -61,7 +61,7 @@ from websockets.sync.server import ServerProtocol  # noqa: E402
 from ida_pro_mcp.idalib_pool_manager import PoolManager  # noqa: E402
 from ida_pro_mcp.pool_websocket import ExternalInstanceBridge  # noqa: E402
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ida_mcp.pool")
 
 POOL_WEBSOCKET_MAX_SIZE = 64 * 1024 * 1024
 POOL_OUTPUT_CACHE_MAX_SIZE = 100
@@ -1033,7 +1033,7 @@ def main():
 
     ida_dir = configure_ida_directory(args.ida_dir)
     if ida_dir:
-        logger.info("Using IDA installation: %s", ida_dir)
+        logger.debug("Using IDA installation: %s", ida_dir)
 
     idalib_args: list[str] = []
     if args.verbose:
@@ -1070,7 +1070,7 @@ def main():
         try:
             initial_tools = pool.discover_tools()
         except Exception as e:
-            print(f"Error: IDA backend startup check failed: {e}", file=sys.stderr)
+            logger.error("IDA backend startup check failed: %s", e)
             raise SystemExit(1) from None
         logger.info("IDA backend ready; discovered %d tools", len(initial_tools))
 
@@ -1088,7 +1088,7 @@ def main():
             from urllib.parse import urlparse
             url = urlparse(transport)
             if not url.hostname or not url.port:
-                print(f"Error: invalid transport URL: {transport}", file=sys.stderr)
+                logger.error("Invalid transport URL: %s", transport)
                 sys.exit(1)
             handler_cls = build_pool_handler_class(pool, output_cache)
             mcp.serve(host=url.hostname, port=url.port, background=False,

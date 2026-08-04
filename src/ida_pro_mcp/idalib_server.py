@@ -22,7 +22,7 @@ from ida_pro_mcp.ida_mcp.zeromcp.jsonrpc import cancel_all_pending_requests
 from ida_pro_mcp.ida_mcp.zeromcp.mcp import LATEST_MCP_PROTOCOL_VERSION
 from ida_pro_mcp.backend_ipc import BackendIpcServer
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ida_mcp.backend")
 
 _current_session_id: str | None = None
 _current_input_path: str = ""

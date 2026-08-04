@@ -25,7 +25,7 @@ except ImportError:
 
 IDA_HOST = "127.0.0.1"
 IDA_PORT = 13337
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ida_mcp.proxy")
 
 mcp = McpServer("ida-pro-mcp")
 dispatch_original = mcp.registry.dispatch

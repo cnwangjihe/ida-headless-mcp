@@ -1493,9 +1493,7 @@ class TestPoolServerDispatch(unittest.TestCase):
             "id": 1,
         }
 
-        with self.assertLogs(
-            "ida_pro_mcp.idalib_pool_server", level="ERROR"
-        ) as logs:
+        with self.assertLogs("ida_mcp.pool", level="ERROR") as logs:
             resp = self._dispatch(mcp, req, transport_session_id="sse:a")
 
         text = resp["result"]["content"][0]["text"]
@@ -1830,7 +1828,7 @@ class TestPoolManager(unittest.TestCase):
         pool.im.instances = [inst]
         pool.im.forward_tool_call.return_value = {"ok": False, "error": "disk full"}
 
-        with self.assertLogs("ida_pro_mcp.idalib_pool_manager", level="WARNING") as logs:
+        with self.assertLogs("ida_mcp.pool.session", level="WARNING") as logs:
             pool.shutdown_all()
 
         self.assertEqual(pool.im.forward_tool_call.call_args_list, [
@@ -1848,7 +1846,7 @@ class TestPoolManager(unittest.TestCase):
         pool.im.instances = [inst]
         pool.im.forward_tool_call.side_effect = BrokenPipeError("socket closed")
 
-        with self.assertLogs("ida_pro_mcp.idalib_pool_manager", level="WARNING") as logs:
+        with self.assertLogs("ida_mcp.pool.session", level="WARNING") as logs:
             pool.shutdown_all()
 
         self.assertIn("socket closed", "\n".join(logs.output))
@@ -1863,16 +1861,20 @@ class TestPoolManager(unittest.TestCase):
         pool.im.spawn.return_value = mock_inst
         pool.im.forward_tool_call.return_value = {"success": True}
 
-        r1 = pool.open_session("/tmp/a.elf")
+        with self.assertLogs("ida_mcp.pool.session", level="INFO") as logs:
+            r1 = pool.open_session("/tmp/a.elf")
+            r2 = pool.open_session("/tmp/a.elf")
+
         self.assertTrue(r1["success"])
         self.assertFalse(r1["existing"])
         sid = r1["session"]["session_id"]
         self.assertRegex(sid, r"^a\.elf_[0-9a-f]{6}$")
-
-        r2 = pool.open_session("/tmp/a.elf")
         self.assertTrue(r2["success"])
         self.assertTrue(r2["existing"])
         self.assertEqual(r2["session"]["session_id"], sid)
+        output = "\n".join(logs.output)
+        self.assertIn("IDA session opened", output)
+        self.assertIn("IDA session reused", output)
         pool.im.spawn.assert_called_once_with()
 
     def test_open_session_generates_new_id_for_different_path(self):
@@ -2310,13 +2312,15 @@ class TestExternalRegistration(unittest.TestCase):
         bridge = MagicMock()
         bridge.alive = True
 
-        result = pool.register_external(
-            bridge, "/tmp/a.elf", "/tmp/a.elf.i64",
-        )
+        with self.assertLogs("ida_mcp.pool.session", level="INFO") as logs:
+            result = pool.register_external(
+                bridge, "/tmp/a.elf", "/tmp/a.elf.i64",
+            )
         self.assertTrue(result["success"])
         self.assertRegex(result["session"]["session_id"], r"^a\.elf_[0-9a-f]{6}$")
         self.assertTrue(result["session"]["is_external"])
         self.assertEqual(result["session"]["refcount"], 1)
+        self.assertIn("External IDA session registered", "\n".join(logs.output))
 
     def test_register_external_idb_conflict_rejected(self):
         pool = self._make_pool()

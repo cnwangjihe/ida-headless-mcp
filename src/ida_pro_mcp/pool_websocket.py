@@ -17,7 +17,7 @@ import queue
 import threading
 import time
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ida_mcp.pool.websocket")
 
 
 class ExternalInstanceBridge:
@@ -233,6 +233,6 @@ class ExternalInstanceBridge:
                     self.alive = False
 
         except Exception as e:
-            logger.info("External instance bridge loop ended: %s", e)
+            logger.debug("External instance bridge loop ended: %s", e)
         finally:
             self.alive = False

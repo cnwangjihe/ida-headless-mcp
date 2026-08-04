@@ -45,7 +45,7 @@ from ida_pro_mcp.backend_ipc import (
     wait_for_message,
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ida_mcp.pool.session")
 
 
 _WINDOWS_ABS_RE = re.compile(r"^[A-Za-z]:[\\/]")
@@ -176,7 +176,7 @@ class InstanceManager:
             args=(child_rpc, child_control, log_path, list(self.idalib_args)),
             name=f"idalib-backend-{idx}",
         )
-        logger.info("Spawning instance %d (log: %s)", idx, log_path)
+        logger.info("IDA backend instance spawning: instance=%d log=%s", idx, log_path)
         try:
             proc.start()
         except Exception:
@@ -217,16 +217,25 @@ class InstanceManager:
         )
         with self._lock:
             self.instances.append(inst)
-        logger.info("Registered external instance %d", idx)
+        logger.info("External IDA instance registered: instance=%d", idx)
         return inst
 
     def kill(self, inst: InstanceInfo) -> None:
         if inst.is_external:
-            logger.info("Removing external instance %d", inst.index)
+            logger.info(
+                "External IDA instance stopping: instance=%d session=%s",
+                inst.index,
+                inst.session_id,
+            )
             if inst.ws_bridge:
                 inst.ws_bridge.alive = False
         else:
-            logger.info("Killing instance %d (pid %d)", inst.index, inst.process.pid)
+            logger.info(
+                "IDA backend instance stopping: instance=%d pid=%d session=%s",
+                inst.index,
+                inst.process.pid,
+                inst.session_id,
+            )
             try:
                 self.send_control(inst, "shutdown")
                 inst.process.join(timeout=10)
@@ -325,7 +334,11 @@ class InstanceManager:
                 f"Instance {inst.index} sent unexpected startup message: "
                 f"{message['type']}"
             )
-        logger.info("Instance %d ready (pid %d)", inst.index, inst.process.pid)
+        logger.info(
+            "IDA backend instance ready: instance=%d pid=%d",
+            inst.index,
+            inst.process.pid,
+        )
 
     # --- IPC forwarding ---
 
@@ -783,6 +796,14 @@ class PoolManager:
                         if context_id:
                             self.sr.acquire_context_session(context_id, existing_sid)
                             self.sr.bind_context(context_id, existing_sid)
+                        logger.info(
+                            "IDA session reused: session=%s context=%s input=%s "
+                            "refcount=%d",
+                            existing_sid,
+                            context_id,
+                            sess.input_path,
+                            self.sr.get_refcount(existing_sid),
+                        )
                         return {
                             "success": True,
                             "existing": True,
@@ -808,6 +829,14 @@ class PoolManager:
                         if context_id:
                             self.sr.acquire_context_session(context_id, existing_sid)
                             self.sr.bind_context(context_id, existing_sid)
+                        logger.info(
+                            "IDA session reused: session=%s context=%s input=%s "
+                            "refcount=%d",
+                            existing_sid,
+                            context_id,
+                            sess.input_path,
+                            self.sr.get_refcount(existing_sid),
+                        )
                         return {
                             "success": True,
                             "existing": True,
@@ -914,6 +943,16 @@ class PoolManager:
                     ),
                 }
 
+            logger.info(
+                "IDA session opened: session=%s context=%s input=%s idb=%s "
+                "instance=%d refcount=%d",
+                session_id,
+                context_id,
+                sess.input_path,
+                sess.idb_path,
+                sess.instance_index,
+                self.sr.get_refcount(session_id),
+            )
             return {
                 "success": True,
                 "existing": False,
@@ -999,6 +1038,13 @@ class PoolManager:
 
         self.im.kill(inst)
 
+        logger.info(
+            "IDA session closed: session=%s input=%s instance=%d",
+            session_id,
+            sess.input_path,
+            inst.index,
+        )
+
         return {"success": True, "closed": True, "message": f"Session closed: {session_id}"}
 
     def acquire_session(
@@ -1012,10 +1058,18 @@ class PoolManager:
         with self._operation():
             with self._lock:
                 sess, inst = self._resolve_session_instance_locked(session_id)
-                self.sr.acquire_context_session(context_id, session_id)
+                acquired = self.sr.acquire_context_session(context_id, session_id)
                 if bind:
                     self.sr.bind_context(context_id, session_id)
                 self.sr.touch(session_id)
+                logger.debug(
+                    "IDA session lease %s: session=%s context=%s refcount=%d bind=%s",
+                    "acquired" if acquired else "reused",
+                    session_id,
+                    context_id,
+                    self.sr.get_refcount(session_id),
+                    bind,
+                )
                 return sess, inst
 
     def release_session(self, context_id: str, session_id: str) -> dict:
@@ -1044,6 +1098,14 @@ class PoolManager:
                         self.sr.unbind_context(context_id)
                     new_rc = self.sr.get_refcount(session_id)
                     if sess.is_external or new_rc > 0:
+                        logger.info(
+                            "IDA session lease released: session=%s context=%s "
+                            "refcount=%d external=%s",
+                            session_id,
+                            context_id,
+                            new_rc,
+                            sess.is_external,
+                        )
                         return {
                             "success": True,
                             "closed": False,
@@ -1059,6 +1121,12 @@ class PoolManager:
                     if inst is None:
                         self.sr.remove(session_id)
                         self._condition.notify_all()
+                        logger.info(
+                            "IDA session cleaned up without instance: "
+                            "session=%s context=%s",
+                            session_id,
+                            context_id,
+                        )
                         return {
                             "success": True,
                             "closed": True,
@@ -1200,6 +1268,15 @@ class PoolManager:
             )
             inst.session_id = session_id
 
+        logger.info(
+            "External IDA session registered: session=%s input=%s idb=%s "
+            "instance=%d",
+            session_id,
+            sess.input_path,
+            sess.idb_path,
+            sess.instance_index,
+        )
+
         return {
             "success": True,
             "session": sess.to_dict(refcount=self.sr.get_refcount(session_id)),
@@ -1227,6 +1304,11 @@ class PoolManager:
         if inst:
             with inst.operation_lock:
                 self.im.kill(inst)
+        logger.info(
+            "External IDA session unregistered: session=%s active_agents=%d",
+            session_id,
+            agents,
+        )
         return {"success": True, "active_agents": agents}
 
     def get_external_agent_count(self, session_id: str) -> int:
