@@ -261,11 +261,22 @@ class PoolAdministrationEventTests(unittest.TestCase):
         self.assertTrue(first["success"])
         self.assertEqual(
             [event.kind for event in self.events],
-            ["IdbOpened", "ContextMappingChanged"],
+            [
+                "IdbOpenStarted",
+                "IdbOpened",
+                "ContextMappingChanged",
+                "IdbOpenFinished",
+            ],
         )
         session_id = first["session"]["session_id"]
-        self.assertEqual(self.events[0].entity_id, session_id)
-        self.assertEqual(self.events[0].payload["refcount"], 1)
+        operation_id = self.events[0].entity_id
+        self.assertEqual(self.events[0].payload["context_id"], "http:agent-a")
+        self.assertEqual(self.events[0].payload["input_path"], "/tmp/a.elf")
+        self.assertEqual(self.events[1].entity_id, session_id)
+        self.assertEqual(self.events[1].payload["refcount"], 1)
+        self.assertEqual(self.events[-1].entity_id, operation_id)
+        self.assertTrue(self.events[-1].payload["success"])
+        self.assertEqual(self.events[-1].payload["session_id"], session_id)
 
         self.events.clear()
         reused = pool.open_session("/tmp/a.elf", context_id="http:agent-a")
@@ -273,8 +284,36 @@ class PoolAdministrationEventTests(unittest.TestCase):
         self.assertTrue(reused["existing"])
         self.assertEqual(
             [event.kind for event in self.events],
-            ["IdbActivityChanged", "ContextMappingChanged"],
+            [
+                "IdbOpenStarted",
+                "IdbActivityChanged",
+                "ContextMappingChanged",
+                "IdbOpenFinished",
+            ],
         )
+
+    def test_failed_open_finishes_the_opening_lifecycle(self):
+        pool = self._make_pool()
+        process = MagicMock()
+        process.is_alive.return_value = True
+        inst = InstanceInfo(0, process)
+        pool.im.spawn.return_value = inst
+        pool.im.find.return_value = inst
+        pool.im.forward_tool_call.return_value = {"error": "invalid IDB"}
+
+        result = pool.open_session(
+            "/tmp/broken.i64",
+            context_id="http:agent-a",
+        )
+
+        self.assertFalse(result.get("success", False))
+        self.assertEqual(
+            [event.kind for event in self.events],
+            ["IdbOpenStarted", "IdbOpenFinished"],
+        )
+        self.assertEqual(self.events[0].entity_id, self.events[1].entity_id)
+        self.assertFalse(self.events[1].payload["success"])
+        self.assertEqual(self.events[1].payload["error"], "invalid IDB")
 
     def test_force_close_emits_one_batch_of_cleared_contexts(self):
         pool = self._make_pool()

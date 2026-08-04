@@ -721,6 +721,42 @@ class PoolManager:
             },
         )
 
+    def _opening_event_locked(
+        self,
+        kind: str,
+        operation_id: str,
+        input_path: str,
+        context_id: str | None,
+        started_at: float,
+        *,
+        run_auto_analysis: bool,
+        allow_duplicate_input: bool,
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> AdminEvent:
+        payload: dict[str, Any] = {
+            "operation_id": operation_id,
+            "context_id": context_id,
+            "input_path": input_path,
+            "filename": _path_basename(input_path),
+            "state": "OPENING" if kind == "IdbOpenStarted" else "FINISHED",
+            "started_at": started_at,
+            "run_auto_analysis": run_auto_analysis,
+            "allow_duplicate_input": allow_duplicate_input,
+        }
+        if kind == "IdbOpenFinished":
+            success = bool(result and result.get("success"))
+            session = result.get("session", {}) if result else {}
+            payload.update(
+                {
+                    "success": success,
+                    "session_id": session.get("session_id"),
+                    "error": error or (result or {}).get("error"),
+                    "finished_at": time.monotonic(),
+                }
+            )
+        return self._make_admin_event_locked(kind, operation_id, payload)
+
     def _emit_admin_events(self, events: list[AdminEvent]) -> None:
         sink = self.admin_event_sink
         if sink is None:
@@ -879,12 +915,48 @@ class PoolManager:
     ) -> dict:
         try:
             with self._operation():
-                return self._open_session(
-                    binary_path,
-                    run_auto_analysis=run_auto_analysis,
-                    allow_duplicate_input=allow_duplicate_input,
-                    context_id=context_id,
-                )
+                input_path = _normalize_path(binary_path)
+                operation_id = f"open:{secrets.token_hex(8)}"
+                started_at = time.monotonic()
+                with self._lock:
+                    started_event = self._opening_event_locked(
+                        "IdbOpenStarted",
+                        operation_id,
+                        input_path,
+                        context_id,
+                        started_at,
+                        run_auto_analysis=run_auto_analysis,
+                        allow_duplicate_input=allow_duplicate_input,
+                    )
+                self._emit_admin_events([started_event])
+
+                result: dict[str, Any] | None = None
+                error: str | None = None
+                try:
+                    result = self._open_session(
+                        input_path,
+                        run_auto_analysis=run_auto_analysis,
+                        allow_duplicate_input=allow_duplicate_input,
+                        context_id=context_id,
+                    )
+                    return result
+                except BaseException as exception:
+                    error = str(exception)
+                    raise
+                finally:
+                    with self._lock:
+                        finished_event = self._opening_event_locked(
+                            "IdbOpenFinished",
+                            operation_id,
+                            input_path,
+                            context_id,
+                            started_at,
+                            run_auto_analysis=run_auto_analysis,
+                            allow_duplicate_input=allow_duplicate_input,
+                            result=result,
+                            error=error,
+                        )
+                    self._emit_admin_events([finished_event])
         except PoolShuttingDownError as e:
             return {"success": False, "error": str(e)}
 
