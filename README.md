@@ -140,6 +140,9 @@ uv run idalib-pool --safe
 
 # Use a specific directory for backend logs
 uv run idalib-pool --runtime-dir ./ida-mcp-runtime
+
+# Include MCP requests/responses and internal routing details
+uv run idalib-pool --log-level debug
 ```
 
 `--ida-dir` has priority over `IDADIR`. If the option is omitted, the existing
@@ -153,6 +156,17 @@ loaded or initialized. The temporary validation backend is then closed; it is
 not retained as an idle or prewarmed instance.
 
 `IDA_MCP_AUTH_TOKEN` is equivalent to `--auth-token`.
+
+### Runtime logging
+
+`idalib-pool` and the runtime `ida-pro-mcp` proxy accept
+`--log-level {debug,info,warning,error,critical}`. The default is `info`, which
+shows MCP transport/session, IDA session/backend, and GUI connection lifecycle
+events without logging individual MCP requests or responses. Use
+`--log-level debug` to include request/response previews, timings, lease
+changes, IPC forwarding, and other diagnostic details. Runtime logs are sent
+to stderr so stdio JSON-RPC output remains protocol-only. The former
+`-v`/`--verbose` pool option has been replaced by `--log-level debug`.
 
 The Streamable HTTP logical-session registry has a separate, fixed default
 capacity of 1024 entries. It removes the least-recently-used inactive MCP
@@ -302,6 +316,11 @@ With Streamable HTTP/SSE client installation, the client connects directly to
 the plugin server. With stdio installation, the client launches
 `ida-pro-mcp`, which proxies requests to that local server. Local-server mode
 and pool-connection mode are mutually exclusive.
+
+The Plugin starts at INFO logging on every IDA launch. Enable
+**MCP > Verbose Logging** to show DEBUG logs for the Plugin, transport,
+JSON-RPC, and IDA integration components; uncheck it to return to INFO. This
+debug setting is intentionally not persisted across IDA restarts.
 
 ### Register a GUI IDB in the pool
 

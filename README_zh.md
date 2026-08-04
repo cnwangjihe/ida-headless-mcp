@@ -128,6 +128,9 @@ uv run idalib-pool --safe
 
 # 指定 backend 日志目录
 uv run idalib-pool --runtime-dir ./ida-mcp-runtime
+
+# 显示 MCP 请求/响应和内部路由细节
+uv run idalib-pool --log-level debug
 ```
 
 `--ida-dir` 的优先级高于 `IDADIR`。未传该参数时，原有环境变量和 idapro
@@ -139,6 +142,16 @@ IDA 无法加载或初始化，启动命令会立即失败。验证完成后该�
 不会作为空闲或预热实例保留。
 
 环境变量 `IDA_MCP_AUTH_TOKEN` 与 `--auth-token` 等效。
+
+### 运行时日志
+
+`idalib-pool` 和运行模式下的 `ida-pro-mcp` proxy 都支持
+`--log-level {debug,info,warning,error,critical}`。默认级别为 `info`，只显示
+MCP transport/session、IDA session/backend 和 GUI 连接的生命周期，以及
+warning/error；具体 MCP 请求和响应默认不会输出。使用 `--log-level debug`
+可以显示请求/响应预览与耗时、lease 变化、IPC 转发等调试细节。运行时日志写入
+stderr，不会污染 stdio JSON-RPC 输出。原有的 Pool `-v`/`--verbose` 参数已由
+`--log-level debug` 替代。
 
 请在 MCP Client 连接后通过 `idalib_open` 打开 binary 或 IDB。这样每个新建
 session 都会立即拥有对应的引用和 transport context。
@@ -264,6 +277,10 @@ host 和 port。当前没有浏览器配置页面。
 使用 Streamable HTTP/SSE 安装配置时，Client 直接连接 Plugin Server；使用
 stdio 配置时，Client 会启动 `ida-pro-mcp`，再由它代理到 Plugin 的本地
 Server。本地 Server 模式与连接 Pool 模式互斥。
+
+Plugin 每次启动 IDA 时都恢复为 INFO 级别。勾选
+**MCP > Verbose Logging** 后，Plugin、transport、JSON-RPC 和 IDA 集成组件会
+输出 DEBUG 日志；取消勾选后恢复 INFO。该调试开关不会跨 IDA 重启持久化。
 
 ### 把 GUI IDB 注册到 Pool
 
