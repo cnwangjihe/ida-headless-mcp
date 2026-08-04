@@ -19,6 +19,8 @@ from types import UnionType
 from urllib.parse import urlparse, parse_qs
 from io import BufferedIOBase
 
+from ida_pro_mcp.admin_events import AdminEvent, AdminEventSink
+
 from .jsonrpc import JsonRpcRegistry, JsonRpcError, JsonRpcException, get_current_request_id, register_pending_request, unregister_pending_request, cancel_request
 
 logger = logging.getLogger("ida_mcp.transport")
@@ -127,6 +129,17 @@ class _HttpBodyError(Exception):
 class _HttpSession:
     protocol_version: str
     last_accessed: float
+
+
+@dataclass
+class _TransportSessionState:
+    context_id: str
+    transport: str
+    peer: str | None
+    created_at: float
+    last_activity: float
+    client_name: str | None = None
+    client_version: str | None = None
 
 
 class McpHttpRequestHandler(BaseHTTPRequestHandler):
@@ -422,7 +435,10 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         # Create SSE connection wrapper
         conn = _McpSseConnection(self.wfile)
         context_id = f"sse:{conn.session_id}"
-        self.mcp_server.open_transport_session(context_id)
+        self.mcp_server.open_transport_session(
+            context_id,
+            peer=self.mcp_server.format_transport_peer(self.client_address),
+        )
         with self.mcp_server._sse_connections_lock:
             self.mcp_server._sse_connections[conn.session_id] = conn
 
@@ -649,7 +665,11 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             if is_initialize:
                 if mcp_session_id is None:
                     mcp_session_id = str(uuid.uuid4())
-                self.mcp_server.register_http_session(mcp_session_id, protocol_version)
+                self.mcp_server.register_http_session(
+                    mcp_session_id,
+                    protocol_version,
+                    peer=self.mcp_server.format_transport_peer(self.client_address),
+                )
             else:
                 if mcp_session_id is None:
                     self.send_error(
@@ -749,8 +769,12 @@ class McpServer:
         self._transport_sessions_lock = threading.Lock()
         self._transport_active_requests: dict[str, int] = {}
         self._transport_closing: dict[str, TransportSessionCloseReason] = {}
+        self._transport_cleanup_in_progress: set[str] = set()
         self._open_transport_sessions: set[str] = set()
+        self._transport_session_states: dict[str, _TransportSessionState] = {}
         self._terminated_transport_sessions: OrderedDict[str, None] = OrderedDict()
+        self._admin_event_revision = 0
+        self.admin_event_sink: AdminEventSink | None = None
         self.transport_session_closed: (
             Callable[[str, TransportSessionCloseReason], None] | None
         ) = None
@@ -965,18 +989,48 @@ class McpServer:
     def get_current_transport_session_id(self) -> str | None:
         return getattr(self._transport_session_id, "data", None)
 
-    def open_transport_session(self, context_id: str) -> None:
+    @staticmethod
+    def format_transport_peer(client_address: Any) -> str | None:
+        """Return a compact, display-only peer address."""
+        if not client_address:
+            return None
+        if isinstance(client_address, tuple) and client_address:
+            host = str(client_address[0])
+            if len(client_address) > 1:
+                return f"{host}:{client_address[1]}"
+            return host
+        return str(client_address)
+
+    def open_transport_session(
+        self,
+        context_id: str,
+        *,
+        peer: str | None = None,
+    ) -> None:
         """Mark a transport context as live, allowing deliberate ID reuse."""
+        event: AdminEvent | None = None
         with self._transport_sessions_lock:
             if context_id in self._open_transport_sessions:
                 return
+            now = time.monotonic()
             self._transport_closing.pop(context_id, None)
+            self._transport_cleanup_in_progress.discard(context_id)
             self._terminated_transport_sessions.pop(context_id, None)
             self._open_transport_sessions.add(context_id)
+            self._transport_session_states[context_id] = _TransportSessionState(
+                context_id=context_id,
+                transport=context_id.split(":", 1)[0],
+                peer=peer,
+                created_at=now,
+                last_activity=now,
+            )
+            event = self._transport_event_locked("TransportOpened", context_id)
+        self._emit_admin_event(event)
         logger.info("MCP transport session opened: context=%s", context_id)
 
     def begin_transport_request(self, context_id: str) -> bool:
         """Track an in-flight request unless the logical session is closing."""
+        event: AdminEvent | None = None
         with self._transport_sessions_lock:
             if (
                 context_id in self._transport_closing
@@ -986,21 +1040,39 @@ class McpServer:
             self._transport_active_requests[context_id] = (
                 self._transport_active_requests.get(context_id, 0) + 1
             )
-            return True
+            state = self._transport_session_states.get(context_id)
+            if state is not None:
+                state.last_activity = time.monotonic()
+                event = self._transport_event_locked(
+                    "TransportActivityChanged", context_id
+                )
+        self._emit_admin_event(event)
+        return True
 
     def end_transport_request(self, context_id: str) -> None:
         callback_reason: TransportSessionCloseReason | None = None
+        event: AdminEvent | None = None
         with self._transport_sessions_lock:
             active = self._transport_active_requests.get(context_id, 0)
             if active > 1:
                 self._transport_active_requests[context_id] = active - 1
             else:
                 self._transport_active_requests.pop(context_id, None)
-                callback_reason = self._transport_closing.pop(context_id, None)
+                callback_reason = self._transport_closing.get(context_id)
                 if callback_reason is not None:
-                    self._mark_transport_session_terminated_locked(context_id)
+                    if context_id in self._transport_cleanup_in_progress:
+                        callback_reason = None
+                    else:
+                        self._transport_cleanup_in_progress.add(context_id)
+            state = self._transport_session_states.get(context_id)
+            if state is not None:
+                state.last_activity = time.monotonic()
+                event = self._transport_event_locked(
+                    "TransportActivityChanged", context_id
+                )
+        self._emit_admin_event(event)
         if callback_reason is not None:
-            self._notify_transport_session_closed(context_id, callback_reason)
+            self._complete_transport_session_close(context_id, callback_reason)
 
     def terminate_transport_session(
         self,
@@ -1008,25 +1080,52 @@ class McpServer:
         reason: TransportSessionCloseReason,
     ) -> bool:
         """Close a logical transport session exactly once after active work."""
-        notify_now = False
+        complete_now = False
+        event: AdminEvent | None = None
         with self._transport_sessions_lock:
             if (
                 context_id in self._transport_closing
                 or context_id in self._terminated_transport_sessions
             ):
                 return False
-            if self._transport_active_requests.get(context_id, 0) > 0:
-                self._transport_closing[context_id] = reason
-            else:
-                self._mark_transport_session_terminated_locked(context_id)
-                notify_now = True
-        if notify_now:
-            self._notify_transport_session_closed(context_id, reason)
+            self._transport_closing[context_id] = reason
+            event = self._transport_event_locked("TransportClosing", context_id)
+            if self._transport_active_requests.get(context_id, 0) == 0:
+                self._transport_cleanup_in_progress.add(context_id)
+                complete_now = True
+        self._emit_admin_event(event)
+        if complete_now:
+            self._complete_transport_session_close(context_id, reason)
         return True
+
+    def _complete_transport_session_close(
+        self,
+        context_id: str,
+        reason: TransportSessionCloseReason,
+    ) -> None:
+        """Run close cleanup before making the transport disappear from observers."""
+        self._notify_transport_session_closed(context_id, reason)
+        with self._transport_sessions_lock:
+            self._transport_closing.pop(context_id, None)
+            self._transport_cleanup_in_progress.discard(context_id)
+            state = self._transport_session_states.get(context_id)
+            closed_at = time.monotonic()
+            event = (
+                self._transport_event_locked(
+                    "TransportClosed",
+                    context_id,
+                    extra={"reason": reason, "closed_at": closed_at},
+                )
+                if state is not None
+                else None
+            )
+            self._mark_transport_session_terminated_locked(context_id)
+        self._emit_admin_event(event)
 
     def _mark_transport_session_terminated_locked(self, context_id: str) -> None:
         """Keep a bounded tombstone cache to suppress duplicate close events."""
         self._open_transport_sessions.discard(context_id)
+        self._transport_session_states.pop(context_id, None)
         self._terminated_transport_sessions[context_id] = None
         self._terminated_transport_sessions.move_to_end(context_id)
         max_tombstones = max(1024, self.http_session_max_entries * 2)
@@ -1055,10 +1154,82 @@ class McpServer:
                 reason,
             )
 
+    def _transport_event_locked(
+        self,
+        kind: str,
+        context_id: str,
+        *,
+        extra: dict[str, Any] | None = None,
+    ) -> AdminEvent | None:
+        """Build an event for a tracked transport while holding its state lock."""
+        state = self._transport_session_states.get(context_id)
+        if state is None:
+            return None
+        self._admin_event_revision += 1
+        payload: dict[str, Any] = {
+            "context_id": context_id,
+            "transport": state.transport,
+            "peer": state.peer,
+            "client_name": state.client_name,
+            "client_version": state.client_version,
+            "state": (
+                "CLOSING" if context_id in self._transport_closing else "OPEN"
+            ),
+            "closing_reason": self._transport_closing.get(context_id),
+            "created_at": state.created_at,
+            "last_activity": state.last_activity,
+            "active_requests": self._transport_active_requests.get(context_id, 0),
+        }
+        if extra:
+            payload.update(extra)
+        return AdminEvent(
+            source="mcp",
+            kind=kind,
+            revision=self._admin_event_revision,
+            entity_id=context_id,
+            payload=payload,
+        )
+
+    def _emit_admin_event(self, event: AdminEvent | None) -> None:
+        sink = self.admin_event_sink
+        if sink is None or event is None:
+            return
+        try:
+            sink(event)
+        except Exception:
+            logger.exception(
+                "MCP administration event sink failed: kind=%s context=%s",
+                event.kind,
+                event.entity_id,
+            )
+
+    def _record_transport_client(self, client_info: Any) -> None:
+        context_id = self.get_current_transport_session_id()
+        if context_id is None or not isinstance(client_info, dict):
+            return
+
+        def clean(value: Any) -> str | None:
+            if not isinstance(value, str):
+                return None
+            return value[:128]
+
+        with self._transport_sessions_lock:
+            state = self._transport_session_states.get(context_id)
+            if state is None:
+                return
+            state.client_name = clean(client_info.get("name"))
+            state.client_version = clean(client_info.get("version"))
+            event = self._transport_event_locked(
+                "TransportClientUpdated", context_id
+            )
+        self._emit_admin_event(event)
+
     def register_http_session(
         self,
         session_id: str,
         protocol_version: str = LATEST_MCP_PROTOCOL_VERSION,
+        *,
+        peer: str | None = None,
     ) -> None:
         with self._http_sessions_lock:
             expired = self._prune_http_sessions_locked()
@@ -1072,7 +1243,7 @@ class McpServer:
             )
         self._report_http_sessions_terminated(expired, "idle_timeout")
         self._report_http_sessions_terminated(evicted, "capacity_evicted")
-        self.open_transport_session(f"http:{session_id}")
+        self.open_transport_session(f"http:{session_id}", peer=peer)
 
     def has_http_session(self, session_id: str) -> bool:
         with self._http_sessions_lock:
@@ -1212,6 +1383,7 @@ class McpServer:
 
     def _mcp_initialize(self, protocolVersion: str, capabilities: dict, clientInfo: dict, _meta: dict | None = None) -> dict:
         """MCP initialize method"""
+        self._record_transport_client(clientInfo)
         server_capabilities = {
             "tools": {},
             "prompts": {},
