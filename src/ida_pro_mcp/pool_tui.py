@@ -75,6 +75,7 @@ class DashboardModel:
     databases: dict[str, dict[str, Any]] = field(default_factory=dict)
     openings: dict[str, dict[str, Any]] = field(default_factory=dict)
     requests: dict[str, dict[str, Any]] = field(default_factory=dict)
+    session_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
     _revisions: dict[tuple[str, str], int] = field(default_factory=dict)
 
     def apply(self, event: AdminEvent) -> bool:
@@ -106,14 +107,33 @@ class DashboardModel:
 
         if entity_type == "opening":
             if event.kind == "IdbOpenFinished":
-                self.openings.pop(event.entity_id, None)
+                opening = self.openings.pop(event.entity_id, None)
+                details = {**(opening or {}), **event.payload}
+                if details.get("success") and details.get("session_id"):
+                    self._record_session_call(
+                        str(details["session_id"]),
+                        "idalib_open",
+                        details.get("context_id"),
+                        details.get("started_at"),
+                        details.get("finished_at"),
+                    )
             else:
                 self.openings[event.entity_id] = dict(event.payload)
             return True
 
         if entity_type == "request":
             if event.kind == "IdbRequestFinished":
-                self.requests.pop(event.entity_id, None)
+                request = self.requests.pop(event.entity_id, None)
+                details = {**(request or {}), **event.payload}
+                session_id = details.get("session_id")
+                if isinstance(session_id, str) and session_id in self.databases:
+                    self._record_session_call(
+                        session_id,
+                        str(details.get("operation") or "request"),
+                        details.get("context_id"),
+                        details.get("started_at"),
+                        details.get("finished_at"),
+                    )
             else:
                 self.requests[event.entity_id] = dict(event.payload)
             return True
@@ -131,6 +151,7 @@ class DashboardModel:
 
         if event.kind in {"IdbClosed", "ExternalIdbUnregistered"}:
             self.databases.pop(event.entity_id, None)
+            self.session_stats.pop(event.entity_id, None)
             self.requests = {
                 operation_id: request
                 for operation_id, request in self.requests.items()
@@ -138,7 +159,49 @@ class DashboardModel:
             }
         else:
             self.databases[event.entity_id] = dict(event.payload)
+            self.session_stats.setdefault(
+                event.entity_id,
+                self._new_session_stats(),
+            )
         return True
+
+    @staticmethod
+    def _new_session_stats() -> dict[str, Any]:
+        return {
+            "completed_calls": 0,
+            "total_duration": 0.0,
+            "max_duration": 0.0,
+            "last_operation": None,
+            "last_context_id": None,
+            "last_finished_at": None,
+        }
+
+    def _record_session_call(
+        self,
+        session_id: str,
+        operation: str,
+        context_id: Any,
+        started_at: Any,
+        finished_at: Any,
+    ) -> None:
+        if session_id not in self.databases:
+            return
+        try:
+            duration = max(0.0, float(finished_at) - float(started_at))
+            finished = float(finished_at)
+        except (TypeError, ValueError):
+            duration = 0.0
+            finished = time.monotonic()
+        stats = self.session_stats.setdefault(
+            session_id,
+            self._new_session_stats(),
+        )
+        stats["completed_calls"] += 1
+        stats["total_duration"] += duration
+        stats["max_duration"] = max(stats["max_duration"], duration)
+        stats["last_operation"] = operation
+        stats["last_context_id"] = context_id
+        stats["last_finished_at"] = finished
 
     @staticmethod
     def _context_has_relations(context: dict[str, Any]) -> bool:
@@ -262,6 +325,17 @@ def format_duration(seconds: float) -> str:
         return f"{hours}h{remaining_minutes}m"
     days, remaining_hours = divmod(hours, 24)
     return f"{days}d{remaining_hours}h"
+
+
+def format_metric_duration(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    if seconds < 1:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    if seconds < 60 * 60:
+        return f"{seconds / 60:.1f}m"
+    return f"{seconds / (60 * 60):.1f}h"
 
 
 TreeTarget = tuple[str, str]
@@ -826,6 +900,23 @@ class PoolTuiApp(App[None]):
 
         database = self.model.databases[entity_id]
         now = time.monotonic()
+        stats = self.model.session_stats.get(
+            entity_id,
+            DashboardModel._new_session_stats(),
+        )
+        completed_calls = int(stats["completed_calls"])
+        total_duration = float(stats["total_duration"])
+        average_duration = (
+            total_duration / completed_calls if completed_calls else 0.0
+        )
+        last_finished_at = stats.get("last_finished_at")
+        last_call = "-"
+        if last_finished_at is not None:
+            last_call = (
+                f"{stats.get('last_operation') or 'request'}"
+                f"@{stats.get('last_context_id') or '-'} · "
+                f"{format_duration(now - float(last_finished_at))} ago"
+            )
         busy_requests = sorted(
             self.model.requests.items(),
             key=lambda item: item[0],
@@ -845,7 +936,9 @@ class PoolTuiApp(App[None]):
         logger.info(
             "Database %s\n  session: %s\n  input: %s\n  idb: %s\n"
             "  type: %s\n  state: %s\n  refcount: %s\n  holders: %s\n"
-            "  busy: %s\n  instance: %s\n  pid: %s\n  backend log: %s",
+            "  calls: %s\n  execution: total %s · avg %s · max %s\n"
+            "  last call: %s\n  busy: %s\n  instance: %s\n  pid: %s\n"
+            "  backend log: %s",
             self.aliases.database(entity_id),
             entity_id,
             database.get("input_path") or "-",
@@ -854,6 +947,11 @@ class PoolTuiApp(App[None]):
             database.get("state") or "UNKNOWN",
             database.get("refcount", 0),
             ", ".join(holders) or "-",
+            completed_calls,
+            format_metric_duration(total_duration),
+            format_metric_duration(average_duration),
+            format_metric_duration(float(stats["max_duration"])),
+            last_call,
             busy_details or "-",
             database.get("instance_index", "-"),
             database.get("pid") or "-",
@@ -1148,6 +1246,8 @@ class PoolTuiApp(App[None]):
         state = database.get("state", "OPEN")
         refcount = database.get("refcount", 0)
         label.append(f" {filename} · {kind} · {state} · ref {refcount}")
+        stats = self.model.session_stats.get(session_id, {})
+        label.append(f" · calls {int(stats.get('completed_calls', 0))}")
         busy_requests = sorted(
             (
                 request

@@ -13,6 +13,7 @@ from ida_pro_mcp.pool_tui import (
     PoolTuiApp,
     StableAliases,
     format_duration,
+    format_metric_duration,
 )
 
 
@@ -177,6 +178,50 @@ class DashboardModelTests(unittest.TestCase):
         self.assertEqual(model.requests, {})
         self.assertFalse(model.apply(started))
 
+    def test_completed_calls_accumulate_session_statistics(self):
+        model = DashboardModel()
+        model.apply(event("pool", "IdbOpened", 1, "db-a", state="OPEN"))
+
+        for revision, operation, started_at, finished_at in (
+            (2, "decompile", 100.0, 102.5),
+            (4, "get_functions", 110.0, 110.5),
+        ):
+            operation_id = f"request:{revision}"
+            model.apply(
+                event(
+                    "pool",
+                    "IdbRequestStarted",
+                    revision,
+                    operation_id,
+                    session_id="db-a",
+                    context_id="http:agent-a",
+                    operation=operation,
+                    started_at=started_at,
+                )
+            )
+            model.apply(
+                event(
+                    "pool",
+                    "IdbRequestFinished",
+                    revision + 1,
+                    operation_id,
+                    session_id="db-a",
+                    context_id="http:agent-a",
+                    operation=operation,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    success=True,
+                )
+            )
+
+        stats = model.session_stats["db-a"]
+        self.assertEqual(stats["completed_calls"], 2)
+        self.assertEqual(stats["total_duration"], 3.0)
+        self.assertEqual(stats["max_duration"], 2.5)
+        self.assertEqual(stats["last_operation"], "get_functions")
+        self.assertEqual(stats["last_context_id"], "http:agent-a")
+        self.assertEqual(stats["last_finished_at"], 110.5)
+
 
 class PresentationHelpersTests(unittest.TestCase):
     def test_duration_is_minute_granularity(self):
@@ -185,6 +230,12 @@ class PresentationHelpersTests(unittest.TestCase):
         self.assertEqual(format_duration(17 * 60), "17m")
         self.assertEqual(format_duration((2 * 60 + 13) * 60), "2h13m")
         self.assertEqual(format_duration((3 * 24 + 4) * 60 * 60), "3d4h")
+
+    def test_metric_duration_adapts_to_request_latency(self):
+        self.assertEqual(format_metric_duration(0.125), "125ms")
+        self.assertEqual(format_metric_duration(2.25), "2.2s")
+        self.assertEqual(format_metric_duration(90), "1.5m")
+        self.assertEqual(format_metric_duration(2 * 60 * 60), "2.0h")
 
     def test_aliases_are_stable_and_not_reused(self):
         aliases = StableAliases()
@@ -474,6 +525,7 @@ class PoolTuiAppTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(len(agent.children), 1)
             self.assertIn("D01 router.i64", agent.children[0].label.plain)
+            self.assertIn("calls 1", agent.children[0].label.plain)
 
     async def test_tree_marks_the_target_database_busy(self):
         app = PoolTuiApp(AdminEventBus(), BufferedLogHandler())
@@ -550,6 +602,10 @@ class PoolTuiAppTests(unittest.IsolatedAsyncioTestCase):
                     5,
                     "request:1234",
                     session_id="database-a",
+                    context_id="http:agent-a",
+                    operation="decompile",
+                    started_at=now,
+                    finished_at=now + 2.5,
                     success=True,
                 )
             )
@@ -561,6 +617,11 @@ class PoolTuiAppTests(unittest.IsolatedAsyncioTestCase):
                 if node.data == ("agent", "http:agent-a")
             )
             self.assertNotIn("BUSY", agent.children[0].label.plain)
+            self.assertIn("calls 1", agent.children[0].label.plain)
+            with self.assertLogs("ida_mcp.tui", level="INFO") as captured:
+                app.execute_command("show D01")
+            self.assertIn("calls: 1", captured.output[0])
+            self.assertIn("total 2.5s · avg 2.5s · max 2.5s", captured.output[0])
 
     async def test_tree_handles_expected_ten_agents_and_thirty_databases(self):
         bus = AdminEventBus()
