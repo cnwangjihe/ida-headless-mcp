@@ -1,9 +1,11 @@
 import unittest
+from unittest.mock import MagicMock
 
 from ida_pro_mcp import idalib_pool_server
 
 
 McpServer = idalib_pool_server._mcp_mod.McpServer
+McpSseConnection = idalib_pool_server._mcp_mod._McpSseConnection
 
 
 class TransportAdministrationEventTests(unittest.TestCase):
@@ -104,6 +106,79 @@ class TransportAdministrationEventTests(unittest.TestCase):
                     "http:agent-c", "client_terminated"
                 )
             )
+
+
+class TransportAdministrationDisconnectTests(unittest.TestCase):
+    def setUp(self):
+        self.server = McpServer("test")
+        self.events = []
+        self.closed = []
+        self.server.admin_event_sink = self.events.append
+        self.server.transport_session_closed = (
+            lambda context_id, reason: self.closed.append((context_id, reason))
+        )
+
+    def test_disconnect_http_invalidates_session_and_drains_active_request(self):
+        context_id = "http:agent-a"
+        self.server.register_http_session("agent-a")
+        self.server.begin_transport_request(context_id)
+
+        result = self.server.disconnect_transport_session(context_id)
+
+        self.assertEqual(
+            result,
+            {
+                "success": True,
+                "context_id": context_id,
+                "state": "CLOSING",
+                "active_requests": 1,
+            },
+        )
+        self.assertFalse(self.server.has_http_session("agent-a"))
+        self.assertFalse(self.server.begin_transport_request(context_id))
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.events[-1].kind, "TransportClosing")
+        self.assertEqual(
+            self.events[-1].payload["closing_reason"], "admin_disconnected"
+        )
+
+        self.server.end_transport_request(context_id)
+
+        self.assertEqual(
+            self.closed,
+            [(context_id, "admin_disconnected")],
+        )
+        self.assertEqual(self.events[-1].kind, "TransportClosed")
+
+    def test_disconnect_sse_shuts_down_stream_socket(self):
+        connection = MagicMock()
+        sse = McpSseConnection(MagicMock(), connection)
+        sse.session_id = "agent-b"
+        context_id = "sse:agent-b"
+        self.server.open_transport_session(context_id)
+        self.server._sse_connections["agent-b"] = sse
+
+        result = self.server.disconnect_transport_session(context_id)
+
+        self.assertTrue(result["success"])
+        self.assertFalse(sse.alive)
+        connection.shutdown.assert_called_once_with(
+            idalib_pool_server._mcp_mod.socket.SHUT_RDWR
+        )
+        self.assertNotIn("agent-b", self.server._sse_connections)
+        self.assertEqual(
+            self.closed,
+            [(context_id, "admin_disconnected")],
+        )
+
+    def test_disconnect_rejects_unknown_and_stdio_sessions(self):
+        self.assertFalse(
+            self.server.disconnect_transport_session("http:missing")["success"]
+        )
+        self.server.open_transport_session("stdio:default")
+        result = self.server.disconnect_transport_session("stdio:default")
+        self.assertFalse(result["success"])
+        self.assertIn("Only HTTP and SSE", result["error"])
 
 
 if __name__ == "__main__":

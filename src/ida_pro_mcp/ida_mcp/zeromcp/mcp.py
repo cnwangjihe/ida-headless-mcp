@@ -34,6 +34,7 @@ SUPPORTED_HTTP_PROTOCOL_VERSIONS = {
 }
 
 TransportSessionCloseReason = Literal[
+    "admin_disconnected",
     "client_terminated",
     "disconnect",
     "idle_timeout",
@@ -59,10 +60,21 @@ class McpRpcRegistry(JsonRpcRegistry):
 
 class _McpSseConnection:
     """Manages a single SSE client connection"""
-    def __init__(self, wfile):
+    def __init__(self, wfile, connection=None):
         self.wfile: BufferedIOBase = wfile
+        self.connection = connection
         self.session_id = str(uuid.uuid4())
         self.alive = True
+
+    def close(self) -> None:
+        """Invalidate the stream and wake the handler blocked in select()."""
+        self.alive = False
+        if self.connection is None:
+            return
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except (OSError, ValueError):
+            pass
 
     def send_event(self, event_type: str, data):
         """Send an SSE event to the client
@@ -433,7 +445,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
 
     def _handle_sse_get(self):
         # Create SSE connection wrapper
-        conn = _McpSseConnection(self.wfile)
+        conn = _McpSseConnection(self.wfile, self.connection)
         context_id = f"sse:{conn.session_id}"
         self.mcp_server.open_transport_session(
             context_id,
@@ -1097,6 +1109,62 @@ class McpServer:
         if complete_now:
             self._complete_transport_session_close(context_id, reason)
         return True
+
+    def disconnect_transport_session(self, context_id: str) -> dict[str, Any]:
+        """Administratively invalidate a network transport session."""
+        transport = context_id.split(":", 1)[0]
+        if transport not in {"http", "sse"}:
+            return {
+                "success": False,
+                "context_id": context_id,
+                "error": "Only HTTP and SSE sessions can be disconnected",
+            }
+
+        with self._transport_sessions_lock:
+            if context_id not in self._open_transport_sessions:
+                return {
+                    "success": False,
+                    "context_id": context_id,
+                    "error": f"Transport session not found: {context_id}",
+                }
+            if context_id in self._transport_closing:
+                return {
+                    "success": False,
+                    "context_id": context_id,
+                    "error": f"Transport session is already closing: {context_id}",
+                }
+            active_requests = self._transport_active_requests.get(context_id, 0)
+
+        session_id = context_id.split(":", 1)[1]
+        if transport == "http":
+            self.remove_http_session(session_id)
+        else:
+            with self._sse_connections_lock:
+                connection = self._sse_connections.pop(session_id, None)
+            if connection is not None:
+                connection.close()
+
+        accepted = self.terminate_transport_session(
+            context_id, "admin_disconnected"
+        )
+        if not accepted:
+            return {
+                "success": False,
+                "context_id": context_id,
+                "error": f"Transport session is already closing: {context_id}",
+            }
+        logger.info(
+            "MCP transport session administratively disconnected: "
+            "context=%s active_requests=%d",
+            context_id,
+            active_requests,
+        )
+        return {
+            "success": True,
+            "context_id": context_id,
+            "state": "CLOSING" if active_requests else "CLOSED",
+            "active_requests": active_requests,
+        }
 
     def _complete_transport_session_close(
         self,
