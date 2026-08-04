@@ -7,6 +7,7 @@ import shlex
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -300,12 +301,14 @@ class PoolTuiApp(App[None]):
         *,
         mcp_server: Any | None = None,
         pool_manager: Any | None = None,
+        startup_callback: Callable[[], None] | None = None,
     ) -> None:
         super().__init__()
         self.event_bus = event_bus
         self.log_handler = log_handler
         self.mcp_server = mcp_server
         self.pool_manager = pool_manager
+        self.startup_callback = startup_callback
         self.model = DashboardModel()
         self.aliases = StableAliases()
         self.runtime_state = "STARTING"
@@ -340,6 +343,8 @@ class PoolTuiApp(App[None]):
         self.set_interval(60, self._refresh_durations, name="duration-refresh")
         self.set_interval(0.1, self._drain_logs, name="log-drain")
         self.query_one("#command-input", Input).focus()
+        if self.startup_callback is not None:
+            self.startup_callback()
 
     def on_unmount(self) -> None:
         if self._event_bridge_started:

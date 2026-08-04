@@ -28,6 +28,7 @@ import signal
 import sys
 import threading
 from typing import Any
+from urllib.parse import ParseResult, urlparse
 
 # Import zeromcp directly from the vendored package path without triggering
 # ida_mcp/__init__.py (which imports idapro-dependent modules).
@@ -59,10 +60,13 @@ from websockets.sync.connection import Connection as WebSocketConnection  # noqa
 from websockets.sync.server import ServerProtocol  # noqa: E402
 
 from ida_pro_mcp.idalib_pool_manager import PoolManager  # noqa: E402
+from ida_pro_mcp.admin_events import AdminEventBus  # noqa: E402
 from ida_pro_mcp.logging_config import (  # noqa: E402
     LOG_LEVEL_NAMES,
     configure_runtime_logging,
+    replace_runtime_log_handler,
 )
+from ida_pro_mcp.pool_tui import BufferedLogHandler, PoolTuiApp  # noqa: E402
 from ida_pro_mcp.pool_websocket import ExternalInstanceBridge  # noqa: E402
 
 logger = logging.getLogger("ida_mcp.pool")
@@ -989,6 +993,123 @@ def build_pool_handler_class(
 # CLI
 # --------------------------------------------------------------------------
 
+
+class PoolTuiRuntime:
+    """Start the pool server in the background and stop it without races."""
+
+    def __init__(
+        self,
+        app: PoolTuiApp,
+        pool: PoolManager,
+        mcp: McpServer,
+        transport: str,
+        transport_url: ParseResult,
+        output_cache: PoolOutputCache | None,
+        request_handler: type[McpHttpRequestHandler],
+    ) -> None:
+        self.app = app
+        self.pool = pool
+        self.mcp = mcp
+        self.transport = transport
+        self.transport_url = transport_url
+        self.output_cache = output_cache
+        self.request_handler = request_handler
+        self._stop_event = threading.Event()
+        self._lifecycle_lock = threading.Lock()
+        self._stop_lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._mcp_started = False
+        self._stopped = False
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._bootstrap,
+            name="idalib-pool-tui-bootstrap",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _bootstrap(self) -> None:
+        try:
+            logger.info("Checking IDA backend startup...")
+            initial_tools = self.pool.discover_tools()
+            if self._stop_event.is_set():
+                return
+            logger.info(
+                "IDA backend ready; discovered %d tools", len(initial_tools)
+            )
+            build_dispatch(
+                self.mcp,
+                self.pool,
+                output_cache=self.output_cache,
+                initial_tools=initial_tools,
+            )
+            with self._lifecycle_lock:
+                if self._stop_event.is_set():
+                    return
+                self.mcp.serve(
+                    host=self.transport_url.hostname,
+                    port=self.transport_url.port,
+                    background=True,
+                    request_handler=self.request_handler,
+                )
+                self._mcp_started = True
+            if self._stop_event.is_set():
+                return
+            self._set_runtime_state("READY", self.transport)
+        except Exception as error:
+            if self._stop_event.is_set():
+                return
+            logger.exception("TUI server startup failed")
+            self._set_runtime_state("FAILED", str(error))
+
+    def _set_runtime_state(self, state: str, detail: str) -> None:
+        try:
+            self.app.call_from_thread(
+                self.app.set_runtime_state,
+                state,
+                detail,
+            )
+        except Exception:
+            if not self._stop_event.is_set():
+                logger.debug("Could not update TUI runtime state", exc_info=True)
+
+    def stop(self) -> None:
+        with self._stop_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            self._stop_event.set()
+            with self._lifecycle_lock:
+                if self._mcp_started:
+                    self.mcp.stop()
+                    self._mcp_started = False
+            logger.info("Shutting down pool...")
+            self.pool.shutdown_all()
+            if self._thread is not None:
+                self._thread.join()
+
+
+def _parse_tui_transport(
+    parser: argparse.ArgumentParser,
+    transport: str,
+) -> ParseResult:
+    if transport == "stdio":
+        parser.error("--tui requires an explicit HTTP --transport URL")
+    try:
+        url = urlparse(transport)
+        port = url.port
+    except ValueError:
+        parser.error(f"Invalid TUI transport URL: {transport}")
+    if url.scheme != "http" or not url.hostname or not port:
+        parser.error(
+            "--tui transport must be an HTTP URL with an explicit port"
+        )
+    return url
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="MCP proxy server managing a pool of idalib instances"
@@ -1003,6 +1124,10 @@ def main():
     parser.add_argument(
         "--transport", type=str, default="stdio",
         help="Transport: 'stdio' (default) or a URL (e.g. http://127.0.0.1:8750)",
+    )
+    parser.add_argument(
+        "--tui", action="store_true",
+        help="Run the interactive pool dashboard (requires HTTP transport and a TTY)",
     )
     parser.add_argument(
         "--runtime-dir", type=str, default=None,
@@ -1035,6 +1160,11 @@ def main():
     args = parser.parse_args()
     if args.http_session_ttl < 0:
         parser.error("--http-session-ttl must be non-negative")
+    tui_transport_url = None
+    if args.tui:
+        tui_transport_url = _parse_tui_transport(parser, args.transport)
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            parser.error("--tui requires an interactive terminal")
 
     configure_runtime_logging(args.log_level)
 
@@ -1063,12 +1193,49 @@ def main():
         else PoolOutputCache(base_url=os.environ.get("IDA_MCP_URL"))
     )
 
+    tui_app: PoolTuiApp | None = None
+
     def request_shutdown(signum, frame):
         logger.info("Shutdown requested")
+        if tui_app is not None:
+            tui_app.exit()
+            return
         raise SystemExit(0)
 
     signal.signal(signal.SIGINT, request_shutdown)
     signal.signal(signal.SIGTERM, request_shutdown)
+
+    if args.tui:
+        assert tui_transport_url is not None
+        event_bus = AdminEventBus()
+        log_handler = BufferedLogHandler()
+        mcp.admin_event_sink = event_bus.publish
+        pool.admin_event_sink = event_bus.publish
+        tui_app = PoolTuiApp(
+            event_bus,
+            log_handler,
+            mcp_server=mcp,
+            pool_manager=pool,
+        )
+        handler_cls = build_pool_handler_class(pool, output_cache)
+        runtime = PoolTuiRuntime(
+            tui_app,
+            pool,
+            mcp,
+            args.transport,
+            tui_transport_url,
+            output_cache,
+            handler_cls,
+        )
+        tui_app.startup_callback = runtime.start
+        try:
+            with replace_runtime_log_handler(log_handler):
+                tui_app.run()
+        finally:
+            mcp.admin_event_sink = None
+            pool.admin_event_sink = None
+            runtime.stop()
+        return
 
     try:
         logger.info("Checking IDA backend startup...")
@@ -1090,7 +1257,6 @@ def main():
         if transport == "stdio":
             mcp.stdio()
         else:
-            from urllib.parse import urlparse
             url = urlparse(transport)
             if not url.hostname or not url.port:
                 logger.error("Invalid transport URL: %s", transport)

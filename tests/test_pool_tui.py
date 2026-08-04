@@ -195,6 +195,19 @@ class PresentationHelpersTests(unittest.TestCase):
 
 
 class PoolTuiAppTests(unittest.IsolatedAsyncioTestCase):
+    async def test_event_bridge_starts_before_runtime_bootstrap(self):
+        order = []
+        bus = MagicMock()
+        bus.start.side_effect = lambda callback: order.append("events")
+        app = PoolTuiApp(
+            bus,
+            BufferedLogHandler(),
+            startup_callback=lambda: order.append("runtime"),
+        )
+
+        async with app.run_test():
+            self.assertEqual(order, ["events", "runtime"])
+
     async def test_tree_renders_agent_to_shared_database_relationship(self):
         bus = AdminEventBus()
         handler = BufferedLogHandler()

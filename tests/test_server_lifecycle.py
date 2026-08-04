@@ -1,8 +1,11 @@
 import os
 import logging
 import sys
+import threading
 import unittest
+from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlparse
 
 from ida_pro_mcp import idalib_pool_server
 
@@ -48,6 +51,210 @@ class PoolServerLifecycleTests(unittest.TestCase):
 
             self.assertEqual(configured, "/environment/ida")
             self.assertEqual(os.environ["IDADIR"], "/environment/ida")
+
+    @patch.object(idalib_pool_server, "PoolManager")
+    def test_tui_rejects_stdio_before_creating_pool(self, pool_cls):
+        with (
+            patch.object(sys, "argv", ["idalib-pool", "--tui"]),
+            patch.object(sys, "stderr"),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            idalib_pool_server.main()
+
+        self.assertEqual(raised.exception.code, 2)
+        pool_cls.assert_not_called()
+
+    @patch.object(idalib_pool_server, "PoolManager")
+    def test_tui_requires_interactive_terminal(self, pool_cls):
+        stdin = MagicMock()
+        stdout = MagicMock()
+        stdin.isatty.return_value = False
+        stdout.isatty.return_value = True
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "idalib-pool",
+                    "--tui",
+                    "--transport",
+                    "http://127.0.0.1:8750",
+                ],
+            ),
+            patch.object(sys, "stdin", stdin),
+            patch.object(sys, "stdout", stdout),
+            patch.object(sys, "stderr"),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            idalib_pool_server.main()
+
+        self.assertEqual(raised.exception.code, 2)
+        pool_cls.assert_not_called()
+
+    def test_tui_runtime_bootstraps_server_and_stops_once(self):
+        app = MagicMock()
+        pool = MagicMock()
+        mcp = MagicMock()
+        handler = MagicMock()
+        tools = [{"name": "get_functions"}]
+        pool.discover_tools.return_value = tools
+        runtime = idalib_pool_server.PoolTuiRuntime(
+            app,
+            pool,
+            mcp,
+            "http://127.0.0.1:8750",
+            urlparse("http://127.0.0.1:8750"),
+            None,
+            handler,
+        )
+
+        with patch.object(idalib_pool_server, "build_dispatch") as dispatch:
+            runtime._bootstrap()
+            runtime.stop()
+            runtime.stop()
+
+        pool.discover_tools.assert_called_once_with()
+        dispatch.assert_called_once_with(
+            mcp,
+            pool,
+            output_cache=None,
+            initial_tools=tools,
+        )
+        mcp.serve.assert_called_once_with(
+            host="127.0.0.1",
+            port=8750,
+            background=True,
+            request_handler=handler,
+        )
+        app.call_from_thread.assert_called_once_with(
+            app.set_runtime_state,
+            "READY",
+            "http://127.0.0.1:8750",
+        )
+        mcp.stop.assert_called_once_with()
+        pool.shutdown_all.assert_called_once_with()
+
+    def test_tui_runtime_reports_startup_failure_without_listening(self):
+        app = MagicMock()
+        pool = MagicMock()
+        mcp = MagicMock()
+        pool.discover_tools.side_effect = RuntimeError("idalib unavailable")
+        runtime = idalib_pool_server.PoolTuiRuntime(
+            app,
+            pool,
+            mcp,
+            "http://127.0.0.1:8750",
+            urlparse("http://127.0.0.1:8750"),
+            None,
+            MagicMock(),
+        )
+
+        with patch.object(idalib_pool_server, "build_dispatch") as dispatch:
+            runtime._bootstrap()
+
+        dispatch.assert_not_called()
+        mcp.serve.assert_not_called()
+        state_call = app.call_from_thread.call_args.args
+        self.assertIs(state_call[0], app.set_runtime_state)
+        self.assertEqual(state_call[1], "FAILED")
+        self.assertIn("idalib unavailable", state_call[2])
+
+    def test_tui_runtime_does_not_listen_after_stop_during_discovery(self):
+        app = MagicMock()
+        pool = MagicMock()
+        mcp = MagicMock()
+        discovery_started = threading.Event()
+        allow_discovery = threading.Event()
+
+        def discover():
+            discovery_started.set()
+            allow_discovery.wait(1)
+            return []
+
+        pool.discover_tools.side_effect = discover
+        runtime = idalib_pool_server.PoolTuiRuntime(
+            app,
+            pool,
+            mcp,
+            "http://127.0.0.1:8750",
+            urlparse("http://127.0.0.1:8750"),
+            None,
+            MagicMock(),
+        )
+        runtime.start()
+        self.assertTrue(discovery_started.wait(1))
+        allow_discovery.set()
+        runtime.stop()
+
+        mcp.serve.assert_not_called()
+        pool.shutdown_all.assert_called_once_with()
+
+    @patch.object(idalib_pool_server.signal, "signal")
+    @patch.object(idalib_pool_server, "replace_runtime_log_handler")
+    @patch.object(idalib_pool_server, "build_pool_handler_class")
+    @patch.object(idalib_pool_server, "PoolTuiRuntime")
+    @patch.object(idalib_pool_server, "PoolTuiApp")
+    @patch.object(idalib_pool_server, "BufferedLogHandler")
+    @patch.object(idalib_pool_server, "AdminEventBus")
+    @patch.object(idalib_pool_server, "McpServer")
+    @patch.object(idalib_pool_server, "PoolManager")
+    def test_tui_cli_wires_events_and_defers_bootstrap_until_mount(
+        self,
+        pool_cls,
+        mcp_cls,
+        event_bus_cls,
+        log_handler_cls,
+        app_cls,
+        runtime_cls,
+        build_handler,
+        replace_handler,
+        signal_mock,
+    ):
+        pool = pool_cls.return_value
+        mcp = mcp_cls.return_value
+        event_bus = event_bus_cls.return_value
+        app = app_cls.return_value
+        runtime = runtime_cls.return_value
+        replace_handler.return_value = nullcontext()
+
+        def run_app():
+            self.assertIs(mcp.admin_event_sink, event_bus.publish)
+            self.assertIs(pool.admin_event_sink, event_bus.publish)
+            runtime.start.assert_not_called()
+            app.startup_callback()
+
+        app.run.side_effect = run_app
+        stdin = MagicMock()
+        stdout = MagicMock()
+        stdin.isatty.return_value = True
+        stdout.isatty.return_value = True
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "idalib-pool",
+                    "--tui",
+                    "--transport",
+                    "http://127.0.0.1:8750",
+                ],
+            ),
+            patch.object(sys, "stdin", stdin),
+            patch.object(sys, "stdout", stdout),
+        ):
+            idalib_pool_server.main()
+
+        pool.discover_tools.assert_not_called()
+        app_cls.assert_called_once_with(
+            event_bus,
+            log_handler_cls.return_value,
+            mcp_server=mcp,
+            pool_manager=pool,
+        )
+        runtime.start.assert_called_once_with()
+        runtime.stop.assert_called_once_with()
+        self.assertIsNone(mcp.admin_event_sink)
+        self.assertIsNone(pool.admin_event_sink)
 
     @patch.object(idalib_pool_server.signal, "signal")
     @patch.object(idalib_pool_server, "build_dispatch")
