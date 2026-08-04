@@ -9,6 +9,7 @@ from ida_pro_mcp import idalib_pool_server, server
 from ida_pro_mcp.logging_config import (
     LOGGER_NAMESPACE,
     configure_runtime_logging,
+    replace_runtime_log_handler,
 )
 
 
@@ -40,6 +41,21 @@ class RuntimeLoggingConfigurationTests(unittest.TestCase):
         configure_runtime_logging("DEBUG", stream=output)
         component.debug("visible request")
         self.assertIn("DEBUG ida_mcp.rpc: visible request", output.getvalue())
+
+    def test_runtime_handler_can_be_temporarily_replaced(self):
+        output = io.StringIO()
+        replacement_output = io.StringIO()
+        component = logging.getLogger("ida_mcp.pool.session")
+        configure_runtime_logging("info", stream=output)
+        replacement = logging.StreamHandler(replacement_output)
+
+        with replace_runtime_log_handler(replacement):
+            component.info("inside TUI")
+        component.info("after TUI")
+
+        self.assertIn("inside TUI", replacement_output.getvalue())
+        self.assertNotIn("inside TUI", output.getvalue())
+        self.assertIn("after TUI", output.getvalue())
 
 
 class CommandLineLogLevelTests(unittest.TestCase):

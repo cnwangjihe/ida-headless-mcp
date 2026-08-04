@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import sys
+from contextlib import contextmanager
+from collections.abc import Iterator
 from typing import TextIO
 
 
@@ -64,3 +66,29 @@ def configure_runtime_logging(
     namespace_logger.setLevel(getattr(logging, normalized.upper()))
     namespace_logger.propagate = False
     return namespace_logger
+
+
+@contextmanager
+def replace_runtime_log_handler(
+    handler: logging.Handler,
+) -> Iterator[logging.Logger]:
+    """Temporarily route the project logger hierarchy to one handler."""
+    namespace_logger = logging.getLogger(LOGGER_NAMESPACE)
+    previous = [
+        candidate
+        for candidate in namespace_logger.handlers
+        if getattr(candidate, _HANDLER_MARKER, False)
+    ]
+    for candidate in previous:
+        namespace_logger.removeHandler(candidate)
+
+    setattr(handler, _HANDLER_MARKER, True)
+    handler.setLevel(logging.NOTSET)
+    handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
+    namespace_logger.addHandler(handler)
+    try:
+        yield namespace_logger
+    finally:
+        namespace_logger.removeHandler(handler)
+        for candidate in previous:
+            namespace_logger.addHandler(candidate)
