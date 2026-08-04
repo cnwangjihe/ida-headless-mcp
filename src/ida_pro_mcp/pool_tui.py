@@ -73,11 +73,14 @@ class DashboardModel:
     transports: dict[str, dict[str, Any]] = field(default_factory=dict)
     contexts: dict[str, dict[str, Any]] = field(default_factory=dict)
     databases: dict[str, dict[str, Any]] = field(default_factory=dict)
+    openings: dict[str, dict[str, Any]] = field(default_factory=dict)
     _revisions: dict[tuple[str, str], int] = field(default_factory=dict)
 
     def apply(self, event: AdminEvent) -> bool:
         if event.source == "mcp":
             entity_type = "transport"
+        elif event.kind in {"IdbOpenStarted", "IdbOpenFinished"}:
+            entity_type = "opening"
         elif event.kind == "ContextMappingChanged":
             entity_type = "context"
         else:
@@ -96,6 +99,13 @@ class DashboardModel:
                     self.contexts.pop(event.entity_id, None)
             else:
                 self.transports[event.entity_id] = dict(event.payload)
+            return True
+
+        if entity_type == "opening":
+            if event.kind == "IdbOpenFinished":
+                self.openings.pop(event.entity_id, None)
+            else:
+                self.openings[event.entity_id] = dict(event.payload)
             return True
 
         if entity_type == "context":
@@ -122,11 +132,17 @@ class DashboardModel:
         )
 
     def agent_ids(self) -> set[str]:
-        return set(self.transports) | {
+        context_ids = set(self.transports) | {
             context_id
             for context_id, context in self.contexts.items()
             if self._context_has_relations(context)
         }
+        context_ids.update(
+            context_id
+            for opening in self.openings.values()
+            if (context_id := opening.get("context_id"))
+        )
+        return context_ids
 
 
 class StableAliases:
@@ -416,7 +432,11 @@ class PoolTuiApp(App[None]):
             return
         if event.source == "mcp" or event.kind == "ContextMappingChanged":
             self.aliases.agent(event.entity_id)
-        if event.source == "pool" and event.kind != "ContextMappingChanged":
+        if event.source == "pool" and event.kind not in {
+            "ContextMappingChanged",
+            "IdbOpenStarted",
+            "IdbOpenFinished",
+        }:
             self.aliases.database(event.entity_id)
         self._rebuild_tree()
 
@@ -733,9 +753,24 @@ class PoolTuiApp(App[None]):
         if kind == "agent":
             transport = self.model.transports.get(entity_id, {})
             relation = self.model.contexts.get(entity_id, {})
+            now = time.monotonic()
+            openings = sorted(
+                (
+                    operation_id,
+                    opening,
+                )
+                for operation_id, opening in self.model.openings.items()
+                if opening.get("context_id") == entity_id
+            )
+            opening_details = "\n             ".join(
+                f"{operation_id} {opening.get('input_path') or '-'} "
+                f"(age {format_duration(now - float(opening.get('started_at', now)))})"
+                for operation_id, opening in openings
+            )
             logger.info(
                 "Agent %s\n  context: %s\n  client: %s %s\n  peer: %s\n"
-                "  state: %s\n  active requests: %s\n  bound: %s\n  holds: %s",
+                "  state: %s\n  active requests: %s\n  opening: %s\n"
+                "  bound: %s\n  holds: %s",
                 self.aliases.agent(entity_id),
                 entity_id,
                 transport.get("client_name") or "unknown",
@@ -743,6 +778,7 @@ class PoolTuiApp(App[None]):
                 transport.get("peer") or "-",
                 transport.get("state") or "ORPHAN",
                 transport.get("active_requests", 0),
+                opening_details or "-",
                 relation.get("bound_session_id") or "-",
                 ", ".join(relation.get("held_session_ids", [])) or "-",
             )
@@ -905,6 +941,8 @@ class PoolTuiApp(App[None]):
             f" · {self.runtime_state} · MCP {len(agent_ids)}"
             f" · IDB {len(self.model.databases)}"
         )
+        if self.model.openings:
+            root_label.append(f" · OPENING {len(self.model.openings)}", style="yellow")
         if self.runtime_detail:
             root_label.append(f" · {self.runtime_detail}")
         tree.root.set_label(root_label)
@@ -912,6 +950,7 @@ class PoolTuiApp(App[None]):
 
         nodes_by_target: dict[TreeTarget, Any] = {}
         referenced_databases: set[str] = set()
+        referenced_openings: set[str] = set()
         now = time.monotonic()
 
         ordered_agents = sorted(agent_ids, key=self.aliases.agent)
@@ -930,7 +969,22 @@ class PoolTuiApp(App[None]):
             bound = relation.get("bound_session_id")
             session_ids = held | ({bound} if bound else set())
             referenced_databases.update(session_ids)
-            if not session_ids:
+            openings = sorted(
+                (
+                    operation_id,
+                    opening,
+                )
+                for operation_id, opening in self.model.openings.items()
+                if opening.get("context_id") == context_id
+            )
+            for operation_id, opening in openings:
+                referenced_openings.add(operation_id)
+                child = node.add_leaf(
+                    self._opening_label(opening, now),
+                    data=("opening", operation_id),
+                )
+                nodes_by_target[("opening", operation_id)] = child
+            if not session_ids and not openings:
                 node.add_leaf(Text("no IDB sessions", style="dim"))
                 continue
             for session_id in sorted(session_ids, key=self.aliases.database):
@@ -943,6 +997,22 @@ class PoolTuiApp(App[None]):
                     data=("database", session_id),
                 )
                 nodes_by_target.setdefault(("database", session_id), child)
+
+        unattached_openings = sorted(
+            set(self.model.openings) - referenced_openings
+        )
+        if unattached_openings:
+            branch = tree.root.add(
+                f"Unattached opening operations ({len(unattached_openings)})",
+                data=("group", "unattached-openings"),
+                expand=True,
+            )
+            for operation_id in unattached_openings:
+                child = branch.add_leaf(
+                    self._opening_label(self.model.openings[operation_id], now),
+                    data=("opening", operation_id),
+                )
+                nodes_by_target[("opening", operation_id)] = child
 
         unattached = sorted(
             set(self.model.databases) - referenced_databases,
@@ -967,6 +1037,17 @@ class PoolTuiApp(App[None]):
 
         if selected in nodes_by_target:
             tree.select_node(nodes_by_target[selected])
+
+    @staticmethod
+    def _opening_label(opening: dict[str, Any], now: float) -> Text:
+        input_path = opening.get("input_path") or "unknown input"
+        started_at = float(opening.get("started_at", now))
+        label = Text()
+        label.append("↻ OPENING", style="bold yellow")
+        label.append(f" {input_path} · age {format_duration(now - started_at)}")
+        if opening.get("run_auto_analysis"):
+            label.append(" · auto-analysis", style="yellow")
+        return label
 
     def _agent_label(
         self,

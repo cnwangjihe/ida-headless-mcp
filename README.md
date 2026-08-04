@@ -177,6 +177,9 @@ The top pane is a compact `agent/MCP -> IDB session` tree. Stable `A01` and
 `*` marks an agent's current binding. A database shared by several agents is
 shown under each holder, while databases without a holder are grouped under
 `Unattached / Closing IDBs`. Agent age and idle time use minute granularity.
+An active `idalib_open` is shown immediately under its requesting agent as
+`OPENING` with the full input path and elapsed time. It does not receive a
+database alias or count toward refcount until opening succeeds.
 The middle pane contains main pool-process logs at the selected `--log-level`,
 and the bottom line accepts administration commands.
 

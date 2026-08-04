@@ -159,8 +159,10 @@ stdio transport 同时使用。界面会立即显示，IDA 启动验证在后台
 界面生命周期内保持稳定的 agent/database 别名，`*` 表示该 agent 当前绑定的
 database。共享 database 会分别显示在每个持有者下面；无持有者或正在关闭的
 database 归入 `Unattached / Closing IDBs` 分支。Agent 存活和空闲时间按分钟
-粒度显示。中间区域显示主 Pool 进程在当前 `--log-level` 下的日志，底部单行是
-管理控制台。
+粒度显示。正在执行的 `idalib_open` 会立即显示在发起请求的 agent 下方，包括
+`OPENING` 状态、完整输入路径和已耗时；打开成功前不会分配 database 别名，也不
+计入 refcount。中间区域显示主 Pool 进程在当前 `--log-level` 下的日志，底部单行
+是管理控制台。
 
 | 命令 | 行为 |
 |---|---|
