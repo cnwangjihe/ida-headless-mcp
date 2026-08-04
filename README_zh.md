@@ -138,10 +138,43 @@ uv run idalib-pool --log-level debug
 `--ida-dir "C:\Program Files\IDA Professional 9.1"`。
 
 Pool 会在打开 stdio 或网络监听前启动一个临时 backend 并完成工具发现。如果
-IDA 无法加载或初始化，启动命令会立即失败。验证完成后该临时 backend 会被关闭，
-不会作为空闲或预热实例保留。
+IDA 无法加载或初始化，非 TUI 模式会立即退出，TUI 模式则在状态区报告失败。
+验证完成后该临时 backend 会被关闭，不会作为空闲或预热实例保留。
 
 环境变量 `IDA_MCP_AUTH_TOKEN` 与 `--auth-token` 等效。
+
+### 交互式管理界面
+
+使用显式 HTTP listener 启动可选的 Textual TUI：
+
+```sh
+uv run idalib-pool --tui --transport http://127.0.0.1:8750
+```
+
+TUI 模式要求交互式终端，以及包含显式端口的 `http://` transport URL；不能与
+stdio transport 同时使用。界面会立即显示，IDA 启动验证在后台执行。验证失败时
+界面会保留并显示 `FAILED` 状态和诊断日志。
+
+顶部状态区使用紧凑的 `agent/MCP -> IDB session` 树。`A01` 和 `D01` 是在本次
+界面生命周期内保持稳定的 agent/database 别名，`*` 表示该 agent 当前绑定的
+database。共享 database 会分别显示在每个持有者下面；无持有者或正在关闭的
+database 归入 `Unattached / Closing IDBs` 分支。Agent 存活和空闲时间按分钟
+粒度显示。中间区域显示主 Pool 进程在当前 `--log-level` 下的日志，底部单行是
+管理控制台。
+
+| 命令 | 行为 |
+|---|---|
+| `help [command]` | 显示命令帮助。 |
+| `show <Axx\|Dxx>` | 显示完整 ID、路径、映射、进程信息和 backend 日志位置；也支持唯一 ID 前缀。 |
+| `save <Dxx>` | 保存本地或 GUI 管理的 IDB，不改变 lease。 |
+| `close <Dxx>` | 确认后无视 refcount，保存并强制关闭本地 IDB，同时撤销全部映射；不能强制关闭 GUI 管理的 IDB。 |
+| `disconnect <Axx>` | 确认后拒绝该 agent 的新请求，等待活动请求结束，再释放它持有的全部 lease。 |
+| `unregister <Dxx>` | 确认后从 Pool 移除 GUI 管理的 IDB，但不会在 IDA 中关闭它。 |
+| `clear` | 清空当前日志区域。 |
+| `quit` | 停止 listener 并关闭 Pool，同时保存本地 IDB。 |
+
+关系视图由进程内生命周期事件增量更新，不会轮询 MCP Server 或 Pool。每分钟的
+UI timer 只用于刷新存活和空闲时间文本。
 
 ### 运行时日志
 

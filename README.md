@@ -151,11 +151,49 @@ On PowerShell, quote paths containing spaces, for example
 `--ida-dir "C:\Program Files\IDA Professional 9.1"`.
 
 Before opening its stdio or network transport, the pool starts one temporary
-backend and performs tool discovery. Startup fails immediately if IDA cannot be
-loaded or initialized. The temporary validation backend is then closed; it is
-not retained as an idle or prewarmed instance.
+backend and performs tool discovery. If IDA cannot be loaded or initialized,
+non-TUI startup exits immediately and TUI mode reports the failure in its
+status view. The temporary validation backend is then closed; it is not
+retained as an idle or prewarmed instance.
 
 `IDA_MCP_AUTH_TOKEN` is equivalent to `--auth-token`.
+
+### Interactive dashboard
+
+Run the optional Textual dashboard with an explicit HTTP listener:
+
+```sh
+uv run idalib-pool --tui --transport http://127.0.0.1:8750
+```
+
+TUI mode requires an interactive terminal and an `http://` transport URL with
+an explicit port; it cannot be combined with stdio transport. The dashboard is
+visible immediately while IDA startup validation runs in the background. A
+startup failure remains visible as `FAILED` in the dashboard instead of
+discarding the diagnostic log.
+
+The top pane is a compact `agent/MCP -> IDB session` tree. Stable `A01` and
+`D01` aliases identify agents and databases for the lifetime of the dashboard;
+`*` marks an agent's current binding. A database shared by several agents is
+shown under each holder, while databases without a holder are grouped under
+`Unattached / Closing IDBs`. Agent age and idle time use minute granularity.
+The middle pane contains main pool-process logs at the selected `--log-level`,
+and the bottom line accepts administration commands.
+
+| Command | Effect |
+|---|---|
+| `help [command]` | Show command help. |
+| `show <Axx\|Dxx>` | Show full IDs, paths, mappings, process details, and backend-log location. Unique ID prefixes are also accepted. |
+| `save <Dxx>` | Save a local or GUI-managed IDB without changing leases. |
+| `close <Dxx>` | After confirmation, save and force-close a local IDB regardless of refcount, revoking all mappings. GUI-managed IDBs cannot be force-closed. |
+| `disconnect <Axx>` | After confirmation, reject new work for an agent, let active requests drain, then release all of its leases. |
+| `unregister <Dxx>` | After confirmation, detach a GUI-managed IDB from the pool without closing it in IDA. |
+| `clear` | Clear the visible log pane. |
+| `quit` | Stop the listener and shut down the pool, saving local IDBs. |
+
+The relationship view is updated by in-process lifecycle events rather than
+polling the MCP server or pool. A one-minute UI timer only refreshes the
+displayed age and idle durations.
 
 ### Runtime logging
 
