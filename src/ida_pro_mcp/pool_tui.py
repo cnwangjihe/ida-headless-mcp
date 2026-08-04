@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import shlex
 import threading
 import time
 from collections import deque
@@ -10,8 +11,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from rich.text import Text
+from textual import events, work
 from textual.app import App, ComposeResult
-from textual.widgets import RichLog, Tree
+from textual.containers import Horizontal, Vertical
+from textual.screen import ModalScreen
+from textual.widgets import Button, Input, Label, RichLog, Tree
 
 from ida_pro_mcp.admin_events import AdminEvent, AdminEventBus
 
@@ -138,6 +142,66 @@ class StableAliases:
     def database_items(self) -> tuple[tuple[str, str], ...]:
         return tuple(self._databases.items())
 
+    def resolve_agent(self, token: str, available: set[str]) -> str:
+        return self._resolve(token, available, self._agents, "agent")
+
+    def resolve_database(self, token: str, available: set[str]) -> str:
+        return self._resolve(token, available, self._databases, "database")
+
+    def resolve_any(
+        self,
+        token: str,
+        agents: set[str],
+        databases: set[str],
+    ) -> tuple[str, str]:
+        normalized = token.casefold()
+        if normalized.startswith("a"):
+            return "agent", self.resolve_agent(token, agents)
+        if normalized.startswith("d"):
+            return "database", self.resolve_database(token, databases)
+
+        matches = [
+            ("agent", entity_id)
+            for entity_id in agents
+            if entity_id == token or entity_id.startswith(token)
+        ]
+        matches.extend(
+            ("database", entity_id)
+            for entity_id in databases
+            if entity_id == token or entity_id.startswith(token)
+        )
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            raise ValueError(f"Target not found: {token}")
+        raise ValueError(f"Ambiguous target prefix: {token}")
+
+    @staticmethod
+    def _resolve(
+        token: str,
+        available: set[str],
+        aliases: dict[str, str],
+        kind: str,
+    ) -> str:
+        normalized = token.casefold()
+        alias_matches = [
+            entity_id
+            for entity_id, alias in aliases.items()
+            if alias.casefold() == normalized and entity_id in available
+        ]
+        if len(alias_matches) == 1:
+            return alias_matches[0]
+        if token in available:
+            return token
+        prefix_matches = sorted(
+            entity_id for entity_id in available if entity_id.startswith(token)
+        )
+        if len(prefix_matches) == 1:
+            return prefix_matches[0]
+        if not prefix_matches:
+            raise ValueError(f"{kind.title()} not found: {token}")
+        raise ValueError(f"Ambiguous {kind} prefix: {token}")
+
 
 def format_duration(seconds: float) -> str:
     minutes = max(0, int(seconds // 60))
@@ -153,6 +217,52 @@ def format_duration(seconds: float) -> str:
 
 
 TreeTarget = tuple[str, str]
+
+
+class ConfirmActionScreen(ModalScreen[bool]):
+    CSS = """
+    ConfirmActionScreen {
+        align: center middle;
+    }
+
+    #confirm-dialog {
+        width: 72;
+        max-width: 90%;
+        height: auto;
+        padding: 1 2;
+        border: round $warning;
+        background: $surface;
+    }
+
+    #confirm-buttons {
+        width: 100%;
+        height: auto;
+        align-horizontal: right;
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self.message = message
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-dialog"):
+            yield Label(self.message)
+            with Horizontal(id="confirm-buttons"):
+                yield Button("Cancel", id="cancel", variant="default")
+                yield Button("Confirm", id="confirm", variant="error")
+
+    def on_mount(self) -> None:
+        self.query_one("#cancel", Button).focus()
+
+    def on_button_pressed(self, message: Button.Pressed) -> None:
+        self.dismiss(message.button.id == "confirm")
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
 
 
 class PoolTuiApp(App[None]):
@@ -173,22 +283,38 @@ class PoolTuiApp(App[None]):
         height: 1fr;
         border: round $primary;
     }
+
+    #command-input {
+        height: 1;
+        min-height: 1;
+        border: none;
+        padding: 0 1;
+        background: $panel;
+    }
     """
 
     def __init__(
         self,
         event_bus: AdminEventBus,
         log_handler: BufferedLogHandler,
+        *,
+        mcp_server: Any | None = None,
+        pool_manager: Any | None = None,
     ) -> None:
         super().__init__()
         self.event_bus = event_bus
         self.log_handler = log_handler
+        self.mcp_server = mcp_server
+        self.pool_manager = pool_manager
         self.model = DashboardModel()
         self.aliases = StableAliases()
         self.runtime_state = "STARTING"
         self.runtime_detail = ""
         self._collapsed_agents: set[str] = set()
         self._event_bridge_started = False
+        self._command_history: list[str] = []
+        self._history_index = 0
+        self._busy_targets: set[TreeTarget] = set()
 
     def compose(self) -> ComposeResult:
         yield Tree[TreeTarget]("Sessions", id="session-tree")
@@ -199,6 +325,11 @@ class PoolTuiApp(App[None]):
             auto_scroll=True,
             id="main-log",
         )
+        yield Input(
+            placeholder="help | show A01 | save D01 | close D01",
+            compact=True,
+            id="command-input",
+        )
 
     def on_mount(self) -> None:
         tree = self.query_one("#session-tree", Tree)
@@ -208,6 +339,7 @@ class PoolTuiApp(App[None]):
         self._event_bridge_started = True
         self.set_interval(60, self._refresh_durations, name="duration-refresh")
         self.set_interval(0.1, self._drain_logs, name="log-drain")
+        self.query_one("#command-input", Input).focus()
 
     def on_unmount(self) -> None:
         if self._event_bridge_started:
@@ -244,6 +376,295 @@ class PoolTuiApp(App[None]):
             log.write(f"[TUI] {dropped} buffered log record(s) overwritten")
         for record in records:
             log.write(record)
+
+    def on_input_submitted(self, message: Input.Submitted) -> None:
+        command_line = message.value.strip()
+        message.input.value = ""
+        if not command_line:
+            return
+        if not self._command_history or self._command_history[-1] != command_line:
+            self._command_history.append(command_line)
+            del self._command_history[:-100]
+        self._history_index = len(self._command_history)
+        self.execute_command(command_line)
+
+    def on_key(self, event: events.Key) -> None:
+        command_input = self.query_one("#command-input", Input)
+        if not command_input.has_focus or event.key not in {"up", "down"}:
+            return
+        if not self._command_history:
+            return
+        event.stop()
+        event.prevent_default()
+        if event.key == "up":
+            self._history_index = max(0, self._history_index - 1)
+            command_input.value = self._command_history[self._history_index]
+        else:
+            self._history_index = min(
+                len(self._command_history), self._history_index + 1
+            )
+            command_input.value = (
+                self._command_history[self._history_index]
+                if self._history_index < len(self._command_history)
+                else ""
+            )
+        command_input.cursor_position = len(command_input.value)
+
+    def execute_command(self, command_line: str) -> None:
+        try:
+            parts = shlex.split(command_line)
+        except ValueError as e:
+            self._console_error(f"Invalid command: {e}")
+            return
+        if not parts:
+            return
+        command = parts[0].casefold()
+        arguments = parts[1:]
+
+        if command == "help":
+            self._show_help(arguments[0] if arguments else None)
+            return
+        if command == "clear":
+            if arguments:
+                self._console_error("Usage: clear")
+                return
+            self.query_one("#main-log", RichLog).clear()
+            return
+        if command == "quit":
+            if arguments:
+                self._console_error("Usage: quit")
+                return
+            self.exit()
+            return
+        if command == "show":
+            if len(arguments) != 1:
+                self._console_error("Usage: show <agent-or-db>")
+                return
+            self._show_target(arguments[0])
+            return
+        if command not in {"save", "close", "disconnect", "unregister"}:
+            self._console_error(f"Unknown command: {command}; use 'help'")
+            return
+        if len(arguments) != 1:
+            self._console_error(f"Usage: {command} <target>")
+            return
+        if self.mcp_server is None or self.pool_manager is None:
+            self._console_error("Administration controls are not connected")
+            return
+
+        try:
+            if command == "disconnect":
+                entity_id = self.aliases.resolve_agent(
+                    arguments[0], self.model.agent_ids()
+                )
+                target = ("agent", entity_id)
+            else:
+                entity_id = self.aliases.resolve_database(
+                    arguments[0], set(self.model.databases)
+                )
+                target = ("database", entity_id)
+        except ValueError as e:
+            self._console_error(str(e))
+            return
+
+        if target in self._busy_targets:
+            self._console_error(f"Target is already busy: {arguments[0]}")
+            return
+        if command == "save":
+            self._start_admin_action(command, target)
+            return
+
+        confirmation = self._confirmation_message(command, target)
+        self.push_screen(
+            ConfirmActionScreen(confirmation),
+            callback=lambda confirmed: (
+                self._start_admin_action(command, target) if confirmed else None
+            ),
+        )
+
+    def _show_help(self, command: str | None) -> None:
+        help_text = {
+            "show": "show <agent-or-db>  Display full IDs, mappings and paths",
+            "save": "save <db>           Save without changing leases",
+            "close": "close <db>          Force-close a local IDB after confirmation",
+            "disconnect": (
+                "disconnect <agent>  Reject new requests and release all leases"
+            ),
+            "unregister": (
+                "unregister <db>     Detach an external GUI IDB from the pool"
+            ),
+            "clear": "clear               Clear the visible log",
+            "quit": "quit                Stop the TUI",
+        }
+        if command is not None:
+            text = help_text.get(command.casefold())
+            if text is None:
+                self._console_error(f"Unknown command: {command}")
+            else:
+                logger.info(text)
+            return
+        logger.info("Commands:\n%s", "\n".join(help_text.values()))
+
+    def _show_target(self, token: str) -> None:
+        try:
+            kind, entity_id = self.aliases.resolve_any(
+                token,
+                self.model.agent_ids(),
+                set(self.model.databases),
+            )
+        except ValueError as e:
+            self._console_error(str(e))
+            return
+        if kind == "agent":
+            transport = self.model.transports.get(entity_id, {})
+            relation = self.model.contexts.get(entity_id, {})
+            logger.info(
+                "Agent %s\n  context: %s\n  client: %s %s\n  peer: %s\n"
+                "  state: %s\n  active requests: %s\n  bound: %s\n  holds: %s",
+                self.aliases.agent(entity_id),
+                entity_id,
+                transport.get("client_name") or "unknown",
+                transport.get("client_version") or "",
+                transport.get("peer") or "-",
+                transport.get("state") or "ORPHAN",
+                transport.get("active_requests", 0),
+                relation.get("bound_session_id") or "-",
+                ", ".join(relation.get("held_session_ids", [])) or "-",
+            )
+            return
+
+        database = self.model.databases[entity_id]
+        holders = sorted(
+            context_id
+            for context_id, relation in self.model.contexts.items()
+            if entity_id in relation.get("held_session_ids", [])
+        )
+        logger.info(
+            "Database %s\n  session: %s\n  input: %s\n  idb: %s\n"
+            "  type: %s\n  state: %s\n  refcount: %s\n  holders: %s\n"
+            "  instance: %s\n  pid: %s\n  backend log: %s",
+            self.aliases.database(entity_id),
+            entity_id,
+            database.get("input_path") or "-",
+            database.get("idb_path") or "-",
+            "GUI" if database.get("is_external") else "LOCAL",
+            database.get("state") or "UNKNOWN",
+            database.get("refcount", 0),
+            ", ".join(holders) or "-",
+            database.get("instance_index", "-"),
+            database.get("pid") or "-",
+            database.get("log_path") or "-",
+        )
+
+    def _confirmation_message(self, command: str, target: TreeTarget) -> str:
+        kind, entity_id = target
+        if kind == "agent":
+            relation = self.model.contexts.get(entity_id, {})
+            transport = self.model.transports.get(entity_id, {})
+            held = relation.get("held_session_ids", [])
+            return (
+                f"Disconnect {self.aliases.agent(entity_id)}?\n\n"
+                f"Active requests: {transport.get('active_requests', 0)}\n"
+                f"Held IDBs: {', '.join(held) or '-'}\n\n"
+                "New requests will be rejected immediately; active requests drain "
+                "before leases are released."
+            )
+
+        database = self.model.databases.get(entity_id, {})
+        alias = self.aliases.database(entity_id)
+        holders = sorted(
+            self.aliases.agent(context_id)
+            for context_id, relation in self.model.contexts.items()
+            if entity_id in relation.get("held_session_ids", [])
+        )
+        if command == "close":
+            return (
+                f"Force-close {alias}?\n\n"
+                f"Refcount: {database.get('refcount', 0)}\n"
+                f"Agents: {', '.join(holders) or '-'}\n\n"
+                "All mappings will be revoked. This is only allowed for local IDBs."
+            )
+        return (
+            f"Unregister external database {alias}?\n\n"
+            f"Agents: {', '.join(holders) or '-'}\n\n"
+            "The pool connection will close; the IDB remains open in IDA GUI."
+        )
+
+    def _start_admin_action(self, command: str, target: TreeTarget) -> None:
+        if target in self._busy_targets:
+            return
+        self._busy_targets.add(target)
+        logger.info(
+            "Administration action started: command=%s target=%s",
+            command,
+            target[1],
+        )
+        self._run_admin_action(command, target)
+
+    @work(thread=True, exit_on_error=False, group="admin-actions")
+    def _run_admin_action(self, command: str, target: TreeTarget) -> None:
+        result = self._perform_admin_action(command, target)
+        self.call_from_thread(
+            self._complete_admin_action,
+            command,
+            target,
+            result,
+        )
+
+    def _perform_admin_action(
+        self,
+        command: str,
+        target: TreeTarget,
+    ) -> dict[str, Any]:
+        kind, entity_id = target
+        try:
+            if command == "save":
+                result = self.pool_manager.save_session(entity_id)
+            elif command == "close":
+                result = self.pool_manager.close_session(entity_id)
+            elif command == "unregister":
+                result = self.pool_manager.unregister_external(entity_id)
+            elif command == "disconnect":
+                result = self.mcp_server.disconnect_transport_session(entity_id)
+                if (
+                    not result.get("success")
+                    and "not found" in str(result.get("error", "")).casefold()
+                ):
+                    release = self.pool_manager.release_context(entity_id)
+                    result = {
+                        **release,
+                        "success": release.get("success", False),
+                        "orphan_context_cleaned": True,
+                    }
+            else:
+                result = {"success": False, "error": f"Unknown action: {command}"}
+        except Exception as e:
+            result = {"success": False, "error": str(e)}
+        return result
+
+    def _complete_admin_action(
+        self,
+        command: str,
+        target: TreeTarget,
+        result: dict[str, Any],
+    ) -> None:
+        self._busy_targets.discard(target)
+        if result.get("success"):
+            logger.info(
+                "Administration action completed: command=%s target=%s result=%s",
+                command,
+                target[1],
+                result,
+            )
+        else:
+            self._console_error(
+                f"{command} failed for {target[1]}: "
+                f"{result.get('error') or result}"
+            )
+
+    @staticmethod
+    def _console_error(message: str) -> None:
+        logger.error(message)
 
     def _remember_tree_state(self, tree: Tree[TreeTarget]) -> TreeTarget | None:
         selected = tree.cursor_node.data if tree.cursor_node is not None else None

@@ -1,8 +1,9 @@
 import logging
 import threading
 import unittest
+from unittest.mock import MagicMock
 
-from textual.widgets import RichLog, Tree
+from textual.widgets import Input, RichLog, Tree
 
 from ida_pro_mcp.admin_events import AdminEvent, AdminEventBus
 from ida_pro_mcp.pool_tui import (
@@ -133,6 +134,26 @@ class PresentationHelpersTests(unittest.TestCase):
         self.assertEqual(aliases.agent("a"), "A01")
         self.assertEqual(aliases.database("x"), "D01")
         self.assertEqual(aliases.database("y"), "D02")
+
+    def test_aliases_resolve_exact_ids_and_unique_prefixes(self):
+        aliases = StableAliases()
+        aliases.agent("http:agent-alpha")
+        aliases.agent("http:agent-beta")
+        aliases.database("firmware-a")
+        self.assertEqual(
+            aliases.resolve_agent(
+                "A01", {"http:agent-alpha", "http:agent-beta"}
+            ),
+            "http:agent-alpha",
+        )
+        self.assertEqual(
+            aliases.resolve_database("firm", {"firmware-a"}),
+            "firmware-a",
+        )
+        with self.assertRaisesRegex(ValueError, "Ambiguous"):
+            aliases.resolve_agent(
+                "http:agent", {"http:agent-alpha", "http:agent-beta"}
+            )
 
     def test_log_handler_is_bounded_and_reports_overwrite(self):
         handler = BufferedLogHandler(capacity=2)
@@ -327,6 +348,117 @@ class PoolTuiAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             log = app.query_one("#main-log", RichLog)
             self.assertTrue(any("backend ready" in line.text for line in log.lines))
+
+
+class PoolTuiCommandTests(unittest.IsolatedAsyncioTestCase):
+    def _database_event(self, *, external=False):
+        return event(
+            "pool",
+            "ExternalIdbRegistered" if external else "IdbOpened",
+            1,
+            "database-a",
+            session_id="database-a",
+            filename="sample.i64",
+            input_path="/tmp/sample.elf",
+            idb_path="/tmp/sample.i64",
+            is_external=external,
+            state="OPEN",
+            refcount=1,
+            instance_index=0,
+            pid=1234,
+            log_path="/tmp/0.log",
+        )
+
+    async def test_save_action_calls_pool_without_changing_ui_state(self):
+        bus = AdminEventBus()
+        pool = MagicMock()
+        pool.save_session.return_value = {"success": True}
+        app = PoolTuiApp(
+            bus,
+            BufferedLogHandler(),
+            mcp_server=MagicMock(),
+            pool_manager=pool,
+        )
+
+        async with app.run_test(size=(120, 35)) as pilot:
+            app.apply_admin_event(self._database_event())
+            result = app._perform_admin_action(
+                "save", ("database", "database-a")
+            )
+            await pilot.pause()
+
+            self.assertTrue(result["success"])
+            pool.save_session.assert_called_once_with("database-a")
+            self.assertEqual(
+                app.query_one("#command-input", Input).region.height,
+                1,
+            )
+
+    async def test_close_command_requires_confirmation(self):
+        bus = AdminEventBus()
+        pool = MagicMock()
+        pool.close_session.return_value = {"success": True}
+        app = PoolTuiApp(
+            bus,
+            BufferedLogHandler(),
+            mcp_server=MagicMock(),
+            pool_manager=pool,
+        )
+
+        async with app.run_test(size=(120, 35)) as pilot:
+            app.apply_admin_event(self._database_event())
+            app._run_admin_action = MagicMock()
+            try:
+                app.execute_command("close D01")
+                await pilot.pause()
+                app._run_admin_action.assert_not_called()
+
+                await pilot.click("#confirm")
+                await pilot.pause()
+                app._run_admin_action.assert_called_once_with(
+                    "close", ("database", "database-a")
+                )
+            finally:
+                app._busy_targets.clear()
+
+    async def test_disconnect_orphan_falls_back_to_context_release(self):
+        bus = AdminEventBus()
+        pool = MagicMock()
+        pool.release_context.return_value = {
+            "success": True,
+            "released_sessions": ["database-a"],
+        }
+        mcp = MagicMock()
+        mcp.disconnect_transport_session.return_value = {
+            "success": False,
+            "error": "Transport session not found: http:orphan",
+        }
+        app = PoolTuiApp(
+            bus,
+            BufferedLogHandler(),
+            mcp_server=mcp,
+            pool_manager=pool,
+        )
+
+        async with app.run_test(size=(120, 35)):
+            app.apply_admin_event(self._database_event())
+            app.apply_admin_event(
+                event(
+                    "pool",
+                    "ContextMappingChanged",
+                    2,
+                    "http:orphan",
+                    bound_session_id="database-a",
+                    held_session_ids=["database-a"],
+                )
+            )
+            result = app._perform_admin_action(
+                "disconnect", ("agent", "http:orphan")
+            )
+
+            self.assertTrue(result["success"])
+            mcp.disconnect_transport_session.assert_called_once_with("http:orphan")
+            pool.release_context.assert_called_once_with("http:orphan")
 
 
 if __name__ == "__main__":
