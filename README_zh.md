@@ -155,15 +155,17 @@ TUI 模式要求交互式终端，以及包含显式端口的 `http://` transpor
 stdio transport 同时使用。界面会立即显示，IDA 启动验证在后台执行。验证失败时
 界面会保留并显示 `FAILED` 状态和诊断日志。
 
-顶部状态区使用紧凑的 `agent/MCP -> IDB session` 树。`A01` 和 `D01` 是在本次
-界面生命周期内保持稳定的 agent/database 别名，`*` 表示该 agent 当前绑定的
-database。共享 database 会分别显示在每个持有者下面；无持有者或正在关闭的
-database 归入 `Unattached / Closing IDBs` 分支。Agent 存活和空闲时间按分钟
-粒度显示。正在执行的 `idalib_open` 会立即显示在发起请求的 agent 下方，包括
-`OPENING` 状态、完整输入路径和已耗时；打开成功前不会分配 database 别名，也不
-计入 refcount。MCP 请求在 IDA 中执行期间，实际目标 database 行会标记为
+顶部状态区使用紧凑的 `agent/MCP -> IDB session` 树。`A001` 和 `D001` 是在本次
+界面生命周期内保持稳定的 agent/database 别名；数字部分至少三位且没有固定位数
+上限。每个 database 行还会在方括号中显示 MCP client 收到的 `filename_hash` 真实
+session ID，`*` 表示该 agent 当前绑定的 database。共享 database 会分别显示在
+每个持有者下面；无持有者或正在关闭的 database 归入
+`Unattached / Closing IDBs` 分支。Agent 存活和空闲时间按分钟粒度显示。正在执行
+的 `idalib_open` 会立即显示在发起请求的 agent 下方，包括 `OPENING` 状态、完整
+输入路径和已耗时；打开成功前不会分配 database 别名，也不计入 refcount。
+MCP 请求在 IDA 中执行期间，实际目标 database 行会标记为
 `BUSY <tool>`；即使显式 `session_id` 覆盖了 agent 当前绑定，也会标记真实目标。
-每个 database 行还会显示本次 Pool/TUI 进程生命周期内完成的调用总数；`show Dxx`
+每个 database 行还会显示本次 Pool/TUI 进程生命周期内完成的调用总数；`show Dxxx`
 可查看累计、平均和最长执行时间及最近一次调用，内部 backend tool 映射不会拆成
 单独统计。中间区域显示主 Pool 进程在当前 `--log-level` 下的日志，底部单行是
 管理控制台。
@@ -171,15 +173,15 @@ database 归入 `Unattached / Closing IDBs` 分支。Agent 存活和空闲时间
 | 命令 | 行为 |
 |---|---|
 | `help [command]` | 显示命令帮助。 |
-| `show <Axx\|Dxx>` | 显示完整 ID、路径、映射、进程信息和 backend 日志位置；也支持唯一 ID 前缀。 |
-| `save <Dxx>` | 保存本地或 GUI 管理的 IDB，不改变 lease。 |
-| `close <Dxx>` | 确认后无视 refcount，保存并强制关闭本地 IDB，同时撤销全部映射；不能强制关闭 GUI 管理的 IDB。 |
-| `disconnect <Axx>` | 确认后拒绝该 agent 的新请求，等待活动请求结束，再释放它持有的全部 lease。 |
-| `unregister <Dxx>` | 确认后从 Pool 移除 GUI 管理的 IDB，但不会在 IDA 中关闭它。 |
+| `show <Axxx\|Dxxx>` | 显示完整 ID、路径、映射、进程信息和 backend 日志位置；也支持唯一 ID 前缀。 |
+| `save <Dxxx>` | 保存本地或 GUI 管理的 IDB，不改变 lease。 |
+| `close <Dxxx>` | 确认后无视 refcount，保存并强制关闭本地 IDB，同时撤销全部映射；不能强制关闭 GUI 管理的 IDB。 |
+| `disconnect <Axxx>` | 确认后拒绝该 agent 的新请求，等待活动请求结束，再释放它持有的全部 lease。 |
+| `unregister <Dxxx>` | 确认后从 Pool 移除 GUI 管理的 IDB，但不会在 IDA 中关闭它。 |
 | `clear` | 清空当前日志区域。 |
 | `quit` | 停止 listener 并关闭 Pool，同时保存本地 IDB。 |
 
-按 Tab 可以补全命令和当前操作适用的 `Axx`/`Dxx` 目标。存在多个匹配时会先扩展
+按 Tab 可以补全命令和当前操作适用的 `Axxx`/`Dxxx` 目标。存在多个匹配时会先扩展
 公共前缀，继续按 Tab 可循环选择候选项。PageUp/PageDown 可在不离开输入框的
 情况下滚动日志。确认框支持 Tab/Shift+Tab 或方向键选择、Enter/Space 激活、
 `Y` 确认，以及 `N` 或 Escape 取消。

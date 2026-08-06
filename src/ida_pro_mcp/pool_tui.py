@@ -236,14 +236,14 @@ class StableAliases:
     def agent(self, context_id: str) -> str:
         alias = self._agents.get(context_id)
         if alias is None:
-            alias = f"A{len(self._agents) + 1:02d}"
+            alias = f"A{len(self._agents) + 1:03d}"
             self._agents[context_id] = alias
         return alias
 
     def database(self, session_id: str) -> str:
         alias = self._databases.get(session_id)
         if alias is None:
-            alias = f"D{len(self._databases) + 1:02d}"
+            alias = f"D{len(self._databases) + 1:03d}"
             self._databases[session_id] = alias
         return alias
 
@@ -266,9 +266,17 @@ class StableAliases:
         databases: set[str],
     ) -> tuple[str, str]:
         normalized = token.casefold()
-        if normalized.startswith("a"):
+        if any(
+            alias.casefold() == normalized
+            for entity_id, alias in self._agents.items()
+            if entity_id in agents
+        ):
             return "agent", self.resolve_agent(token, agents)
-        if normalized.startswith("d"):
+        if any(
+            alias.casefold() == normalized
+            for entity_id, alias in self._databases.items()
+            if entity_id in databases
+        ):
             return "database", self.resolve_database(token, databases)
 
         matches = [
@@ -496,7 +504,7 @@ class PoolTuiApp(App[None]):
             id="main-log",
         )
         yield Input(
-            placeholder="help | show A01 | save D01 | close D01",
+            placeholder="help | show A001 | save D001 | close D001",
             compact=True,
             id="command-input",
         )
@@ -1238,6 +1246,7 @@ class PoolTuiApp(App[None]):
         label = Text()
         label.append("* " if bound else "  ", style="bold magenta" if bound else None)
         label.append(alias, style="bold magenta")
+        label.append(f" [{session_id}]", style="cyan")
         if database is None:
             label.append(" pending · UNKNOWN", style="yellow")
             return label

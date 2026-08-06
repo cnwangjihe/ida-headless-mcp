@@ -237,13 +237,18 @@ class PresentationHelpersTests(unittest.TestCase):
         self.assertEqual(format_metric_duration(90), "1.5m")
         self.assertEqual(format_metric_duration(2 * 60 * 60), "2.0h")
 
-    def test_aliases_are_stable_and_not_reused(self):
+    def test_aliases_are_stable_unbounded_and_not_reused(self):
         aliases = StableAliases()
-        self.assertEqual(aliases.agent("a"), "A01")
-        self.assertEqual(aliases.agent("b"), "A02")
-        self.assertEqual(aliases.agent("a"), "A01")
-        self.assertEqual(aliases.database("x"), "D01")
-        self.assertEqual(aliases.database("y"), "D02")
+        self.assertEqual(aliases.agent("a"), "A001")
+        self.assertEqual(aliases.agent("b"), "A002")
+        self.assertEqual(aliases.agent("a"), "A001")
+        self.assertEqual(aliases.database("x"), "D001")
+        self.assertEqual(aliases.database("y"), "D002")
+        for index in range(998):
+            aliases.agent(f"agent-{index}")
+            aliases.database(f"database-{index}")
+        self.assertEqual(aliases.agent("agent-997"), "A1000")
+        self.assertEqual(aliases.database("database-997"), "D1000")
 
     def test_aliases_resolve_exact_ids_and_unique_prefixes(self):
         aliases = StableAliases()
@@ -252,7 +257,7 @@ class PresentationHelpersTests(unittest.TestCase):
         aliases.database("firmware-a")
         self.assertEqual(
             aliases.resolve_agent(
-                "A01", {"http:agent-alpha", "http:agent-beta"}
+                "A001", {"http:agent-alpha", "http:agent-beta"}
             ),
             "http:agent-alpha",
         )
@@ -264,6 +269,19 @@ class PresentationHelpersTests(unittest.TestCase):
             aliases.resolve_agent(
                 "http:agent", {"http:agent-alpha", "http:agent-beta"}
             )
+
+    def test_database_name_starting_with_alias_letter_resolves_as_session(self):
+        aliases = StableAliases()
+        aliases.agent("http:agent-alpha")
+
+        self.assertEqual(
+            aliases.resolve_any(
+                "a_binary_deadbeef",
+                {"http:agent-alpha"},
+                {"a_binary_deadbeef"},
+            ),
+            ("database", "a_binary_deadbeef"),
+        )
 
     def test_log_handler_is_bounded_and_reports_overwrite(self):
         handler = BufferedLogHandler(capacity=2)
@@ -432,7 +450,8 @@ class PoolTuiAppTests(unittest.IsolatedAsyncioTestCase):
                 for node in agent_nodes
                 for child in node.children
             ]
-            self.assertEqual(sum("D01" in label for label in child_labels), 2)
+            self.assertEqual(sum("D001" in label for label in child_labels), 2)
+            self.assertEqual(sum("[shared-db]" in label for label in child_labels), 2)
             self.assertEqual(sum(label.startswith("* ") for label in child_labels), 1)
 
     async def test_tree_shows_in_progress_open_under_requesting_agent(self):
@@ -480,7 +499,7 @@ class PoolTuiAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("/firmware/router.i64", agent.children[0].label.plain)
             self.assertEqual(app.aliases.database_items(), ())
             with self.assertLogs("ida_mcp.tui", level="INFO") as captured:
-                app.execute_command("show A01")
+                app.execute_command("show A001")
             self.assertIn("/firmware/router.i64", captured.output[0])
 
             app.apply_admin_event(
@@ -524,7 +543,10 @@ class PoolTuiAppTests(unittest.IsolatedAsyncioTestCase):
                 if node.data == ("agent", "http:agent-a")
             )
             self.assertEqual(len(agent.children), 1)
-            self.assertIn("D01 router.i64", agent.children[0].label.plain)
+            self.assertIn(
+                "D001 [database-a] router.i64",
+                agent.children[0].label.plain,
+            )
             self.assertIn("calls 1", agent.children[0].label.plain)
 
     async def test_tree_marks_the_target_database_busy(self):
@@ -588,11 +610,14 @@ class PoolTuiAppTests(unittest.IsolatedAsyncioTestCase):
                 if node.data == ("agent", "http:agent-a")
             )
             database_label = agent.children[0].label.plain
-            self.assertIn("D01 router.i64", database_label)
+            self.assertIn("D001 [database-a] router.i64", database_label)
             self.assertIn("BUSY decompile", database_label)
-            self.assertEqual(app.aliases.database_items(), (("database-a", "D01"),))
+            self.assertEqual(
+                app.aliases.database_items(),
+                (("database-a", "D001"),),
+            )
             with self.assertLogs("ida_mcp.tui", level="INFO") as captured:
-                app.execute_command("show D01")
+                app.execute_command("show D001")
             self.assertIn("request:1234 decompile@http:agent-a", captured.output[0])
 
             app.apply_admin_event(
@@ -619,7 +644,7 @@ class PoolTuiAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("BUSY", agent.children[0].label.plain)
             self.assertIn("calls 1", agent.children[0].label.plain)
             with self.assertLogs("ida_mcp.tui", level="INFO") as captured:
-                app.execute_command("show D01")
+                app.execute_command("show D001")
             self.assertIn("calls: 1", captured.output[0])
             self.assertIn("total 2.5s · avg 2.5s · max 2.5s", captured.output[0])
 
@@ -786,17 +811,17 @@ class PoolTuiCommandTests(unittest.IsolatedAsyncioTestCase):
             command_input.value = "disconnect A"
             command_input.cursor_position = len(command_input.value)
             await pilot.press("tab")
-            self.assertEqual(command_input.value, "disconnect A01 ")
+            self.assertEqual(command_input.value, "disconnect A001 ")
 
             command_input.value = "close D"
             command_input.cursor_position = len(command_input.value)
             await pilot.press("tab")
-            self.assertEqual(command_input.value, "close D01 ")
+            self.assertEqual(command_input.value, "close D001 ")
 
             command_input.value = "unregister D"
             command_input.cursor_position = len(command_input.value)
             await pilot.press("tab")
-            self.assertEqual(command_input.value, "unregister D02 ")
+            self.assertEqual(command_input.value, "unregister D002 ")
 
     async def test_tab_expands_common_prefix_then_cycles_candidates(self):
         app = PoolTuiApp(AdminEventBus(), BufferedLogHandler())
@@ -828,7 +853,7 @@ class PoolTuiCommandTests(unittest.IsolatedAsyncioTestCase):
             app.apply_admin_event(self._database_event())
             app._run_admin_action = MagicMock()
             try:
-                app.execute_command("close D01")
+                app.execute_command("close D001")
                 await pilot.pause()
                 app._run_admin_action.assert_not_called()
 
@@ -852,7 +877,7 @@ class PoolTuiCommandTests(unittest.IsolatedAsyncioTestCase):
             app.apply_admin_event(self._database_event())
             app._run_admin_action = MagicMock()
             try:
-                app.execute_command("close D01")
+                app.execute_command("close D001")
                 await pilot.pause()
                 self.assertIsInstance(app.screen, ConfirmActionScreen)
                 self.assertEqual(app.screen.focused.id, "cancel")
@@ -881,13 +906,13 @@ class PoolTuiCommandTests(unittest.IsolatedAsyncioTestCase):
             app.apply_admin_event(self._database_event())
             app._run_admin_action = MagicMock()
             try:
-                app.execute_command("close D01")
+                app.execute_command("close D001")
                 await pilot.pause()
                 await pilot.press("n")
                 await pilot.pause()
                 app._run_admin_action.assert_not_called()
 
-                app.execute_command("close D01")
+                app.execute_command("close D001")
                 await pilot.pause()
                 await pilot.press("y")
                 await pilot.pause()
@@ -910,7 +935,7 @@ class PoolTuiCommandTests(unittest.IsolatedAsyncioTestCase):
             app.apply_admin_event(self._database_event(external=True))
             app.push_screen = MagicMock()
             with self.assertLogs("ida_mcp.tui", level="ERROR") as captured:
-                app.execute_command("close D01")
+                app.execute_command("close D001")
             self.assertIn("cannot be force-closed", captured.output[0])
             app.push_screen.assert_not_called()
 
@@ -925,7 +950,7 @@ class PoolTuiCommandTests(unittest.IsolatedAsyncioTestCase):
             )
             app.apply_admin_event(self._database_event(revision=3))
             with self.assertLogs("ida_mcp.tui", level="ERROR") as captured:
-                app.execute_command("unregister D01")
+                app.execute_command("unregister D001")
             self.assertIn("cannot be unregistered", captured.output[0])
             app.push_screen.assert_not_called()
 

@@ -172,8 +172,10 @@ visible immediately while IDA startup validation runs in the background. A
 startup failure remains visible as `FAILED` in the dashboard instead of
 discarding the diagnostic log.
 
-The top pane is a compact `agent/MCP -> IDB session` tree. Stable `A01` and
-`D01` aliases identify agents and databases for the lifetime of the dashboard;
+The top pane is a compact `agent/MCP -> IDB session` tree. Stable `A001` and
+`D001` aliases identify agents and databases. Their numeric part is padded to at
+least three digits and grows without a fixed upper bound. Each database row also
+shows the actual `filename_hash` session ID returned to MCP clients in brackets;
 `*` marks an agent's current binding. A database shared by several agents is
 shown under each holder, while databases without a holder are grouped under
 `Unattached / Closing IDBs`. Agent age and idle time use minute granularity.
@@ -183,7 +185,7 @@ database alias or count toward refcount until opening succeeds.
 While an MCP request is executing in IDA, its actual target database row is
 marked `BUSY <tool>`, including when an explicit `session_id` overrides the
 agent's current binding. Each database row also shows its completed call count.
-`show Dxx` reports cumulative, average, and longest execution time plus the
+`show Dxxx` reports cumulative, average, and longest execution time plus the
 most recent call for the lifetime of the current Pool/TUI process; internal
 backend tool mappings are not broken out as separate statistics.
 The middle pane contains main pool-process logs at the selected `--log-level`,
@@ -192,15 +194,15 @@ and the bottom line accepts administration commands.
 | Command | Effect |
 |---|---|
 | `help [command]` | Show command help. |
-| `show <Axx\|Dxx>` | Show full IDs, paths, mappings, process details, and backend-log location. Unique ID prefixes are also accepted. |
-| `save <Dxx>` | Save a local or GUI-managed IDB without changing leases. |
-| `close <Dxx>` | After confirmation, save and force-close a local IDB regardless of refcount, revoking all mappings. GUI-managed IDBs cannot be force-closed. |
-| `disconnect <Axx>` | After confirmation, reject new work for an agent, let active requests drain, then release all of its leases. |
-| `unregister <Dxx>` | After confirmation, detach a GUI-managed IDB from the pool without closing it in IDA. |
+| `show <Axxx\|Dxxx>` | Show full IDs, paths, mappings, process details, and backend-log location. Unique ID prefixes are also accepted. |
+| `save <Dxxx>` | Save a local or GUI-managed IDB without changing leases. |
+| `close <Dxxx>` | After confirmation, save and force-close a local IDB regardless of refcount, revoking all mappings. GUI-managed IDBs cannot be force-closed. |
+| `disconnect <Axxx>` | After confirmation, reject new work for an agent, let active requests drain, then release all of its leases. |
+| `unregister <Dxxx>` | After confirmation, detach a GUI-managed IDB from the pool without closing it in IDA. |
 | `clear` | Clear the visible log pane. |
 | `quit` | Stop the listener and shut down the pool, saving local IDBs. |
 
-Press Tab to complete commands and context-appropriate `Axx`/`Dxx` targets.
+Press Tab to complete commands and context-appropriate `Axxx`/`Dxxx` targets.
 Common prefixes are expanded first; repeated Tab presses cycle ambiguous
 matches. PageUp/PageDown scroll the log without leaving the command input.
 Confirmation dialogs support Tab/Shift+Tab or arrow-key selection, Enter/Space
