@@ -13,6 +13,7 @@ from ida_pro_mcp.pool_tui import (
     PoolTuiApp,
     StableAliases,
     format_duration,
+    format_memory_size,
     format_metric_duration,
 )
 
@@ -237,6 +238,13 @@ class PresentationHelpersTests(unittest.TestCase):
         self.assertEqual(format_metric_duration(90), "1.5m")
         self.assertEqual(format_metric_duration(2 * 60 * 60), "2.0h")
 
+    def test_memory_size_uses_compact_binary_units(self):
+        self.assertEqual(format_memory_size(None), "-")
+        self.assertEqual(format_memory_size(0), "0 B")
+        self.assertEqual(format_memory_size(1536), "1.5 KiB")
+        self.assertEqual(format_memory_size(512 * 1024 * 1024), "512 MiB")
+        self.assertEqual(format_memory_size(3 * 1024 * 1024 * 1024), "3.0 GiB")
+
     def test_aliases_are_stable_unbounded_and_not_reused(self):
         aliases = StableAliases()
         self.assertEqual(aliases.agent("a"), "A001")
@@ -417,6 +425,7 @@ class PoolTuiAppTests(unittest.IsolatedAsyncioTestCase):
                     is_external=False,
                     state="OPEN",
                     refcount=2,
+                    memory_rss_bytes=512 * 1024 * 1024,
                 )
             )
             for revision, context_id in enumerate(
@@ -452,6 +461,7 @@ class PoolTuiAppTests(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertEqual(sum("D001" in label for label in child_labels), 2)
             self.assertEqual(sum("[shared-db]" in label for label in child_labels), 2)
+            self.assertEqual(sum("RSS 512 MiB" in label for label in child_labels), 2)
             self.assertEqual(sum(label.startswith("* ") for label in child_labels), 1)
 
     async def test_tree_shows_in_progress_open_under_requesting_agent(self):
@@ -599,6 +609,7 @@ class PoolTuiAppTests(unittest.IsolatedAsyncioTestCase):
                     context_id="http:agent-a",
                     operation="decompile",
                     started_at=now,
+                    memory_rss_bytes=768 * 1024 * 1024,
                 )
             )
             await pilot.pause()
@@ -611,6 +622,7 @@ class PoolTuiAppTests(unittest.IsolatedAsyncioTestCase):
             )
             database_label = agent.children[0].label.plain
             self.assertIn("D001 [database-a] router.i64", database_label)
+            self.assertIn("RSS 768 MiB", database_label)
             self.assertIn("BUSY decompile", database_label)
             self.assertEqual(
                 app.aliases.database_items(),
@@ -632,6 +644,7 @@ class PoolTuiAppTests(unittest.IsolatedAsyncioTestCase):
                     started_at=now,
                     finished_at=now + 2.5,
                     success=True,
+                    memory_rss_bytes=1024 * 1024 * 1024,
                 )
             )
             await pilot.pause()
@@ -642,6 +655,7 @@ class PoolTuiAppTests(unittest.IsolatedAsyncioTestCase):
                 if node.data == ("agent", "http:agent-a")
             )
             self.assertNotIn("BUSY", agent.children[0].label.plain)
+            self.assertIn("RSS 1.0 GiB", agent.children[0].label.plain)
             self.assertIn("calls 1", agent.children[0].label.plain)
             with self.assertLogs("ida_mcp.tui", level="INFO") as captured:
                 app.execute_command("show D001")

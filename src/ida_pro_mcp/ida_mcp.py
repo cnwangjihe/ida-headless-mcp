@@ -15,6 +15,11 @@ import ida_nalt
 import ida_loader
 from typing import TYPE_CHECKING, Callable
 
+try:
+    import psutil
+except ImportError:  # Keep the plugin usable if IDAPython lacks this dependency.
+    psutil = None
+
 if TYPE_CHECKING:
     from . import ida_mcp
 
@@ -24,6 +29,19 @@ PLUGIN_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 PLUGIN_LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 _PLUGIN_HANDLER_MARKER = "_ida_mcp_plugin_handler"
 logger = logging.getLogger("ida_mcp.plugin")
+
+POOL_METRICS_FIELD = "_ida_pool_metrics"
+
+
+def current_process_metrics() -> dict[str, int]:
+    metrics: dict[str, int] = {}
+    if psutil is None:
+        return metrics
+    try:
+        metrics["memory_rss_bytes"] = int(psutil.Process().memory_info().rss)
+    except (psutil.Error, OSError, ValueError):
+        pass
+    return metrics
 
 
 def configure_plugin_logging(verbose: bool = False) -> logging.Handler:
@@ -205,6 +223,7 @@ class PoolConnector:
             "input_path": input_path,
             "idb_path": idb_path,
             "allow_duplicate_input": allow_duplicate_input,
+            "process_metrics": current_process_metrics(),
         }))
         raw = self.ws.recv()
         self._reg_response = json.loads(raw)
@@ -245,6 +264,8 @@ class PoolConnector:
                 response = self.mcp_server.registry.dispatch(msg)
                 if response is not None:
                     try:
+                        response = dict(response)
+                        response[POOL_METRICS_FIELD] = current_process_metrics()
                         self.ws.send(json.dumps(response))
                     except Exception:
                         break

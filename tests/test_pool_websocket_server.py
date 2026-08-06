@@ -40,6 +40,7 @@ class _DummyPool:
             "input_path": input_path,
             "idb_path": idb_path,
             "allow_duplicate_input": allow_duplicate_input,
+            "memory_rss_bytes": ws_bridge.memory_rss_bytes,
         }
         return {
             "success": True,
@@ -247,6 +248,9 @@ class TestPoolWebSocketServer(unittest.TestCase):
                         "idb_path": r"C:\work\a.i64",
                         "session_id": "win-gui",
                         "allow_duplicate_input": False,
+                        "process_metrics": {
+                            "memory_rss_bytes": 640 * 1024 * 1024,
+                        },
                     }
                 )
             )
@@ -261,6 +265,10 @@ class TestPoolWebSocketServer(unittest.TestCase):
 
         self.assertEqual(pool.registered["input_path"], r"C:\work\a.exe")
         self.assertEqual(pool.registered["idb_path"], r"C:\work\a.i64")
+        self.assertEqual(
+            pool.registered["memory_rss_bytes"],
+            640 * 1024 * 1024,
+        )
         self.assertNotIn("session_id", pool.registered)
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline and not pool.unregistered:

@@ -184,7 +184,9 @@ An active `idalib_open` is shown immediately under its requesting agent as
 database alias or count toward refcount until opening succeeds.
 While an MCP request is executing in IDA, its actual target database row is
 marked `BUSY <tool>`, including when an explicit `session_id` overrides the
-agent's current binding. Each database row also shows its completed call count.
+agent's current binding. Each database row also shows the corresponding IDA
+process's current resident memory (`RSS`) and its completed call count. RSS is
+sampled when IDB events occur rather than polled independently.
 `show Dxxx` reports cumulative, average, and longest execution time plus the
 most recent call for the lifetime of the current Pool/TUI process; internal
 backend tool mappings are not broken out as separate statistics.

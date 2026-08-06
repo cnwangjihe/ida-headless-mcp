@@ -37,6 +37,31 @@ class _FakeWebSocket:
 
 
 class TestExternalInstanceBridge(unittest.TestCase):
+    def test_response_metrics_are_retained_and_removed_from_jsonrpc_result(self):
+        ws = _FakeWebSocket(
+            [],
+            response_factory=lambda request: {
+                "jsonrpc": "2.0",
+                "result": {"ok": True},
+                "id": request["id"],
+                "_ida_pool_metrics": {
+                    "memory_rss_bytes": 640 * 1024 * 1024,
+                },
+            },
+        )
+        bridge = ExternalInstanceBridge(ws)
+        thread = threading.Thread(target=bridge.run_loop, daemon=True)
+        thread.start()
+        self.addCleanup(lambda: setattr(bridge, "alive", False))
+
+        response = bridge.forward_request(
+            {"jsonrpc": "2.0", "method": "tools/list", "id": 7},
+            timeout=2,
+        )
+
+        self.assertNotIn("_ida_pool_metrics", response)
+        self.assertEqual(bridge.memory_rss_bytes, 640 * 1024 * 1024)
+
     def test_control_message_during_forward_does_not_replace_response(self):
         ws = _FakeWebSocket(
             [

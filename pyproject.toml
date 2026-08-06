@@ -21,6 +21,7 @@ classifiers = [
 ]
 dependencies = [
     "idapro>=0.0.7",
+    "psutil>=5.9.0",
     "textual>=8.2.8,<9",
     "tomli-w>=1.0.0",
     "websockets==16.0",

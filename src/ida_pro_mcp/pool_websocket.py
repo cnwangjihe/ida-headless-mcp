@@ -19,6 +19,8 @@ import time
 
 logger = logging.getLogger("ida_mcp.pool.websocket")
 
+POOL_METRICS_FIELD = "_ida_pool_metrics"
+
 
 class ExternalInstanceBridge:
     """Wraps a server-side WebSocket connection for pool↔plugin forwarding.
@@ -39,6 +41,19 @@ class ExternalInstanceBridge:
         self._notification_queue: queue.Queue[dict] = queue.Queue()
         self._request_event = threading.Event()
         self._next_request_id = 1
+        self.memory_rss_bytes: int | None = None
+
+    def update_process_metrics(self, metrics: object) -> None:
+        """Retain validated metrics reported by the external IDA process."""
+        if not isinstance(metrics, dict):
+            return
+        memory_rss_bytes = metrics.get("memory_rss_bytes")
+        if (
+            isinstance(memory_rss_bytes, int)
+            and not isinstance(memory_rss_bytes, bool)
+            and memory_rss_bytes >= 0
+        ):
+            self.memory_rss_bytes = memory_rss_bytes
 
     def forward_request(self, request: dict, timeout: float = 300) -> dict:
         """Send a JSON-RPC request to the plugin and return the response.
@@ -173,6 +188,7 @@ class ExternalInstanceBridge:
                     expected_id,
                 )
                 continue
+            self.update_process_metrics(msg.pop(POOL_METRICS_FIELD, None))
             return msg
         raise ConnectionError("External instance disconnected")
 

@@ -36,6 +36,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
+import psutil
+
 from ida_pro_mcp.admin_events import AdminEvent, AdminEventSink
 from ida_pro_mcp.backend_bootstrap import run_backend_process
 from ida_pro_mcp.backend_ipc import (
@@ -84,6 +86,17 @@ def _session_base_name(path: str) -> str:
         name = root
     name = _SESSION_NAME_RE.sub("_", name).strip("._-")
     return name or "session"
+
+
+def _read_process_rss_bytes(pid: int | None) -> int | None:
+    """Return a process's current resident memory, if it is still readable."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        return int(psutil.Process(pid).memory_info().rss)
+    except (psutil.Error, OSError, ValueError):
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -141,6 +154,21 @@ class InstanceInfo:
             return self.process.is_alive()
         except (AssertionError, ValueError):
             return False
+
+    @property
+    def process_id(self) -> int | None:
+        pid = getattr(self.process, "pid", None)
+        return pid if isinstance(pid, int) and not isinstance(pid, bool) else None
+
+    def get_memory_rss_bytes(self) -> int | None:
+        if self.is_external:
+            rss = getattr(self.ws_bridge, "memory_rss_bytes", None)
+            return (
+                rss
+                if isinstance(rss, int) and not isinstance(rss, bool)
+                else None
+            )
+        return _read_process_rss_bytes(self.process_id)
 
 
 # ---------------------------------------------------------------------------
@@ -682,7 +710,10 @@ class PoolManager:
             for context_id, session_id in self.sr._context_bindings.items()
             if session_id == sess.session_id
         )
-        process = inst.process if inst is not None else None
+        process_id = inst.process_id if inst is not None else None
+        memory_rss_bytes = (
+            inst.get_memory_rss_bytes() if inst is not None else None
+        )
         return self._make_admin_event_locked(
             kind,
             sess.session_id,
@@ -699,7 +730,8 @@ class PoolManager:
                 "refcount": self.sr.get_refcount(sess.session_id),
                 "holder_context_ids": holders,
                 "bound_context_ids": bound_contexts,
-                "pid": getattr(process, "pid", None),
+                "pid": process_id,
+                "memory_rss_bytes": memory_rss_bytes,
                 "log_path": inst.log_path if inst is not None else None,
             },
         )
@@ -767,6 +799,7 @@ class PoolManager:
         request_id: int | str | None,
         started_at: float,
         *,
+        memory_rss_bytes: int | None = None,
         error: str | None = None,
     ) -> AdminEvent:
         payload: dict[str, Any] = {
@@ -777,6 +810,7 @@ class PoolManager:
             "request_id": request_id,
             "state": "BUSY" if kind == "IdbRequestStarted" else "FINISHED",
             "started_at": started_at,
+            "memory_rss_bytes": memory_rss_bytes,
         }
         if kind == "IdbRequestFinished":
             payload.update(
@@ -827,6 +861,7 @@ class PoolManager:
                     operation,
                     request_id,
                     started_at,
+                    memory_rss_bytes=inst.get_memory_rss_bytes(),
                 )
         if tracked is None:
             yield
@@ -850,6 +885,7 @@ class PoolManager:
                     operation,
                     request_id,
                     started_at,
+                    memory_rss_bytes=inst.get_memory_rss_bytes(),
                     error=error,
                 )
             self._emit_admin_events([finished_event])

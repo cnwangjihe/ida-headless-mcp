@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from ida_pro_mcp import idalib_pool_server
 from ida_pro_mcp.idalib_pool_manager import (
@@ -199,7 +199,14 @@ class PoolAdministrationEventTests(unittest.TestCase):
     def setUp(self):
         self.events = []
 
-    def test_acquire_and_release_context_emit_complete_relationships(self):
+    @patch(
+        "ida_pro_mcp.idalib_pool_manager._read_process_rss_bytes",
+        return_value=384 * 1024 * 1024,
+    )
+    def test_acquire_and_release_context_emit_complete_relationships(
+        self,
+        _read_rss,
+    ):
         pool = self._make_pool()
         process = MagicMock()
         process.is_alive.return_value = True
@@ -224,6 +231,7 @@ class PoolAdministrationEventTests(unittest.TestCase):
         self.assertEqual(idb["holder_context_ids"], ["http:agent-a"])
         self.assertEqual(idb["refcount"], 1)
         self.assertEqual(idb["pid"], 4242)
+        self.assertEqual(idb["memory_rss_bytes"], 384 * 1024 * 1024)
         self.assertEqual(idb["log_path"], "/tmp/fake-pool/0.log")
         context = self.events[1].payload
         self.assertEqual(context["bound_session_id"], "s1")
@@ -416,6 +424,7 @@ class PoolAdministrationEventTests(unittest.TestCase):
         pool.admin_event_sink = self.events.append
         bridge = MagicMock()
         bridge.alive = True
+        bridge.memory_rss_bytes = 640 * 1024 * 1024
 
         result = pool.register_external(
             bridge, "/tmp/gui.elf", "/tmp/gui.i64"
@@ -425,6 +434,10 @@ class PoolAdministrationEventTests(unittest.TestCase):
         self.assertEqual(self.events[-1].kind, "ExternalIdbRegistered")
         self.assertTrue(self.events[-1].payload["is_external"])
         self.assertEqual(self.events[-1].payload["refcount"], 1)
+        self.assertEqual(
+            self.events[-1].payload["memory_rss_bytes"],
+            640 * 1024 * 1024,
+        )
 
         pool.sr.acquire_context_session("http:agent-a", session_id)
         pool.sr.bind_context("http:agent-a", session_id)

@@ -122,13 +122,25 @@ class DashboardModel:
             return True
 
         if entity_type == "request":
+            session_id = event.payload.get("session_id")
+            memory_rss_bytes = event.payload.get("memory_rss_bytes")
+            if (
+                isinstance(session_id, str)
+                and session_id in self.databases
+                and isinstance(memory_rss_bytes, int)
+                and not isinstance(memory_rss_bytes, bool)
+            ):
+                self.databases[session_id]["memory_rss_bytes"] = memory_rss_bytes
             if event.kind == "IdbRequestFinished":
                 request = self.requests.pop(event.entity_id, None)
                 details = {**(request or {}), **event.payload}
-                session_id = details.get("session_id")
-                if isinstance(session_id, str) and session_id in self.databases:
+                completed_session_id = details.get("session_id")
+                if (
+                    isinstance(completed_session_id, str)
+                    and completed_session_id in self.databases
+                ):
                     self._record_session_call(
-                        session_id,
+                        completed_session_id,
                         str(details.get("operation") or "request"),
                         details.get("context_id"),
                         details.get("started_at"),
@@ -344,6 +356,24 @@ def format_metric_duration(seconds: float) -> str:
     if seconds < 60 * 60:
         return f"{seconds / 60:.1f}m"
     return f"{seconds / (60 * 60):.1f}h"
+
+
+def format_memory_size(byte_count: int | None) -> str:
+    if byte_count is None or byte_count < 0:
+        return "-"
+    try:
+        value = float(byte_count)
+    except OverflowError:
+        return "-"
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} B"
+            precision = 0 if value >= 100 else 1
+            return f"{value:.{precision}f} {unit}"
+        value /= 1024
+    return "-"
 
 
 TreeTarget = tuple[str, str]
@@ -1255,6 +1285,16 @@ class PoolTuiApp(App[None]):
         state = database.get("state", "OPEN")
         refcount = database.get("refcount", 0)
         label.append(f" {filename} · {kind} · {state} · ref {refcount}")
+        memory_rss_bytes = database.get("memory_rss_bytes")
+        label.append(
+            " · RSS "
+            + format_memory_size(
+                memory_rss_bytes
+                if isinstance(memory_rss_bytes, int)
+                and not isinstance(memory_rss_bytes, bool)
+                else None
+            )
+        )
         stats = self.model.session_stats.get(session_id, {})
         label.append(f" · calls {int(stats.get('completed_calls', 0))}")
         busy_requests = sorted(

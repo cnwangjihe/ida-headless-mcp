@@ -165,7 +165,9 @@ session ID，`*` 表示该 agent 当前绑定的 database。共享 database 会�
 输入路径和已耗时；打开成功前不会分配 database 别名，也不计入 refcount。
 MCP 请求在 IDA 中执行期间，实际目标 database 行会标记为
 `BUSY <tool>`；即使显式 `session_id` 覆盖了 agent 当前绑定，也会标记真实目标。
-每个 database 行还会显示本次 Pool/TUI 进程生命周期内完成的调用总数；`show Dxxx`
+每个 database 行还会显示对应 IDA 进程当前的驻留内存（`RSS`）和本次 Pool/TUI
+进程生命周期内完成的调用总数。RSS 只在 IDB 事件发生时采样，不进行独立轮询；
+`show Dxxx`
 可查看累计、平均和最长执行时间及最近一次调用，内部 backend tool 映射不会拆成
 单独统计。中间区域显示主 Pool 进程在当前 `--log-level` 下的日志，底部单行是
 管理控制台。

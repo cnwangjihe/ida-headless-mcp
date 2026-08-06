@@ -981,6 +981,8 @@ def build_pool_handler_class(
                     ws.send(json.dumps({"success": False, "error": "Expected register message"}))
                     return
 
+                bridge.update_process_metrics(reg.get("process_metrics"))
+
                 result = pool.register_external(
                     ws_bridge=bridge,
                     input_path=reg.get("input_path", ""),
