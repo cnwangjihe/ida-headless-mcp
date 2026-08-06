@@ -1142,7 +1142,15 @@ class PoolTuiApp(App[None]):
         referenced_openings: set[str] = set()
         now = time.monotonic()
 
-        ordered_agents = sorted(agent_ids, key=self.aliases.agent)
+        def agent_sort_key(context_id: str) -> tuple[bool, str]:
+            relation = self.model.contexts.get(context_id, {})
+            has_idb_session = bool(
+                relation.get("bound_session_id")
+                or relation.get("held_session_ids")
+            )
+            return not has_idb_session, self.aliases.agent(context_id)
+
+        ordered_agents = sorted(agent_ids, key=agent_sort_key)
         for context_id in ordered_agents:
             alias = self.aliases.agent(context_id)
             transport = self.model.transports.get(context_id)

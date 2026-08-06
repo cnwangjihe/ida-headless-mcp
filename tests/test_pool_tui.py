@@ -464,6 +464,65 @@ class PoolTuiAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sum("RSS 512 MiB" in label for label in child_labels), 2)
             self.assertEqual(sum(label.startswith("* ") for label in child_labels), 1)
 
+    async def test_tree_sorts_agents_without_idb_sessions_last(self):
+        app = PoolTuiApp(AdminEventBus(), BufferedLogHandler())
+
+        async with app.run_test(size=(120, 35)) as pilot:
+            now = __import__("time").monotonic()
+            for revision, context_id in enumerate(
+                ("http:empty-agent", "http:bound-agent"),
+                start=1,
+            ):
+                app.apply_admin_event(
+                    event(
+                        "mcp",
+                        "TransportOpened",
+                        revision,
+                        context_id,
+                        transport="http",
+                        client_name=context_id,
+                        state="OPEN",
+                        created_at=now,
+                        last_activity=now,
+                        active_requests=0,
+                    )
+                )
+            app.apply_admin_event(
+                event(
+                    "pool",
+                    "IdbOpened",
+                    3,
+                    "database-a",
+                    filename="router.i64",
+                    state="OPEN",
+                    refcount=1,
+                )
+            )
+            app.apply_admin_event(
+                event(
+                    "pool",
+                    "ContextMappingChanged",
+                    4,
+                    "http:bound-agent",
+                    bound_session_id="database-a",
+                    held_session_ids=["database-a"],
+                )
+            )
+            await pilot.pause()
+
+            tree = app.query_one("#session-tree", Tree)
+            agent_nodes = [
+                node
+                for node in tree.root.children
+                if node.data and node.data[0] == "agent"
+            ]
+            self.assertEqual(
+                [node.data[1] for node in agent_nodes],
+                ["http:bound-agent", "http:empty-agent"],
+            )
+            self.assertTrue(agent_nodes[0].label.plain.startswith("A002 "))
+            self.assertTrue(agent_nodes[1].label.plain.startswith("A001 "))
+
     async def test_tree_shows_in_progress_open_under_requesting_agent(self):
         app = PoolTuiApp(AdminEventBus(), BufferedLogHandler())
 
