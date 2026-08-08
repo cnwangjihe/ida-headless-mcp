@@ -34,6 +34,8 @@ TUI_COMMANDS = (
     "quit",
 )
 
+CTRL_D_EXIT_WINDOW_SECONDS = 2.0
+
 
 class BufferedLogHandler(logging.Handler):
     """A bounded logging handler which may be drained from the UI thread."""
@@ -523,6 +525,7 @@ class PoolTuiApp(App[None]):
         self._completion_tail = ""
         self._completion_value: str | None = None
         self._completion_cursor = 0
+        self._ctrl_d_exit_deadline = 0.0
 
     def compose(self) -> ComposeResult:
         yield SessionTree("Sessions", id="session-tree")
@@ -612,6 +615,22 @@ class PoolTuiApp(App[None]):
             or self.screen.focused is not command_input
         ):
             return
+        if event.key == "ctrl+d":
+            event.stop()
+            event.prevent_default()
+            self._reset_completion()
+            now = time.monotonic()
+            if now <= self._ctrl_d_exit_deadline:
+                self._ctrl_d_exit_deadline = 0.0
+                self._request_exit()
+            else:
+                self._ctrl_d_exit_deadline = now + CTRL_D_EXIT_WINDOW_SECONDS
+                logger.info(
+                    "Press Ctrl-D again within %.0f seconds to quit",
+                    CTRL_D_EXIT_WINDOW_SECONDS,
+                )
+            return
+        self._ctrl_d_exit_deadline = 0.0
         if event.key in {"pageup", "pagedown"}:
             event.stop()
             event.prevent_default()
@@ -788,7 +807,7 @@ class PoolTuiApp(App[None]):
             if arguments:
                 self._console_error("Usage: quit")
                 return
-            self.exit()
+            self._request_exit()
             return
         if command == "show":
             if len(arguments) != 1:
@@ -849,6 +868,34 @@ class PoolTuiApp(App[None]):
             callback=lambda confirmed: (
                 self._start_admin_action(command, target) if confirmed else None
             ),
+        )
+
+    def _request_exit(self) -> None:
+        self._ctrl_d_exit_deadline = 0.0
+        live_databases = [
+            database
+            for database in self.model.databases.values()
+            if str(database.get("state", "OPEN")).upper()
+            not in {"CLOSED", "DEAD"}
+        ]
+        if not live_databases:
+            self.exit()
+            return
+
+        local_count = sum(
+            not bool(database.get("is_external"))
+            for database in live_databases
+        )
+        external_count = len(live_databases) - local_count
+        self.push_screen(
+            ConfirmActionScreen(
+                "Exit TUI and stop the pool?\n\n"
+                f"Live IDBs: {len(live_databases)} "
+                f"(local {local_count}, GUI {external_count})\n\n"
+                "Local IDBs will be saved before their backend processes stop. "
+                "GUI IDBs will be detached and remain open in IDA."
+            ),
+            callback=lambda confirmed: self.exit() if confirmed else None,
         )
 
     def _show_help(self, command: str | None) -> None:

@@ -911,6 +911,78 @@ class PoolTuiCommandTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("tab")
             self.assertEqual(command_input.value, "clear")
 
+    async def test_quit_exits_immediately_without_live_databases(self):
+        app = PoolTuiApp(AdminEventBus(), BufferedLogHandler())
+
+        async with app.run_test(size=(120, 35)):
+            app.exit = MagicMock()
+            app.execute_command("quit")
+
+            app.exit.assert_called_once_with()
+
+    async def test_quit_requires_confirmation_with_live_database(self):
+        app = PoolTuiApp(AdminEventBus(), BufferedLogHandler())
+
+        async with app.run_test(size=(120, 35)) as pilot:
+            app.apply_admin_event(self._database_event())
+            app.exit = MagicMock()
+
+            app.execute_command("quit")
+            await pilot.pause()
+
+            self.assertIsInstance(app.screen, ConfirmActionScreen)
+            self.assertIn("Live IDBs: 1", app.screen.message)
+            await pilot.press("n")
+            await pilot.pause()
+            app.exit.assert_not_called()
+
+            app.execute_command("quit")
+            await pilot.pause()
+            await pilot.press("y")
+            await pilot.pause()
+            app.exit.assert_called_once_with()
+
+    async def test_double_ctrl_d_uses_confirmed_quit_flow(self):
+        app = PoolTuiApp(AdminEventBus(), BufferedLogHandler())
+
+        async with app.run_test(size=(120, 35)) as pilot:
+            app.apply_admin_event(self._database_event())
+            app.exit = MagicMock()
+
+            await pilot.press("ctrl+d")
+            await pilot.pause()
+            self.assertNotIsInstance(app.screen, ConfirmActionScreen)
+            app.exit.assert_not_called()
+
+            await pilot.press("ctrl+d")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, ConfirmActionScreen)
+            app.exit.assert_not_called()
+
+            await pilot.press("y")
+            await pilot.pause()
+            app.exit.assert_called_once_with()
+
+    async def test_quit_ignores_dead_database_for_confirmation(self):
+        app = PoolTuiApp(AdminEventBus(), BufferedLogHandler())
+
+        async with app.run_test(size=(120, 35)):
+            app.apply_admin_event(self._database_event())
+            app.apply_admin_event(
+                event(
+                    "pool",
+                    "IdbActivityChanged",
+                    2,
+                    "database-a",
+                    state="DEAD",
+                )
+            )
+            app.exit = MagicMock()
+
+            app.execute_command("quit")
+
+            app.exit.assert_called_once_with()
+
     async def test_close_command_requires_confirmation(self):
         bus = AdminEventBus()
         pool = MagicMock()

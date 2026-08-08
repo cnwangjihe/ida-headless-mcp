@@ -181,11 +181,12 @@ MCP 请求在 IDA 中执行期间，实际目标 database 行会标记为
 | `disconnect <Axxx>` | 确认后拒绝该 agent 的新请求，等待活动请求结束，再释放它持有的全部 lease。 |
 | `unregister <Dxxx>` | 确认后从 Pool 移除 GUI 管理的 IDB，但不会在 IDA 中关闭它。 |
 | `clear` | 清空当前日志区域。 |
-| `quit` | 停止 listener 并关闭 Pool，同时保存本地 IDB。 |
+| `quit` | 停止 listener 并关闭 Pool，同时保存本地 IDB；存在仍存活的 IDB 时需要确认。 |
 
 按 Tab 可以补全命令和当前操作适用的 `Axxx`/`Dxxx` 目标。存在多个匹配时会先扩展
 公共前缀，继续按 Tab 可循环选择候选项。PageUp/PageDown 可在不离开输入框的
-情况下滚动日志。确认框支持 Tab/Shift+Tab 或方向键选择、Enter/Space 激活、
+情况下滚动日志。两秒内连续按两次 Ctrl-D 会进入与 `quit` 相同的确认退出流程。
+确认框支持 Tab/Shift+Tab 或方向键选择、Enter/Space 激活、
 `Y` 确认，以及 `N` 或 Escape 取消。
 
 关系视图由进程内生命周期事件增量更新，不会轮询 MCP Server 或 Pool。每分钟的

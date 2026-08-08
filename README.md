@@ -202,11 +202,13 @@ and the bottom line accepts administration commands.
 | `disconnect <Axxx>` | After confirmation, reject new work for an agent, let active requests drain, then release all of its leases. |
 | `unregister <Dxxx>` | After confirmation, detach a GUI-managed IDB from the pool without closing it in IDA. |
 | `clear` | Clear the visible log pane. |
-| `quit` | Stop the listener and shut down the pool, saving local IDBs. |
+| `quit` | Stop the listener and shut down the pool, saving local IDBs. Confirmation is required while any IDB is live. |
 
 Press Tab to complete commands and context-appropriate `Axxx`/`Dxxx` targets.
 Common prefixes are expanded first; repeated Tab presses cycle ambiguous
 matches. PageUp/PageDown scroll the log without leaving the command input.
+Press Ctrl-D twice within two seconds to run the same confirmed exit flow as
+`quit`.
 Confirmation dialogs support Tab/Shift+Tab or arrow-key selection, Enter/Space
 activation, `Y` to confirm, and `N` or Escape to cancel.
 
